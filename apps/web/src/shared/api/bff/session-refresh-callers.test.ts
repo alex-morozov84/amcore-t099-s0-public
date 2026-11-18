@@ -1,7 +1,7 @@
 // @vitest-environment node
 import type * as ReactModule from 'react'
 import { cookies, headers } from 'next/headers'
-import { AMCORE_CLIENT_IP_HEADER,PRODUCT_ADMIN_CONFIG } from '@amcore/shared'
+import { AMCORE_CLIENT_IP_HEADER, PRODUCT_ADMIN_CONFIG } from '@amcore/shared'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
 import { proxyToBackend } from './authenticated-proxy'

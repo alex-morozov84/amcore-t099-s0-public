@@ -9,11 +9,9 @@ export async function storageSettingJourney(
   apiPath: string,
   beforeReset?: () => Promise<void>
 ): Promise<void> {
-  const card = page
-    .locator('section')
-    .filter({
-      has: page.getByRole('heading', { name: messages.console.overviewFilesTitle, exact: true }),
-    })
+  const card = page.locator('section').filter({
+    has: page.getByRole('heading', { name: messages.console.overviewFilesTitle, exact: true }),
+  })
   let writes = 0
   page.on('request', (r) => {
     if (r.method() === 'PATCH' && r.url().includes('runtime-settings/storage-probe')) writes++
