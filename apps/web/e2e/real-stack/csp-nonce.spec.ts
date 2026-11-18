@@ -77,8 +77,9 @@ test('production build: the authenticated dashboard (sidebar style= attributes i
   // different sidebar render) while we have a real authenticated session.
   await page.setViewportSize({ width: 375, height: 812 })
   await page.getByRole('button', { name: messages.nav.toggleSidebar, exact: true }).click()
-  await expect(page.locator('[data-slot="sidebar"][data-mobile="true"]')).toBeVisible()
-  await waitForAnimationsToFinish(page, '[data-slot="sheet-content"]')
+  const mobileSidebar = '[data-slot="sidebar"][data-mobile="true"]'
+  await expect(page.locator(mobileSidebar)).toBeVisible()
+  await waitForAnimationsToFinish(page, mobileSidebar)
 
   expect(
     violations,

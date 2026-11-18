@@ -5,6 +5,7 @@ import { DEFAULT_LOCALE, localizedFrontendUrl, SERVED_LOCALES } from '@amcore/sh
 import { expect, test } from '@playwright/test'
 
 import { expectNoAxeViolations } from '../shared/axe'
+import { completeMfaSignIn } from '../shared/mfa-login'
 import { activeTarget, guardedSql } from '../support/managed-target.mjs'
 import { proveSetupMailbox, SETUP_PASSWORD, setupCommand } from '../support/organization-setup'
 
@@ -37,7 +38,11 @@ test('operator steps, lost reply and actual recipient consent produce a working 
   await page.goto(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, 'login'))
   await page.getByRole('textbox', { name: en.auth.email, exact: true }).fill(operatorEmail)
   await page.getByLabel(en.auth.password, { exact: true }).fill(SETUP_PASSWORD)
+  const signIn = page.waitForResponse(
+    (r) => new URL(r.url()).pathname.endsWith('/auth/login') && r.request().method() === 'POST'
+  )
   await page.getByRole('button', { name: en.auth.login, exact: true }).click()
+  if ((await signIn).status() === 202) await completeMfaSignIn(page, operatorEmail)
   await page.waitForURL(
     (url) =>
       url.origin === consoleOrigin &&

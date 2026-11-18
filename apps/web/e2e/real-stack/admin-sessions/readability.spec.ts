@@ -2,7 +2,7 @@ import { ADMIN_CONSOLE_SETTINGS } from '@amcore/shared'
 import { expect, test } from '@playwright/test'
 
 import { expectNoAxeViolations, scanAccessibility } from '../../shared/axe'
-import { consolePath, isProductHome, messages } from '../../shared/product-settings'
+import { consolePath, isProductHome, messages, translate } from '../../shared/product-settings'
 import { setSystemRole } from '../admin-helpers'
 import { loginViaUi, registerViaUi, uniqueEmail } from '../helpers'
 import { holdSessionRefetch, waitForSessionTransitions } from '../sessions-readability'
@@ -28,15 +28,20 @@ for (const theme of ['light', 'dark']) {
       await expect(page).toHaveURL(isProductHome)
       await page.goto(consolePath('/users'))
       await page.getByRole('link', { name: email }).click()
-      const card = page
-        .locator('[data-slot="card"]')
-        .filter({ has: page.getByRole('heading', { name: messages.console.userSessionsHeading }) })
+      const card = page.locator('[data-slot="card"]').filter({
+        has: page.getByRole('heading', {
+          name: translate('console.userSessionsHeading', { count: 1 }),
+          exact: true,
+        }),
+      })
       const rows = card.locator('[aria-busy]:visible')
       const refresh = card.getByRole('button', {
         name: messages.console.overviewRefresh,
         exact: true,
       })
-      await expect(card.getByRole('heading', { name: 'Sessions (1 total)' })).toBeVisible()
+      await expect(
+        card.getByRole('heading', { name: translate('console.userSessionsHeading', { count: 1 }) })
+      ).toBeVisible()
       await expect(rows).toHaveAttribute('aria-busy', 'false')
       await expect(refresh).toBeEnabled()
       await waitForSessionTransitions(card)
@@ -57,7 +62,11 @@ for (const theme of ['light', 'dark']) {
         await expect(refresh).toBeDisabled()
         await expect(refresh.locator('.animate-spin')).toBeVisible()
         await expect(rows).toHaveText(retained, { useInnerText: true })
-        await expect(card.getByRole('heading', { name: 'Sessions (1 total)' })).toBeVisible()
+        await expect(
+          card.getByRole('heading', {
+            name: translate('console.userSessionsHeading', { count: 1 }),
+          })
+        ).toBeVisible()
         expect(held.released).toBe(false)
         await expectNoAxeViolations(page, { allowBusy: true })
         expect(held.released).toBe(false)

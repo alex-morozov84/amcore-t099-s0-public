@@ -16,6 +16,7 @@ test.use({ trace: 'off', video: 'off', screenshot: 'off' })
 
 test('Console recovers a deleted recipient and lost replies without duplicating access', async ({
   page,
+  browser,
 }) => {
   const m = activeTarget()
   const consoleApi = m.consoleTopology === 'host' ? '/api' : '/api/console'
@@ -104,7 +105,7 @@ test('Console recovers a deleted recipient and lost replies without duplicating 
   await expect(setup.getByLabel(en.name, { exact: true })).toHaveCount(0)
   // The mailbox-verification portion starts with an idle source budget.
   resetBrowserProbeDomainBudget()
-  const recipientPage = await page.context().newPage()
+  const recipientPage = await browser.newPage()
   await proveSetupMailbox(recipientPage, recipient)
   await setup.getByRole('button', { name: en.checkEmail, exact: true }).click()
   await expect(setup.getByText(en.verified, { exact: true })).toBeVisible()

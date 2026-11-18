@@ -1,5 +1,4 @@
-import { admitS0 } from './e2e-ci-plan.mjs'
-import { s0Scenarios } from './product-admin-e2e-plan.mjs'
+import { s0Scenarios } from './stand/s0-scenarios.mjs'
 import { preservedTopology } from './stand/settings-policy.mjs'
 import { projectChoices } from './stand/project.mjs'
 import { standDeadline } from './lib/lighthouse-deadlines.mjs'
@@ -41,6 +40,7 @@ if (args.includes('--s0-scenario')) {
     args.includes('--audit-only')
   )
     throw new Error('Invalid S0 scenario request')
+  const { admitS0 } = await import('./e2e-ci-plan.mjs')
   admitS0(root)
 }
 const auditOnly = args.includes('--audit-only')
@@ -82,7 +82,7 @@ if (group && (lane !== 'real-stack' || !['standard', 'disruptive'].includes(grou
 const lanes = ['mocked', 'real-stack', 'product-admin-real-stack']
 if (lane === 'product-admin-real-stack' && fixture && !productAdminProfiles.includes(fixture))
   throw new Error('Staff lane requires a staff fixture')
-if (productAdminProfiles.includes(fixture) && lane !== 'product-admin-real-stack')
+if (!scenario && productAdminProfiles.includes(fixture) && lane !== 'product-admin-real-stack')
   throw new Error('Staff fixture requires the staff lane')
 let topology
 if (lane === 'product-admin-real-stack') topology = 'host'

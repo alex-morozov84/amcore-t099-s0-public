@@ -3,8 +3,13 @@ import { type Browser, expect, type Page, test } from '@playwright/test'
 
 import { expectNoAxeViolations, waitForAnimationsToFinish } from '../../shared/axe'
 import { completeMfaStepUp } from '../../shared/mfa-login'
-import { messages, translate } from '../../shared/product-settings'
-import { consolePath, isProductHome } from '../../shared/product-settings'
+import {
+  consolePath,
+  isProductHome,
+  messages,
+  productPath,
+  translate,
+} from '../../shared/product-settings'
 import { waitForIdleRegions } from '../../shared/visual-stability'
 import { ageSessionLastAuthAt, countLiveSessions, setSystemRole } from '../admin-helpers'
 import { loginViaUi, registerViaUi, TEST_PASSWORD, uniqueEmail } from '../helpers'
@@ -35,11 +40,15 @@ async function addExtraSession(browser: Browser, email: string, userAgent: strin
   await context.close()
 }
 
-async function openTargetDetail(page: Page, targetEmail: string) {
+async function openTargetDetail(page: Page, targetEmail: string, count: number) {
   await page.goto(consolePath('/users'))
   await page.getByRole('link', { name: targetEmail }).click()
   await expect(
-    page.getByRole('heading', { level: 2, name: messages.console.userSessionsHeading })
+    page.getByRole('heading', {
+      level: 2,
+      name: translate('console.userSessionsHeading', { count }),
+      exact: true,
+    })
   ).toBeVisible()
 }
 
@@ -63,7 +72,7 @@ test('path-mode: session list shows a parsed device label, never the raw user ag
   )
   await signInAsPathAdmin(page, adminEmail, false)
 
-  await openTargetDetail(page, targetEmail)
+  await openTargetDetail(page, targetEmail, 2)
 
   const labels = page.getByRole('table').getByText('Chrome on Windows', { exact: true })
   await expect(labels).toHaveCount(2)
@@ -92,10 +101,13 @@ test('path-mode: revoking one session soft-revokes it and removes it from the li
   await signInAsPathAdmin(page, adminEmail, false)
 
   expect(countLiveSessions(targetEmail)).toBe(2)
-  await openTargetDetail(page, targetEmail)
+  await openTargetDetail(page, targetEmail, 2)
 
   const row = page.getByRole('row').filter({ hasText: /iOS/i })
-  await row.getByRole('button', { name: messages.console.userSessionsActionsFor }).click()
+  const actionName = translate('console.userSessionsActionsFor', { device: '__device__' })
+    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    .replace('__device__', '.+')
+  await row.getByRole('button', { name: new RegExp('^' + actionName + '$') }).click()
   await page.getByRole('menuitem', { name: messages.console.userSessionsRevokeOne }).click()
   await page
     .getByRole('alertdialog')
@@ -125,7 +137,7 @@ test('path-mode: revoking all sessions requires confirmation and empties the lis
   await signInAsPathAdmin(page, adminEmail, false)
 
   expect(countLiveSessions(targetEmail)).toBe(2)
-  await openTargetDetail(page, targetEmail)
+  await openTargetDetail(page, targetEmail, 2)
 
   await page.getByRole('button', { name: messages.console.userSessionsRevokeAll }).click()
   await page
@@ -148,7 +160,7 @@ test('path-mode: revoking with an aged admin session requires step-up', async ({
   await signInAsPathAdmin(page, adminEmail, false)
 
   ageSessionLastAuthAt(adminEmail)
-  await openTargetDetail(page, targetEmail)
+  await openTargetDetail(page, targetEmail, 1)
   await page.getByRole('button', { name: messages.console.userSessionsRevokeAll }).click()
   await page
     .getByRole('alertdialog')
@@ -157,7 +169,7 @@ test('path-mode: revoking with an aged admin session requires step-up', async ({
 
   const stepUpDialog = page.getByRole('dialog', { name: messages.console.stepUpTitle })
   await expect(stepUpDialog).toBeVisible()
-  await stepUpDialog.getByLabel(messages.console.loginPassword).fill(TEST_PASSWORD)
+  await stepUpDialog.getByLabel(messages.console.loginPassword, { exact: true }).fill(TEST_PASSWORD)
   await stepUpDialog.getByRole('button', { name: messages.console.stepUpSubmit }).click()
   await completeMfaStepUp(page, adminEmail)
 
@@ -181,7 +193,12 @@ test('path-mode: an operator viewing their own detail page sees no destructive s
   await expect(
     page.getByRole('button', { name: messages.console.userSessionsRevokeAll })
   ).toHaveCount(0)
-  await expect(page.getByText(messages.console.userSessionsSelfNote)).toBeVisible()
+  const label = messages.console.userSessionsSelfNote.match(/<link>(.*?)<\/link>/)?.[1]
+  expect(label).toBeTruthy()
+  await expect(page.getByRole('link', { name: label, exact: true })).toHaveAttribute(
+    'href',
+    productPath('/settings/sessions')
+  )
 })
 
 test('the Sessions card has no axe violations, populated or empty', async ({ page, browser }) => {
@@ -199,8 +216,10 @@ test('the Sessions card has no axe violations, populated or empty', async ({ pag
   )
   await signInAsPathAdmin(page, adminEmail, false)
 
-  await openTargetDetail(page, targetEmail)
-  await expect(page.getByRole('heading', { name: 'Sessions (2 total)' })).toBeVisible()
+  await openTargetDetail(page, targetEmail, 2)
+  await expect(
+    page.getByRole('heading', { name: translate('console.userSessionsHeading', { count: 2 }) })
+  ).toBeVisible()
   await expect(page.getByRole('table').locator('tbody tr')).toHaveCount(2)
   await waitForIdleRegions(page)
   await expect(
@@ -208,7 +227,9 @@ test('the Sessions card has no axe violations, populated or empty', async ({ pag
   ).toBeEnabled()
   await waitForSessionTransitions(
     page.locator('[data-slot="card"]').filter({
-      has: page.getByRole('heading', { name: 'Sessions (2 total)' }),
+      has: page.getByRole('heading', {
+        name: translate('console.userSessionsHeading', { count: 2 }),
+      }),
     })
   )
   await expectNoAxeViolations(page)

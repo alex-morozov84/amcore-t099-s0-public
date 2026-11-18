@@ -101,7 +101,7 @@ test('platform key discovery, captured bulk step-up, lifecycle history and respo
   await confirm.getByRole('button', { name: messages.console.apiKeys.revoke, exact: true }).click()
   const stepUp = page.getByRole('dialog')
   await expect(stepUp).toBeVisible()
-  await stepUp.getByLabel(messages.console.loginPassword).fill(TEST_PASSWORD)
+  await stepUp.getByLabel(messages.console.loginPassword, { exact: true }).fill(TEST_PASSWORD)
   await stepUp.getByRole('button', { name: messages.console.stepUpSubmit }).click()
   await completeMfaStepUp(page, email)
   await expect(page.getByRole('row').filter({ hasText: 'Lifecycle 00' })).toContainText(

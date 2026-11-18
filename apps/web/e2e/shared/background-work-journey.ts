@@ -98,10 +98,14 @@ export async function backgroundWorkJourney(page: Page, url: string): Promise<vo
     ).toBeVisible()
     await expect(
       external
-        .getByRole('button', { name: messages.console.backgroundWork.control.actions.pause })
+        .getByRole('button', {
+          name: messages.console.backgroundWork.control.actions.pause,
+          exact: true,
+        })
         .or(
           external.getByRole('button', {
             name: messages.console.backgroundWork.control.actions.resume,
+            exact: true,
           })
         )
     ).toHaveCount(0)

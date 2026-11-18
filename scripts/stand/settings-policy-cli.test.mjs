@@ -44,6 +44,10 @@ function fixture(t) {
     new URL('./settings-policy.mjs', import.meta.url),
     join(root, 'scripts/stand/settings-policy.mjs')
   )
+  copyFileSync(
+    new URL('./s0-scenarios.mjs', import.meta.url),
+    join(root, 'scripts/stand/s0-scenarios.mjs')
+  )
   return root
 }
 

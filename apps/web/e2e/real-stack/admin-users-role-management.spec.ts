@@ -96,7 +96,7 @@ test('path-mode: demoting with an aged session requires step-up, retries automat
 
   const stepUpDialog = page.getByRole('dialog', { name: messages.console.stepUpTitle })
   await expect(stepUpDialog).toBeVisible()
-  await stepUpDialog.getByLabel(messages.console.loginPassword).fill(TEST_PASSWORD)
+  await stepUpDialog.getByLabel(messages.console.loginPassword, { exact: true }).fill(TEST_PASSWORD)
   await stepUpDialog.getByRole('button', { name: messages.console.stepUpSubmit }).click()
   await completeMfaStepUp(page, adminEmail)
 
@@ -143,11 +143,15 @@ test('path-mode: a wrong step-up password stays recoverable and leaves the role 
 
   const stepUpDialog = page.getByRole('dialog', { name: messages.console.stepUpTitle })
   await expect(stepUpDialog).toBeVisible()
-  await stepUpDialog.getByLabel(messages.console.loginPassword).fill('DefinitelyWrong123')
+  await stepUpDialog
+    .getByLabel(messages.console.loginPassword, { exact: true })
+    .fill('DefinitelyWrong123')
   await stepUpDialog.getByRole('button', { name: messages.console.stepUpSubmit }).click()
 
   await expect(stepUpDialog.getByText(messages.errors.INVALID_CREDENTIALS)).toBeVisible()
-  await expect(stepUpDialog.getByLabel(messages.console.loginPassword)).toBeVisible()
+  await expect(
+    stepUpDialog.getByLabel(messages.console.loginPassword, { exact: true })
+  ).toBeVisible()
 
   await stepUpDialog.getByRole('button', { name: messages.common.cancel }).click()
   await expect(
