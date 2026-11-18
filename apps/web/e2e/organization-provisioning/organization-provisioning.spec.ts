@@ -63,7 +63,7 @@ test('operator steps, lost reply and actual recipient consent produce a working 
   await expectNoAxeViolations(page)
   // Drop only the browser's success acknowledgment. The real browser request keeps
   // its own TLS/proxy/Host/Origin/cookies; APIRequestContext replay is a different transport.
-  await page.evaluate(() => {
+  await page.evaluate((createPath) => {
     const send = window.fetch.bind(window)
     let intercepted = false
     window.fetch = async (input, init) => {
@@ -72,16 +72,14 @@ test('operator steps, lost reply and actual recipient consent produce a working 
         location.origin
       )
       const target =
-        !intercepted &&
-        url.pathname === `${consoleApi}/organization-provisionings` &&
-        (init?.method ?? 'GET') === 'POST'
+        !intercepted && url.pathname === createPath && (init?.method ?? 'GET') === 'POST'
       if (target) intercepted = true
       const response = await send(input, init)
       if (target && response.status === 201)
         throw new TypeError('Controlled lost creation acknowledgment')
       return response
     }
-  })
+  }, `${consoleApi}/organization-provisionings`)
   await flow.getByRole('button', { name: t.createAndInvite, exact: true }).click()
   await expect(flow.getByText(t.unknown, { exact: true })).toBeVisible()
   await expect(flow.getByRole('button', { name: t.checkResult, exact: true })).toBeEnabled()
