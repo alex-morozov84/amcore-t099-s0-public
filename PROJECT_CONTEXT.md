@@ -6,17 +6,17 @@ separate product from the starter.
 
 ## Identity
 
-- **Mode:** `upstream-starter`
-- **Product:** AMCore
+- **Mode:** `downstream-product`
+- **Product:** S0 Catalogue
 - **Purpose:** Continue development of AMCore and its reusable, production-oriented
   NestJS API starter.
 - **Canonical upstream:** https://github.com/alex-morozov84/AMCore
-- **Upstream sync policy:** N/A — this checkout is the canonical upstream.
+- **Upstream sync policy:** Local synthetic source update rehearsal.
 - **Workflow mode:** `strict` (protected `main`, PR-only, squash-only, required CI).
 - **Public workflow:** See `AGENTS.md` and `CONTRIBUTING.md`.
 - **Current maintainer status:** If `ai/` exists, read `ai/STATUS.md`.
 - **theme_persistence:** local-storage
-- **initialized_from_amcore_version:** N/A — this checkout is AMCore itself.
+- **initialized_from_amcore_version:** Local snapshot.
 
 One field per line, machine-editable by `pnpm init:brand` — do not fold multiple
 fields back into a single prose bullet.

@@ -30,7 +30,10 @@ test('operator steps, lost reply and actual recipient consent produce a working 
     'UPDATE core.users SET "systemRole"=\'SUPER_ADMIN\' WHERE id=:\'id\' AND "emailVerified"=true;',
     { id: prepared.userId }
   )
+  const consoleApi = m.consoleTopology === 'host' ? '/api' : '/api/console'
   const consoleOrigin = m.origins.console ?? m.origins.product
+  const organizationPath =
+    m.consoleTopology === 'host' ? 'organizations' : `${m.consoleSlug}/organizations`
   await page.goto(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, 'login'))
   await page.getByRole('textbox', { name: en.auth.email, exact: true }).fill(operatorEmail)
   await page.getByLabel(en.auth.password, { exact: true }).fill(SETUP_PASSWORD)
@@ -40,7 +43,7 @@ test('operator steps, lost reply and actual recipient consent produce a working 
       url.origin === consoleOrigin &&
       url.pathname === new URL(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE)).pathname
   )
-  await page.goto(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, 'organizations'))
+  await page.goto(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, organizationPath))
   const t = en.console.organizationProvisioning
   const flow = page
     .locator('[data-slot="card"]')
@@ -65,7 +68,7 @@ test('operator steps, lost reply and actual recipient consent produce a working 
       )
       const target =
         !intercepted &&
-        url.pathname === '/api/organization-provisionings' &&
+        url.pathname === `${consoleApi}/organization-provisionings` &&
         (init?.method ?? 'GET') === 'POST'
       if (target) intercepted = true
       const response = await send(input, init)
@@ -96,7 +99,9 @@ test('operator steps, lost reply and actual recipient consent produce a working 
       id: prepared.userId,
     }).trim()
   ).toBe('0')
-  await page.goto(localizedFrontendUrl(consoleOrigin, alternateLocale, `organizations/${orgId}`))
+  await page.goto(
+    localizedFrontendUrl(consoleOrigin, alternateLocale, `${organizationPath}/${orgId}`)
+  )
   await page.setViewportSize({ width: 375, height: 900 })
   await expect(
     page.getByRole('heading', {
@@ -113,7 +118,7 @@ test('operator steps, lost reply and actual recipient consent produce a working 
   // New initial cancellation is terminal; a distinct additional invitation repairs the same organization.
   await page.setViewportSize({ width: 1280, height: 1000 })
   async function createOrganization(name: string, slug: string, email: string) {
-    await page.goto(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, 'organizations'))
+    await page.goto(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, organizationPath))
     await page.getByRole('button', { name: t.start, exact: true }).click()
     await page.getByLabel(t.name, { exact: true }).fill(name)
     await page.getByLabel(t.slug, { exact: true }).fill(slug)
@@ -144,7 +149,7 @@ test('operator steps, lost reply and actual recipient consent produce a working 
   await invitation.getByRole('button', { name: admin.confirmInvite, exact: true }).click()
   await expect(page.getByText(admin.sent, { exact: true })).toBeVisible()
   await createOrganization('West shop', 'west-shop', 'later-admin@e2e.amcore.test')
-  await page.goto(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, 'organizations'))
+  await page.goto(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, organizationPath))
   const attention = page
     .locator('[data-slot="card"]')
     .filter({ has: page.getByRole('heading', { name: admin.attentionTitle, exact: true }) })
@@ -159,7 +164,9 @@ test('operator steps, lost reply and actual recipient consent produce a working 
     `INSERT INTO core.org_members (id,"userId","organizationId","createdAt") VALUES ('proof-south-member',:'user',:'org',CURRENT_TIMESTAMP); INSERT INTO core.member_roles (id,"memberId","roleId") SELECT 'proof-south-member-role','proof-south-member',id FROM core.roles WHERE name='MEMBER' AND "organizationId" IS NULL;`,
     { user: firstUserId, org: southId }
   )
-  await page.goto(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, `organizations/${southId}`))
+  await page.goto(
+    localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, `${organizationPath}/${southId}`)
+  )
   await page.getByRole('button', { name: admin.promote, exact: true }).click()
   const promotion = page.getByRole('dialog')
   await promotion.getByLabel(admin.reason, { exact: true }).fill('TEST-49 verified member addition')
@@ -175,7 +182,7 @@ test('operator steps, lost reply and actual recipient consent produce a working 
   for (const [locale, messages] of SERVED_LOCALES.map(
     (locale) => [locale, copy(locale)] as const
   )) {
-    await page.goto(localizedFrontendUrl(consoleOrigin, locale, `organizations/${southId}`))
+    await page.goto(localizedFrontendUrl(consoleOrigin, locale, `${organizationPath}/${southId}`))
     await page.setViewportSize({ width: 375, height: 900 })
     await expect(
       page.getByRole('heading', {

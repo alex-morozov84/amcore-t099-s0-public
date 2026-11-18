@@ -34,6 +34,18 @@ export function validateEnvelopes(plan, envelopes, jobResults) {
         e.plan === plan.digest,
       'stale-or-foreign-lane-evidence'
     )
+    if (plan.browserCases?.[e.lane]) {
+      const witness = e.browserEvidence
+      invariant(
+        witness?.lane === e.lane &&
+          witness.run === plan.run &&
+          witness.attempt === plan.attempt &&
+          witness.source === plan.source &&
+          witness.plan === plan.digest &&
+          witness.observed === plan.browserCases[e.lane],
+        'missing-or-foreign-browser-cases'
+      )
+    }
     const ids = plan.assignments[e.lane]
     invariant(
       JSON.stringify(e.expected) === JSON.stringify(ids) &&

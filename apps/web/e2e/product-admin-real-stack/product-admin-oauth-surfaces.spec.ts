@@ -1,3 +1,4 @@
+import { productAdminPath } from '@amcore/shared'
 import { expect, type Page, test } from '@playwright/test'
 
 import { logoutViaApi, registerViaUi, uniqueEmail } from '../real-stack/helpers'
@@ -113,22 +114,23 @@ for (const scenario of [
 }
 
 test('ordinary staff Apple login cannot register a new account', async ({ browser }) => {
-  const { staff } = activeTarget().origins
-  if (!staff) throw new Error('Staff OAuth fixture required')
+  const m = activeTarget()
+  const admin = m.origins.staff ?? m.origins.product
+  if (!m.origins.staff && !m.s0Scenario) throw new Error('Staff OAuth fixture required')
+  const login = '/en' + productAdminPath('/login')
   const context = await browser.newContext({ ignoreHTTPSErrors: true, serviceWorkers: 'block' })
   const email = uniqueEmail('apple-staff-new')
   try {
     const page = await context.newPage()
-    const seen = await appleBrowserFixture(context, staff, email)
-    await page.goto(`${staff}/en/login`)
+    const seen = await appleBrowserFixture(context, admin, email)
+    await page.goto(admin + login)
     await page.getByRole('link', { name: /continue with apple/i }).click()
     await terminal(
       page,
-      (url) =>
-        url.origin === staff && url.pathname === '/en/login' && url.searchParams.has('oauthError')
+      (url) => url.origin === admin && url.pathname === login && url.searchParams.has('oauthError')
     )
     expect(seen()).toBe(true)
-    expect((await context.request.get(`${staff}/api/auth/me`)).status()).toBe(401)
+    expect((await context.request.get(`${admin}/api/auth/me`)).status()).toBe(401)
     expect(accountCounts(email)).toBe('0|0|0')
   } finally {
     await context.close().catch(() => undefined)

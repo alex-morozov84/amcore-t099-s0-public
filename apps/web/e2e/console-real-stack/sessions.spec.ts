@@ -1,5 +1,11 @@
 import { completeMfaSignIn, completeMfaStepUp } from '../shared/mfa-login'
-import { isProductHome, messages, productPath, translate } from '../shared/product-settings'
+import {
+  consolePath,
+  isProductHome,
+  messages,
+  productPath,
+  translate,
+} from '../shared/product-settings'
 import { activeTarget } from '../support/managed-target.mjs'
 
 const standTarget = activeTarget()
@@ -14,9 +20,12 @@ function exec(service: string, args: string[]): string {
   return guardedExec(service, ...args).trim()
 }
 
-test('host session helper preserves current UA on actual vault rotation; Sessions revoke requires step-up', async ({
+test('Console session preserves current UA on actual vault rotation; Sessions revoke requires step-up', async ({
   browser,
 }) => {
+  const host = standTarget.consoleTopology === 'host'
+  const consoleOrigin = standTarget.origins.console ?? standTarget.origins.product
+  const consoleUrlPath = host ? productPath : consolePath
   const email = uniqueEmail('host-sessions-admin'),
     target = uniqueEmail('host-sessions-target')
   const product = await browser.newContext({
@@ -31,7 +40,7 @@ test('host session helper preserves current UA on actual vault rotation; Session
   await expect(productPage).toHaveURL(isProductHome)
   setSystemRole(email, 'SUPER_ADMIN')
   const admin = await browser.newContext({
-    baseURL: `${standTarget.origins.console}`,
+    baseURL: consoleOrigin,
     ignoreHTTPSErrors: true,
   })
   const page = await admin.newPage()
@@ -40,15 +49,13 @@ test('host session helper preserves current UA on actual vault rotation; Session
   await page.getByLabel(messages.auth.password, { exact: true }).fill(TEST_PASSWORD)
   await page.getByRole('button', { name: messages.auth.login, exact: true }).click()
   await completeMfaSignIn(page, email)
-  await expect(page).toHaveURL(
-    (url) => url.origin === standTarget.origins.console && isProductHome(url)
-  )
+  await expect(page).toHaveURL((url) => url.origin === consoleOrigin && isProductHome(url))
   await page.waitForLoadState('networkidle')
   ageSessionLastAuthAt(email)
   const sid = (await admin.cookies()).find(
-    (cookie) => cookie.name === '__Host-amcore_console_session'
+    (cookie) => cookie.name === (host ? '__Host-amcore_console_session' : 'amcore_session')
   )!.value
-  const key = `web:console-session:v1:${sid}`
+  const key = `web:${host ? 'console-session' : 'session'}:v1:${sid}`
   const ua = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/128.0.0.0 T011-host-rotation'
   expect(
     exec('redis', [
@@ -62,7 +69,7 @@ test('host session helper preserves current UA on actual vault rotation; Session
   const targetId = guardedSql(`SELECT id FROM core.users WHERE "emailCanonical" = :'email';`, {
     email: target,
   }).trim()
-  const refreshed = await admin.request.get(productPath(`/users/${targetId}`), {
+  const refreshed = await admin.request.get(consoleUrlPath(`/users/${targetId}`), {
     headers: { 'User-Agent': ua },
   })
   expect(refreshed.status()).toBe(200)
@@ -72,7 +79,7 @@ test('host session helper preserves current UA on actual vault rotation; Session
       { email }
     ).trim()
   ).toBe(ua)
-  await page.goto(productPath(`/users/${targetId}`))
+  await page.goto(consoleUrlPath(`/users/${targetId}`))
   await expect(
     page.getByRole('heading', {
       level: 2,
@@ -81,7 +88,8 @@ test('host session helper preserves current UA on actual vault rotation; Session
   ).toBeVisible()
   const responses: number[] = []
   page.on('response', (response) => {
-    if (response.url().endsWith('/api/auth/step-up')) responses.push(response.status())
+    const path = host ? '/api/auth/step-up' : '/api/console/auth/step-up'
+    if (new URL(response.url()).pathname === path) responses.push(response.status())
   })
   await page
     .getByRole('button', { name: messages.console.userSessionsRevokeAll, exact: true })

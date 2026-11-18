@@ -14,7 +14,8 @@ import { unpackReports } from '../lib/lighthouse-archive.mjs'
 import { verifyView } from '../lib/lighthouse-view-export.mjs'
 import { checkCoverage } from '../lib/lighthouse-coverage.mjs'
 
-const plan = auditPlan(process.cwd(), runIdentity(process.cwd()))
+const s0 = process.env.AMCORE_E2E_INVENTORY === 's0'
+const plan = auditPlan(process.cwd(), runIdentity(process.cwd()), { configured: s0, s0 })
 invariant(
   JSON.parse(process.env.AMCORE_EXPECTED_AUDIT_PLAN).digest === plan.digest,
   'unexpected-ci-plan'

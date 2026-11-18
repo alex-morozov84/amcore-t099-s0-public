@@ -15,6 +15,10 @@ export const productAdminProfiles = [
 
 /** Copy-only topology rehearsal; never modifies the authoring checkout or runtime policy. */
 export async function prepareProductAdminSource(m) {
+  if (m.s0Scenario) {
+    await prepareAppleOAuthFixture(m)
+    return
+  }
   if (!m.productAdminHost && m.fixtureProfile !== 'product-admin-oauth-path') return
   const path = join(m.snapshot, 'packages/shared/src/config/product-admin.json')
   const config = JSON.parse(await readFile(path, 'utf8'))

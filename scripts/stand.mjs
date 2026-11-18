@@ -1,3 +1,5 @@
+import { admitS0 } from './e2e-ci-plan.mjs'
+import { s0Scenarios } from './product-admin-e2e-plan.mjs'
 import { preservedTopology } from './stand/settings-policy.mjs'
 import { projectChoices } from './stand/project.mjs'
 import { standDeadline } from './lib/lighthouse-deadlines.mjs'
@@ -22,9 +24,25 @@ const [action = 'help', ...args] = process.argv.slice(2)
 const value = (flag, fallback) => (args.includes(flag) ? args[args.indexOf(flag) + 1] : fallback)
 const lane = value('--lane', 'real-stack')
 const group = value('--ci-group')
-const fixture = value('--fixture')
+const requestedFixture = value('--fixture')
+const scenario = value('--s0-scenario')
+const fixture = scenario ? s0Scenarios[scenario]?.fixture : requestedFixture
 const settingsPolicy = value('--settings-policy', 'variant')
 if (!['preserve', 'variant'].includes(settingsPolicy)) throw new Error('Invalid settings policy')
+if (args.includes('--s0-scenario')) {
+  if (
+    !s0Scenarios[scenario] ||
+    settingsPolicy !== 'preserve' ||
+    action !== 'e2e' ||
+    lane !== 'real-stack' ||
+    group ||
+    args.includes('--fixture') ||
+    args.includes('--') ||
+    args.includes('--audit-only')
+  )
+    throw new Error('Invalid S0 scenario request')
+  admitS0(root)
+}
 const auditOnly = args.includes('--audit-only')
 const reuseAudit = args.includes('--reuse-audit')
 if (reuseAudit && (!auditOnly || process.env.CI === 'true'))
@@ -72,6 +90,7 @@ lanes.push('console-real-stack')
 if (lane === 'console-real-stack') topology = 'host'
 if (settingsPolicy === 'preserve' && ['up', 'preview', 'e2e'].includes(action))
   topology = preservedTopology(lane, await projectChoices(root))
+if (scenario && s0Scenarios[scenario].https) topology = 'host'
 const id = value('--id', action === 'e2e' ? `e2e-${randomUUID()}` : 'preview')
 // Explicit risk acceptance for a build whose Docker export is not proved finished;
 // recorded in the manifest as acceptance, never as proof (see local-stands guide).
@@ -150,7 +169,8 @@ async function execute() {
       if (e.code !== 'ENOENT') throw e
     })
     if (existing) {
-      if (fixture) throw new Error('Organization setup fixture requires a fresh stand ID')
+      if (fixture || scenario)
+        throw new Error('Organization setup fixture requires a fresh stand ID')
       if (Boolean(existing.mocked) !== (lane === 'mocked'))
         throw new Error('Cannot switch a recorded stand between mocked and Docker lanes')
       if (action === 'e2e' && existing.purpose !== 'e2e')
@@ -184,7 +204,8 @@ async function execute() {
         (allocated) => {
           m = allocated
         },
-        settingsPolicy
+        settingsPolicy,
+        scenario
       )
     if (lane !== 'mocked') await boot(m, !existing)
     if (interrupted) throw new Error('Interrupted startup')

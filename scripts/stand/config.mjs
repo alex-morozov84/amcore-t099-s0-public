@@ -1,3 +1,4 @@
+import { s0Scenarios } from '../product-admin-e2e-plan.mjs'
 import { managedReadiness } from '../runner-disk/policy.mjs'
 import { mfaE2EEnvironment } from './mfa-e2e.mjs'
 import { operatorMfaEnvironment } from './operator-mfa.mjs'
@@ -32,6 +33,13 @@ const labelLines = (m, pad) =>
 const overridden = (value) =>
   `!override\n      ${stringify(value).trimEnd().replaceAll('\n', '\n      ')}`
 
+function signupPolicy(m) {
+  const closed = m.s0Scenario
+    ? s0Scenarios[m.s0Scenario].closedSignup
+    : isOrganizationMailFixture(m)
+  return closed ? 'false' : 'true'
+}
+
 export async function configuration(m) {
   assertOrganizationSetupFixture(m)
   const db = `postgresql://amcore:${m.dbPassword}@postgres:5432/amcore`
@@ -56,7 +64,7 @@ export async function configuration(m) {
     // The browser-facing API origin of this stand, so a public avatar URL resolves.
     ...(m.origins.api && { STORAGE_PUBLIC_BASE_URL: `${m.origins.api}/api/v1/storage/public` }),
     EMAIL_PROVIDER: 'mock',
-    AUTH_PUBLIC_SIGNUP_ENABLED: isOrganizationMailFixture(m) ? 'false' : 'true',
+    AUTH_PUBLIC_SIGNUP_ENABLED: signupPolicy(m),
     ORG_SELF_SERVICE_CREATION_ENABLED:
       isOrganizationMailFixture(m) || closedCreationProfiles.includes(m.fixtureProfile)
         ? 'false'
@@ -104,7 +112,7 @@ export async function configuration(m) {
       WEB_INVITATION_LOCAL_HTTP_ORIGIN: m.origins.product.startsWith('http:')
         ? m.origins.product
         : '',
-      ADMIN_CONSOLE_HOSTNAME: m.hostnames.console ?? '',
+      ADMIN_CONSOLE_HOSTNAME: m.origins.console ? m.hostnames.console : '',
       ADMIN_CONSOLE_ORIGIN: m.origins.console ?? '',
       // External tool links for the Overview card; empty unless the CLI shell sets them.
       ADMIN_CONSOLE_METRICS_URL: process.env.AMCORE_STAND_CONSOLE_METRICS_URL ?? '',
@@ -257,7 +265,7 @@ export function validateModel(m) {
       )
         throw new Error('Provisioning fixture mail policy changed')
       if (
-        environment.AUTH_PUBLIC_SIGNUP_ENABLED !== 'false' ||
+        environment.AUTH_PUBLIC_SIGNUP_ENABLED !== signupPolicy(m) ||
         environment.ORG_SELF_SERVICE_CREATION_ENABLED !== 'false' ||
         environment.AMCORE_SETUP_MAIL_CAPTURE_KEY !== m.mailCaptureKey
       )
@@ -315,7 +323,7 @@ export function validateModel(m) {
         }
   if (m.fixtureProfile === 'console-summary')
     wantedOrigins.metrics = `http://127.0.0.1:${m.ports.tls}`
-  if (m.productAdminHost && (!m.consoleEnabled || m.consoleTopology !== 'host'))
+  if (m.s0Scenario || (m.productAdminHost && (!m.consoleEnabled || m.consoleTopology !== 'host')))
     delete wantedOrigins.console
   if (JSON.stringify(m.origins) !== JSON.stringify(wantedOrigins))
     throw new Error('Foreign stand origin')

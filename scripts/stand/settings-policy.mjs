@@ -1,4 +1,7 @@
+import { s0Scenarios } from '../product-admin-e2e-plan.mjs'
 import { readFile } from 'node:fs/promises'
+import assert from 'node:assert/strict'
+import { pathToFileURL } from 'node:url'
 import { join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 
@@ -30,8 +33,37 @@ export async function assertSettings(m) {
     throw new Error('Product execution must preserve source settings')
 }
 
-export function assertPreserveRequest(policy, fixture, topology, choices) {
+export async function assertCompiledSettings(m) {
+  await assertSettings(m)
+  const settings = m.exercisedSettings
+  assert.deepEqual(settings, await sourceSettings(m.worktree), 'S0 source settings changed')
+  const shared = await import(pathToFileURL(join(m.snapshot, 'packages/shared/dist/index.js')).href)
+  assert.deepEqual(shared.SERVED_LOCALES, settings.locales.enabled)
+  assert.equal(shared.DEFAULT_LOCALE, settings.locales.default)
+  assert.deepEqual(shared.ADMIN_CONSOLE_SETTINGS, settings['admin-console'])
+  assert.deepEqual(shared.PRODUCT_ADMIN_CONFIG, settings['product-admin'])
+  const product = new URL(m.origins.product)
+  assert.equal(m.consoleTopology, 'path')
+  assert.equal(m.productAdminHost, false)
+  assert.equal(m.origins.console ?? m.origins.staff, undefined)
+  assert.equal(product.protocol, s0Scenarios[m.s0Scenario]?.https ? 'https:' : 'http:')
+}
+
+export function assertPreserveRequest(policy, fixture, topology, choices, scenario) {
   if (!['preserve', 'variant'].includes(policy)) throw new Error('Invalid settings policy')
+  if (scenario) {
+    const plan = s0Scenarios[scenario]
+    if (
+      policy !== 'preserve' ||
+      !plan ||
+      plan.fixture !== fixture ||
+      choices.topology !== 'path' ||
+      !choices.consoleEnabled ||
+      topology !== (plan.https ? 'host' : 'path')
+    )
+      throw new Error('S0 stand does not match the declared scenario')
+    return
+  }
   if (policy === 'preserve' && (fixture || (topology && topology !== choices.topology)))
     throw new Error('Preserved settings cannot use a topology variant or fixture')
 }

@@ -7,6 +7,8 @@ export interface ManagedTarget {
   id: string
   uuid: string
   fixtureProfile?: string
+  s0Scenario?: string
+  settingsPolicy?: 'preserve' | 'variant'
   consoleTopology: 'path' | 'host'
   consoleSlug: string
   purpose: string

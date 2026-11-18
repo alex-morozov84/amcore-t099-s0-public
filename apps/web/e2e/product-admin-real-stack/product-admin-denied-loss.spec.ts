@@ -1,21 +1,24 @@
 import { randomUUID } from 'node:crypto'
 
+import { productAdminPath } from '@amcore/shared'
 import { expect, test } from '@playwright/test'
 
 import { directApi } from '../real-stack/credential-containment.helpers'
-import { registerViaUi, TEST_PASSWORD, uniqueEmail } from '../real-stack/helpers'
+import { logoutViaApi, registerViaUi, TEST_PASSWORD, uniqueEmail } from '../real-stack/helpers'
 import { activeTarget, guardedSql } from '../support/managed-target.mjs'
 
 test.use({ trace: 'off', screenshot: 'off', video: 'off' })
 
-test('later membership loss hides data on refresh/reload and permits independent logout with profile refused', async ({
+test('later membership loss hides data on refresh/reload and permits logout with profile refused', async ({
   browser,
 }) => {
   const { product, staff, ports } = (() => {
     const t = activeTarget()
     return { ...t.origins, ports: t.ports }
   })()
-  if (!staff) throw new Error('Owned staff fixture required')
+  if (!staff && !activeTarget().s0Scenario) throw new Error('Owned staff fixture required')
+  const admin = staff ?? product
+  const url = (path: string) => admin + '/en' + productAdminPath(path)
   const context = await browser.newContext({ baseURL: product, ignoreHTTPSErrors: true })
   try {
     const page = await context.newPage()
@@ -45,12 +48,13 @@ test('later membership loss hides data on refresh/reload and permits independent
         link: `c${randomUUID().replaceAll('-', '').slice(0, 24)}`,
       }
     )
-    await page.goto(`${staff}/en/login`)
+    if (!staff) expect((await logoutViaApi(context.request, product)).status()).toBe(200)
+    await page.goto(url('/login'))
     await page.getByRole('textbox', { name: /email/i }).fill(email)
     await page.getByLabel(/^password$/i).fill(TEST_PASSWORD)
     await page.getByRole('button', { name: /sign in/i }).click()
-    await page.waitForURL((url) => url.origin === staff && url.pathname === '/en/organizations')
-    const deep = `${staff}/en/organizations/${org.id}/members`
+    await page.waitForURL(url('/organizations'))
+    const deep = url(`/organizations/${org.id}/members`)
     await page.goto(deep)
     await expect(
       page.getByRole('heading', { name: 'Private removed organization', exact: true })
@@ -76,7 +80,7 @@ test('later membership loss hides data on refresh/reload and permits independent
     expect(page.url()).toBe(deep)
     let profileRefusals = 0
     await page.route(
-      (url) => url.origin === staff && url.pathname === '/api/auth/me',
+      (url) => url.origin === admin && url.pathname === '/api/auth/me',
       async (route) => {
         profileRefusals++
         await route.fulfill({ status: 503, contentType: 'application/json', body: '{}' })
@@ -95,8 +99,8 @@ test('later membership loss hides data on refresh/reload and permits independent
     expect((await logout).status()).toBe(200)
     await expect(page.getByRole('heading', { name: 'Sign in', exact: true })).toBeVisible()
     const buyerMe = await context.request.get(`${product}/api/auth/me`)
-    expect(buyerMe.status()).toBe(200)
-    expect((await buyerMe.json()).user.email).toBe(buyer)
+    expect(buyerMe.status()).toBe(staff ? 200 : 401)
+    if (staff) expect((await buyerMe.json()).user.email).toBe(buyer)
   } finally {
     await context.close()
   }

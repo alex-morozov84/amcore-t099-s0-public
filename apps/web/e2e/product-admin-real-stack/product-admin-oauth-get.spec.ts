@@ -1,3 +1,4 @@
+import { productAdminPath } from '@amcore/shared'
 import { expect, test } from '@playwright/test'
 
 import { logoutViaApi, registerViaUi, TEST_PASSWORD, uniqueEmail } from '../real-stack/helpers'
@@ -12,9 +13,11 @@ for (const provider of ['google', 'github'] as const) {
     test(`${provider} GET callback completes selected ${surface} session with S256`, async ({
       browser,
     }) => {
-      const { product, staff } = activeTarget().origins
-      if (!staff) throw new Error('Staff provider fixture required')
-      const origin = surface === 'site' ? product : staff
+      const m = activeTarget()
+      const { product, staff } = m.origins
+      if (!staff && !m.s0Scenario) throw new Error('Staff provider fixture required')
+      const origin = surface === 'site' ? product : (staff ?? product)
+      const destination = surface === 'admin' ? '/en' + productAdminPath('/organizations') : '/en'
       const context = await browser.newContext({
         baseURL: product,
         ignoreHTTPSErrors: true,
@@ -30,12 +33,9 @@ for (const provider of ['google', 'github'] as const) {
           `${origin}/api/${surface === 'admin' ? 'product-admin/' : ''}auth/oauth/${provider}`
         )
         try {
-          await page.waitForURL(
-            (url) =>
-              url.origin === origin &&
-              url.pathname === (surface === 'admin' ? '/en/organizations' : '/en'),
-            { timeout: 15000 }
-          )
+          await page.waitForURL((url) => url.origin === origin && url.pathname === destination, {
+            timeout: 15000,
+          })
         } catch {
           throw new Error('GET OAuth did not reach the selected signed-in destination')
         }
@@ -57,8 +57,12 @@ for (const provider of ['google', 'github'] as const) {
   test(`${provider} selected account linking retains the current session without creating another login session`, async ({
     browser,
   }) => {
-    const { product, staff } = activeTarget().origins
-    if (!staff) throw new Error('Staff provider fixture required')
+    const m = activeTarget()
+    const { product, staff } = m.origins
+    if (!staff && !m.s0Scenario) throw new Error('Staff provider fixture required')
+    const admin = staff ?? product
+    const cookieName = staff ? '__Host-amcore_staff_session' : 'amcore_session'
+    const organizations = '/en' + productAdminPath('/organizations')
     const context = await browser.newContext({
       baseURL: product,
       ignoreHTTPSErrors: true,
@@ -69,13 +73,18 @@ for (const provider of ['google', 'github'] as const) {
     try {
       const page = await context.newPage()
       await registerViaUi(page, email)
-      await page.goto(`${staff}/en/login`)
-      await page.getByRole('textbox', { name: /email/i }).fill(email)
-      await page.getByLabel(/^password$/i).fill(TEST_PASSWORD)
-      await page.getByRole('button', { name: /sign in/i }).click()
-      await page.waitForURL((url) => url.origin === staff && url.pathname === '/en/organizations')
-      const sessionBefore = (await context.cookies(staff)).find(
-        (cookie) => cookie.name === '__Host-amcore_staff_session'
+      if (staff) {
+        await page.goto(`${staff}/en/login`)
+        await page.getByRole('textbox', { name: /email/i }).fill(email)
+        await page.getByLabel(/^password$/i).fill(TEST_PASSWORD)
+        await page.getByRole('button', { name: /sign in/i }).click()
+        await page.waitForURL((url) => url.origin === staff && url.pathname === organizations)
+      } else {
+        await page.goto(admin + organizations)
+        await expect(page).toHaveURL(admin + organizations)
+      }
+      const sessionBefore = (await context.cookies(admin)).find(
+        (cookie) => cookie.name === cookieName
       )?.value
       const sessions = () =>
         guardedSql(
@@ -84,15 +93,15 @@ for (const provider of ['google', 'github'] as const) {
         ).trim()
       expect(Boolean(sessionBefore)).toBe(true)
       const countBefore = sessions()
-      const seen = await getBrowserFixture(context, staff, identityEmail, provider, 'admin', true)
-      await page.goto(`${staff}/api/product-admin/auth/oauth/${provider}/link`, {
-        referer: `${staff}/en/organizations`,
+      const seen = await getBrowserFixture(context, admin, identityEmail, provider, 'admin', true)
+      await page.goto(`${admin}/api/product-admin/auth/oauth/${provider}/link`, {
+        referer: admin + organizations,
       })
       try {
         await page.waitForURL(
           (url) =>
-            url.origin === staff &&
-            url.pathname === '/en/auth/linked' &&
+            url.origin === admin &&
+            url.pathname === '/en' + productAdminPath('/auth/linked') &&
             url.searchParams.get('linked') === provider,
           { timeout: 15000 }
         )
@@ -102,11 +111,10 @@ for (const provider of ['google', 'github'] as const) {
       expect(seen()).toBe(true)
       expect(sessions()).toBe(countBefore)
       expect(
-        (await context.cookies(staff)).find(
-          (cookie) => cookie.name === '__Host-amcore_staff_session'
-        )?.value === sessionBefore
+        (await context.cookies(admin)).find((cookie) => cookie.name === cookieName)?.value ===
+          sessionBefore
       ).toBe(true)
-      const response = await context.request.get(`${staff}/api/auth/me`)
+      const response = await context.request.get(`${admin}/api/auth/me`)
       expect((await response.json()).user.email).toBe(email)
       expect(
         guardedSql(
@@ -115,7 +123,7 @@ for (const provider of ['google', 'github'] as const) {
         ).trim()
       ).toBe('1')
       expect(
-        (await context.cookies(staff)).some(
+        (await context.cookies(admin)).some(
           (cookie) => cookie.name === '__Host-amcore_admin_oauth_refresh'
         )
       ).toBe(false)

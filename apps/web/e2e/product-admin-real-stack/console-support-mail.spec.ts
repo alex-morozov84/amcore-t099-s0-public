@@ -23,7 +23,7 @@ test('operator recovery and verification use real localized website mail with sa
   const m = activeTarget()
   if (
     !['support-mail-path', 'support-mail-host'].includes(m.fixtureProfile ?? '') ||
-    !m.origins.staff
+    (!m.s0Scenario && !m.origins.staff)
   )
     throw new Error('Owned support-mail topology required')
   const copy = (locale: string) =>
@@ -258,16 +258,20 @@ test('operator recovery and verification use real localized website mail with sa
     { headers: { Origin: 'https://untrusted.example.test' }, data: { kind: 'password_recovery' } }
   )
   expect(foreign.status()).toBe(403)
-  if (m.consoleTopology === 'host') {
+  if (m.consoleTopology === 'host' && m.origins.staff) {
     const sibling = await page.request.post(
       `${consoleOrigin}${consoleApi}/users/${target}/support-mail/prepare`,
       { headers: { Origin: m.origins.staff }, data: { kind: 'password_recovery' } }
     )
     expect(sibling.status()).toBe(403)
   }
-  expect(
-    (await page.request.get(`${m.origins.staff}/api/console/users/${target}/support-mail`)).status()
-  ).toBe(404)
+  if (m.origins.staff) {
+    expect(
+      (
+        await page.request.get(`${m.origins.staff}/api/console/users/${target}/support-mail`)
+      ).status()
+    ).toBe(404)
+  }
 
   guardedSql(
     `UPDATE core.auth_session_families SET "primaryAt"=now()-interval '1 day', "mfaAt"=now()-interval '1 day' WHERE "userId"=:'id';

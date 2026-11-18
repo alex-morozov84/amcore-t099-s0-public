@@ -1,5 +1,5 @@
 import { completeMfaSignIn } from '../shared/mfa-login'
-import { isProductHome, messages, productPath } from '../shared/product-settings'
+import { consolePath, isProductHome, messages, productPath } from '../shared/product-settings'
 import { activeTarget, guardedSql } from '../support/managed-target.mjs'
 
 const standTarget = activeTarget()
@@ -103,9 +103,14 @@ test('host session is isolated, origin-guarded, and loses admission after demoti
   await console.close()
 })
 
-test('host MFA reentry retires target reads across browser history and a confirmed session change', async ({
+test('Console MFA reentry retires target reads across browser history and a confirmed session change', async ({
   browser,
 }) => {
+  const host = standTarget.consoleTopology === 'host'
+  const consoleOrigin = standTarget.origins.console ?? standTarget.origins.product
+  const consoleUrlPath = host ? productPath : consolePath
+  const cookieName = host ? '__Host-amcore_console_session' : 'amcore_session'
+  const namespace = host ? 'web:console-session:v1' : 'web:session:v1'
   const email = uniqueEmail('console-query-reentry')
   const product = await browser.newContext({
     baseURL: standTarget.origins.product,
@@ -118,7 +123,7 @@ test('host MFA reentry retires target reads across browser history and a confirm
     email,
   }).trim()
   const operator = await browser.newContext({
-    baseURL: standTarget.origins.console,
+    baseURL: consoleOrigin,
     ignoreHTTPSErrors: true,
   })
   const page = await operator.newPage()
@@ -127,14 +132,13 @@ test('host MFA reentry retires target reads across browser history and a confirm
     await page.getByLabel(messages.auth.password, { exact: true }).fill('Test1234Secure')
     await page.getByRole('button', { name: messages.auth.login, exact: true }).click()
     await completeMfaSignIn(page, email)
-    await expect(page).toHaveURL(
-      (url) => url.origin === standTarget.origins.console && isProductHome(url)
-    )
+    await expect(page).toHaveURL((url) => url.origin === consoleOrigin && isProductHome(url))
   }
   const openTarget = async () => {
+    if (!host) await page.goto(consolePath())
     await page.getByRole('link', { name: messages.console.users, exact: true }).first().click()
     await page.getByRole('row').filter({ hasText: email }).getByRole('link').first().click()
-    await expect(page).toHaveURL((url) => url.pathname === productPath(`/users/${targetId}`))
+    await expect(page).toHaveURL((url) => url.pathname === consoleUrlPath(`/users/${targetId}`))
     await expect(
       page.getByRole('heading', {
         level: 2,
@@ -149,11 +153,11 @@ test('host MFA reentry retires target reads across browser history and a confirm
     ).toBeVisible()
   }
   const sessionFamily = async () => {
-    const cookie = (await operator.cookies(standTarget.origins.console)).find(
-      (entry) => entry.name === '__Host-amcore_console_session'
+    const cookie = (await operator.cookies(consoleOrigin)).find(
+      (entry) => entry.name === cookieName
     )
     if (!cookie) throw new Error('Confirmed Console cookie missing')
-    const entry = redisEntry(`web:console-session:v1:${cookie.value}`)
+    const entry = redisEntry(`${namespace}:${cookie.value}`)
     const binding = entry.browser as { familyId?: string } | undefined
     if (!binding?.familyId) throw new Error('Confirmed Console family missing')
     return binding.familyId
@@ -164,7 +168,11 @@ test('host MFA reentry retires target reads across browser history and a confirm
     const firstFamily = await sessionFamily()
     let reads = 0
     page.on('request', (request) => {
-      if (new URL(request.url()).pathname === `/api/users/${targetId}/sessions`) reads++
+      if (
+        new URL(request.url()).pathname ===
+        `${host ? '/api' : '/api/console'}/users/${targetId}/sessions`
+      )
+        reads++
     })
     await openTarget()
     expect(reads).toBe(1)
@@ -175,7 +183,7 @@ test('host MFA reentry retires target reads across browser history and a confirm
     const history = await navigation.send('Page.getNavigationHistory')
     const loginEntry = history.entries.find((entry) => {
       const url = new URL(entry.url)
-      return url.origin === standTarget.origins.console && url.pathname === productPath('/login')
+      return url.origin === consoleOrigin && url.pathname === productPath('/login')
     })
     expect(!!loginEntry).toBe(true)
     await navigation.send('Page.navigateToHistoryEntry', { entryId: loginEntry!.id })
@@ -192,9 +200,9 @@ test('host MFA reentry retires target reads across browser history and a confirm
     expect(Date.now() - loadedAt).toBeLessThan(60000)
     expect(reads).toBe(2)
     await page.goBack()
-    await expect(page).toHaveURL((url) => url.pathname === productPath('/users'))
+    await expect(page).toHaveURL((url) => url.pathname === consoleUrlPath('/users'))
     await page.goForward()
-    await expect(page).toHaveURL((url) => url.pathname === productPath(`/users/${targetId}`))
+    await expect(page).toHaveURL((url) => url.pathname === consoleUrlPath(`/users/${targetId}`))
     await expect(
       page.getByRole('heading', {
         level: 2,

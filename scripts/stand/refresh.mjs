@@ -13,7 +13,7 @@ import { snapshot } from './snapshot.mjs'
 export async function refresh(m) {
   const choices = await projectChoices(m.worktree)
   if (m.settingsPolicy) {
-    assertPreserveRequest(m.settingsPolicy, m.fixtureProfile, m.topology, choices)
+    assertPreserveRequest(m.settingsPolicy, m.fixtureProfile, m.topology, choices, m.s0Scenario)
     const current = await sourceSettings(m.worktree)
     if (m.settingsPolicy === 'preserve' && !isDeepStrictEqual(m.sourceSettings, current))
       throw new Error('Source settings changed; use a fresh stand ID')

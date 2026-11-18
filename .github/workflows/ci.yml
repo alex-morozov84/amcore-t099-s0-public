@@ -14,6 +14,7 @@ permissions:
   contents: read
 
 env:
+  AMCORE_E2E_INVENTORY: s0
   API_E2E_CACHE_MODE: warm
   API_E2E_PR_HEAD: ${{ github.event.pull_request.head.sha || '' }}
 
@@ -924,6 +925,7 @@ jobs:
             .amcore/stands/*/report/
             .amcore/stands/*/test-results/
             .amcore/stands/*/inventory.json
+            .amcore/lighthouse-results/*/*/*/lifecycle.json
           include-hidden-files: true
           retention-days: 7
 

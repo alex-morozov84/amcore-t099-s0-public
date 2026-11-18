@@ -823,3 +823,23 @@ Separate queue, setup, cache and container costs; do not infer speed from a shor
 Rollback of the repeat removal restores the focused/background job, its fresh
 prepare and artifact upload, the Test dependency and expected set, contract tests
 and documentation together. It does not migrate dependencies or persistent data.
+
+### Synthetic S0 browser inventory
+
+This product selects its complete S0 inventory in Web E2E. Run the source-only
+plan from the repository root with
+`AMCORE_E2E_INVENTORY=s0 node scripts/e2e-ci.mjs --matrix`. Use `--audit-plan` to
+see the case-set hashes and assigned audits. Broad, mixed and unknown changes
+use this inventory. The standard group retains all its applicable cases.
+
+The plan requires both served locales, Console at `/admin`, and product
+administration at `/manage`. The invitation HTTPS group uses the existing web
+TLS configuration. Setup, provisioning, support mail and closed-signup
+invitation groups use the existing isolated data and mail preparations.
+
+When changing cases, compare Playwright's collection in each affected managed
+group with the intended inventory before updating `ci/s0-browser-cases.json`.
+Each value is a SHA-256 digest of the JSON array of sorted Playwright case IDs.
+The aggregate requires matching execution evidence from the current checkout
+and attempt. It also requires the `login`, `members` and `console-overview`
+audit reports from `configured-standard`.

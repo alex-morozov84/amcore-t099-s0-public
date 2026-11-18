@@ -38,8 +38,10 @@ export function composeArguments(m) {
   ]
   if (m.productAdminHost)
     args.push('--profile', 'edge', '-f', `${m.snapshot}/docker/compose/product-admin-host.yml`)
-  else if (m.topology === 'host')
-    args.push('--profile', 'edge', '-f', `${m.snapshot}/docker/compose/console-host.yml`)
+  else if (m.topology === 'host') {
+    const overlay = m.s0Scenario ? 'web' : 'console-host'
+    args.push('--profile', 'edge', '-f', `${m.snapshot}/docker/compose/${overlay}.yml`)
+  }
   return [...args, '-f', m.overlay]
 }
 export function compose(m, args, options = {}) {

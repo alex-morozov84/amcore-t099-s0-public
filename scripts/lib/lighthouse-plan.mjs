@@ -1,3 +1,4 @@
+import { browserCaseDigests } from '../stand/s0-case-evidence.mjs'
 import { assertRequiredAudits } from './lighthouse-required.mjs'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
@@ -78,10 +79,10 @@ export function auditCatalogue(root, choices = auditChoices(root)) {
   return { scenarios, coverage }
 }
 
-export function auditScope(root, { configured = false } = {}) {
+export function auditScope(root, { configured = false, s0 = false } = {}) {
   const choices = auditChoices(root)
   const catalogue = auditCatalogue(root, choices)
-  const lanes = ciLanes(root, { configured })
+  const lanes = ciLanes(root, { configured, s0 })
   const owner = (scope) => {
     if (configured) {
       if (scope === 'product' || scope === 'product-admin') return 'configured-standard'
@@ -106,6 +107,13 @@ export function auditScope(root, { configured = false } = {}) {
     'missing-required-owner'
   )
   invariant(catalogue.scenarios.length <= 3, 'scenario-count-requires-budget-admission')
+  if (s0) {
+    invariant(
+      JSON.stringify(assignments['configured-standard']) ===
+        JSON.stringify(['login', 'members', 'console-overview']),
+      'missing-s0-standard-audit'
+    )
+  }
   return { choices, catalogue, assignments }
 }
 
@@ -120,6 +128,7 @@ export function auditPlan(root, identity, options) {
   const plan = {
     version: 1,
     ...(options?.configured ? { execution: 'configured' } : {}),
+    ...(options?.s0 ? { browserCases: browserCaseDigests(root, Object.keys(assignments)) } : {}),
     ...identity,
     config: digest(choices),
     descriptors: digest(catalogue),
