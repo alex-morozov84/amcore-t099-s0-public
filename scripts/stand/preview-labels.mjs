@@ -1,0 +1,42 @@
+import { readFile } from 'node:fs/promises'
+import { join } from 'node:path'
+
+export async function previewLabels(m) {
+  const messages = JSON.parse(
+    await readFile(join(m.snapshot, `apps/web/messages/${m.baseLocale}.json`), 'utf8')
+  )
+  const labels = {
+    product: {
+      email: messages.auth.email,
+      password: messages.auth.password,
+      submit: messages.auth.login,
+      creationTitle: messages.organizationCreation.title,
+      create: messages.organizationCreation.create,
+      organizationName: messages.organizationCreation.name,
+      cancelCreation: messages.organizationCreation.cancel,
+    },
+  }
+  if (m.operatorMfa) {
+    const t = messages.accountMfa
+    labels.mfa = {
+      connectApp: t.connectApp,
+      qrLabel: t.qrLabel,
+      appCode: t.appCode,
+      continue: t.continue,
+      codesDescription: t.codesDescription,
+      backupCodesTitle: t.backupCodesTitle,
+      savedCheckbox: t.savedCheckbox,
+      finishSetup: t.finishSetup,
+    }
+  }
+  if (m.consoleEnabled)
+    labels.console = {
+      email: messages.console.loginEmail,
+      password: messages.console.loginPassword,
+      submit: messages.console.signIn,
+      setupTitle: messages.console.organizationSetup.title,
+      setupFirstStep: messages.console.organizationSetup.headings.administrator,
+      setupStates: Object.values(messages.console.organizationSetup.states),
+    }
+  return labels
+}

@@ -1,0 +1,198 @@
+import { ADMIN_CONSOLE_SETTINGS } from '@amcore/shared'
+import { expect, type Route, test } from '@playwright/test'
+
+import { messages } from '../shared/product-settings'
+import { consolePath, isProductHome } from '../shared/product-settings'
+
+import {
+  createOrganization,
+  createOrganizationsForPagination,
+  setSystemRole,
+} from './admin-helpers'
+import { loginViaUi, registerViaUi, uniqueEmail } from './helpers'
+
+test.skip(
+  ADMIN_CONSOLE_SETTINGS.mode !== 'path',
+  'Requires configured path Console; isolated-host scenarios run in the host family'
+)
+
+/**
+ * Path mode (this checkout's configured topology -
+ * `packages/shared/src/config/admin-console.json`)
+ * has no separate console login: a SUPER_ADMIN signs into the ordinary
+ * product session, then opens `/admin` directly (`docs/operations-console/
+ * README.md`). This proves the Organizations panel's real data path over
+ * that reused session, mirroring `console-real-stack/organizations.spec.ts`'s
+ * host-mode coverage of the same panel.
+ *
+ * `SystemRolesGuard` (`apps/api/src/core/auth/guards/system-roles.guard.ts`,
+ * OB-06a/ADR-037) requires the JWT's `systemRole` *claim* to already satisfy
+ * the route, intersected with the live DB role - a promotion only takes
+ * effect on a token minted *after* it, by design (the asymmetric guard
+ * against a stale-promotion replay). So every test that expects SUPER_ADMIN
+ * access must re-authenticate after `setSystemRole(..., 'SUPER_ADMIN')`,
+ * not just update the row and reuse the already-issued session.
+ */
+test('path-mode Organizations panel renders real data via the reused product session', async ({
+  page,
+}) => {
+  const email = uniqueEmail('admin-orgs')
+  await registerViaUi(page, email)
+  await expect(page).toHaveURL(isProductHome)
+  setSystemRole(email, 'SUPER_ADMIN')
+  await page.context().clearCookies()
+  await loginViaUi(page, email)
+  await expect(page).toHaveURL(isProductHome)
+
+  const orgName = `Path E2E Org ${Date.now()}`
+  const orgSlug = `path-e2e-org-${Date.now()}`
+  createOrganization(orgName, orgSlug)
+
+  const requestsWithAuthHeader: string[] = []
+  page.on('request', (request) => {
+    if (request.headers().authorization) requestsWithAuthHeader.push(request.url())
+  })
+
+  await page.goto(consolePath('/organizations'))
+  await expect(page.getByRole('cell', { name: orgName })).toBeVisible()
+  await expect(page.getByRole('cell', { name: orgSlug })).toBeVisible()
+
+  const html = await page.content()
+  expect(html).not.toContain('Bearer ')
+  expect(requestsWithAuthHeader).toHaveLength(0)
+})
+
+test('path-mode Organizations panel denies a demoted session with a live re-check', async ({
+  page,
+}) => {
+  const email = uniqueEmail('admin-orgs-denied')
+  await registerViaUi(page, email)
+  setSystemRole(email, 'SUPER_ADMIN')
+  await page.context().clearCookies()
+  await loginViaUi(page, email)
+  await expect(page).toHaveURL(isProductHome)
+
+  await page.goto(consolePath('/organizations'))
+  await expect(page.getByRole('heading', { name: messages.console.organizations })).toBeVisible()
+
+  // Demotion, unlike promotion above, takes effect on the *existing* token:
+  // the guard's live current-DB-role read (not the JWT claim) catches it.
+  setSystemRole(email, 'USER')
+  const response = await page.goto(consolePath('/organizations'))
+  expect(response?.status()).toBe(404)
+})
+
+/**
+ * Next's installed *Layouts and Pages* docs: a layout persists and does not
+ * rerender on client-side navigation between sibling pages underneath it.
+ * A role check only in `(protected)/layout.tsx` would stop
+ * being a real gate the moment a second protected page exists - it would
+ * only run once, on whichever page first mounted the layout. Each protected
+ * page must call it itself. This proves that with a real client-side
+ * transition (clicking the sidebar link), not `page.goto()` (a full
+ * navigation, which would pass even with a layout-only check).
+ */
+test('client-side navigation back to Organizations re-checks a demotion that happened while elsewhere', async ({
+  page,
+}) => {
+  const email = uniqueEmail('admin-orgs-clientnav')
+  await registerViaUi(page, email)
+  setSystemRole(email, 'SUPER_ADMIN')
+  await page.context().clearCookies()
+  await loginViaUi(page, email)
+  await expect(page).toHaveURL(isProductHome)
+
+  await page.goto(consolePath('/organizations'))
+  await expect(page.getByRole('heading', { name: messages.console.organizations })).toBeVisible()
+
+  await page.getByRole('link', { name: messages.console.overview }).click()
+  await expect(page).toHaveURL((url) => url.pathname.replace(/\/$/, '') === consolePath())
+
+  setSystemRole(email, 'USER')
+  await page.getByRole('link', { name: messages.console.organizations }).click()
+  await expect(page.getByRole('heading', { name: /404|not found/i })).toBeVisible()
+  await expect(page.getByRole('heading', { name: messages.console.organizations })).toHaveCount(0)
+})
+
+test('path-mode Organizations panel paginates real data with the Next/Previous links', async ({
+  page,
+}) => {
+  const email = uniqueEmail('admin-orgs-page2')
+  await registerViaUi(page, email)
+  setSystemRole(email, 'SUPER_ADMIN')
+  await page.context().clearCookies()
+  await loginViaUi(page, email)
+
+  const marker = Date.now()
+  const lastOrgName = `Page2 Marker Org ${marker}`
+  // `AdminService.findAllOrganizations` orders by `createdAt: 'desc'` - the
+  // *oldest* row of a batch ends up on the later page. Create the marker
+  // first, then 20 newer rows that outrank it in the descending sort, so it
+  // reliably lands on page 2 regardless of any leftover rows from earlier
+  // tests in this file (those are older still and only sink further).
+  createOrganizationsForPagination(marker)
+
+  const isPage2 = (url: URL) =>
+    url.pathname === consolePath('/organizations') && url.searchParams.get('page') === '2'
+  let releasePage2!: () => void
+  let page2Entered!: () => void
+  const heldResponse = new Promise<void>((resolve) => {
+    releasePage2 = resolve
+  })
+  const entered = new Promise<void>((resolve) => {
+    page2Entered = resolve
+  })
+  const responses: Promise<void>[] = []
+  const gatePage2 = (route: Route) => {
+    const work = (async () => {
+      page2Entered()
+      const response = await route.fetch()
+      await heldResponse
+      await route.fulfill({ response })
+    })()
+    responses.push(work)
+    return work
+  }
+  await page.clock.install()
+  try {
+    await page.route(isPage2, gatePage2)
+    await page.goto(consolePath('/organizations'))
+    const search = page.getByLabel(messages.console.organizationsSearchLabel)
+    await expect(search).toBeEnabled()
+    await expect(page.getByRole('cell', { name: lastOrgName })).toHaveCount(0)
+    // Pause after loaded controls; the conditional clear button below proves client handling.
+    await page.clock.pauseAt(new Date(Date.now() + 1000))
+    const searches: string[] = []
+    page.on('request', (request) => {
+      const url = new URL(request.url())
+      if (url.pathname === consolePath('/organizations') && url.searchParams.has('search'))
+        searches.push(request.url())
+    })
+    await search.fill('uncommitted-page-draft')
+    await expect(
+      page.getByRole('button', { name: messages.console.organizationsSearchClear })
+    ).toBeVisible()
+    // Hold the real Next response: a fast navigation must not cancel the bug for the test.
+    await page
+      .getByRole('link', { name: messages.console.paginationNext })
+      .click({ noWaitAfter: true })
+    await entered
+    await page.clock.runFor(1000)
+    expect(searches).toEqual([])
+    releasePage2()
+    await expect(page).toHaveURL(/[?&]page=2\b/)
+    await expect(page).not.toHaveURL(/[?&]search=/)
+    await expect(search).toHaveValue('')
+    await expect(page.getByRole('cell', { name: lastOrgName })).toBeVisible()
+
+    await page.getByRole('link', { name: messages.console.paginationPrevious }).click()
+    // Page1 is the default and its parameter is omitted.
+    await expect(page).not.toHaveURL(/[?&]page=/)
+    await expect(page.getByRole('cell', { name: lastOrgName })).toHaveCount(0)
+  } finally {
+    releasePage2()
+    await page.unroute(isPage2, gatePage2)
+    await Promise.allSettled(responses)
+    await page.clock.resume()
+  }
+})

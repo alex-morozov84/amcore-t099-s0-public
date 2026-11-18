@@ -1,0 +1,82 @@
+import { Suspense } from 'react'
+import { getTranslations } from 'next-intl/server'
+
+import {
+  DiscoverySearchBoundary,
+  type DiscoverySortOrder,
+  SearchInput,
+} from '@/features/console-discovery'
+import { OrganizationAttention } from '@/features/console-organization-administration'
+import { OrganizationProvisioning } from '@/features/console-organization-provisioning'
+import { OrganizationSetup } from '@/features/console-organization-setup'
+import { getConsoleOrganizationsHref } from '@/shared/lib/console-public-href'
+import { ConsoleFilterPanel } from '@/shared/ui/console-detail/ConsoleFilterPanel'
+import { ConsoleRestorePosition } from '@/shared/ui/console-detail/ConsoleRestorePosition'
+
+import { OrganizationsResults } from './OrganizationsResults'
+import { OrganizationsResultsSkeleton } from './OrganizationsResultsSkeleton'
+import { getOrganizationsEffectiveSortOrder, type OrganizationsSortableField } from './parse-query'
+
+const DEFAULT_SORT_BY: OrganizationsSortableField = 'createdAt'
+
+export interface OrganizationsPageProps {
+  page: number
+  limit: number
+  search?: string
+  sortBy?: OrganizationsSortableField
+  sortOrder?: DiscoverySortOrder
+}
+
+/**
+ * Searchable/sortable Organizations panel. The heading and search box render
+ * immediately; only
+ * `OrganizationsResults` (the part that actually needs the backend fetch)
+ * sits behind its own `<Suspense>`. Mirrors `UsersPage`/`UsersResults`
+ * exactly; see that pair's own doc comments for the full rationale.
+ */
+export async function OrganizationsPage({
+  page,
+  limit,
+  search,
+  sortBy = DEFAULT_SORT_BY,
+  sortOrder,
+}: OrganizationsPageProps) {
+  const t = await getTranslations('console')
+  const baseHref = getConsoleOrganizationsHref()
+  return (
+    <section className="flex flex-col gap-4">
+      <ConsoleRestorePosition />
+      <h1 className="text-3xl font-semibold tracking-tight">{t('organizations')}</h1>
+      <OrganizationProvisioning />
+      <OrganizationSetup />
+      <OrganizationAttention />
+      <DiscoverySearchBoundary
+        baseHref={baseHref}
+        search={search}
+        page={page}
+        sortBy={sortBy}
+        sortOrder={sortOrder}
+        effectiveSortOrder={getOrganizationsEffectiveSortOrder(sortBy, sortOrder)}
+      >
+        <ConsoleFilterPanel>
+          <SearchInput
+            label={t('organizationsSearchLabel')}
+            placeholder={t('organizationsSearchPlaceholder')}
+            clearLabel={t('organizationsSearchClear')}
+            inputId="organizations-search"
+          />
+        </ConsoleFilterPanel>
+        <Suspense fallback={<OrganizationsResultsSkeleton />}>
+          <OrganizationsResults
+            page={page}
+            limit={limit}
+            search={search}
+            sortBy={sortBy}
+            sortOrder={sortOrder}
+            baseHref={baseHref}
+          />
+        </Suspense>
+      </DiscoverySearchBoundary>
+    </section>
+  )
+}

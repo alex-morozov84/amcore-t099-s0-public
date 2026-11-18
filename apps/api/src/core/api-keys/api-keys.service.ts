@@ -1,0 +1,300 @@
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
+
+import { Injectable } from '@nestjs/common'
+import { PinoLogger } from 'nestjs-pino'
+
+import type { ApiKeyListResponse, ApiKeyQuery } from '@amcore/shared'
+import type { CreateApiKeyInput } from '@amcore/shared'
+
+import { ForbiddenException } from '../../common/exceptions/index.js'
+import { AuditActorType, AuditTargetType, Prisma } from '../../generated/prisma/client.js'
+import { BoundedRedis } from '../../infrastructure/redis/index.js'
+import { PrismaService } from '../../prisma/index.js'
+import { AuditLogService } from '../audit/index.js'
+import { isStageExpired } from '../auth/stage/auth-stage.service.js'
+
+import { apiKeyStatus, apiKeyStatusWhere } from './api-key-lifecycle.js'
+import { ApiKeyRevocationService } from './api-key-revocation.service.js'
+
+export interface CreateApiKeyResult {
+  id: string
+  name: string
+  key: string
+  organizationId: string
+  scopes: string[]
+  expiresAt: string | null
+  createdAt: string
+}
+
+export interface ApiKeyListItem {
+  organizationName: string | null
+  id: string
+  name: string
+  organizationId: string
+  scopes: string[]
+  expiresAt: string | null
+  lastUsedAt: string | null
+  createdAt: string
+  revokedAt: string | null
+  revocationReason:
+    | 'owner_revoked'
+    | 'platform_revoked'
+    | 'organization_admin_revoked'
+    | 'membership_removed'
+    | null
+  status: 'unexpired' | 'expired' | 'revoked'
+}
+
+@Injectable()
+export class ApiKeysService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly redis: BoundedRedis,
+    private readonly auditLog: AuditLogService,
+    private readonly logger: PinoLogger,
+    private readonly revocation: ApiKeyRevocationService
+  ) {
+    this.logger.setContext(ApiKeysService.name)
+  }
+
+  async create(userId: string, input: CreateApiKeyInput): Promise<CreateApiKeyResult> {
+    // Per ADR-033: API keys are organization-scoped. Creator must be a
+    // member of the bound organization at creation time. Membership is
+    // re-verified on each request by ApiKeyGuard (lazy invariant) so a
+    // later loss of membership invalidates the credential.
+    const { key, shortToken, longToken } = this.generateKey()
+    const salt = randomBytes(16).toString('hex')
+    const keyHash = this.hashLongToken(longToken, salt)
+
+    const apiKey = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM core.organizations WHERE id = ${input.organizationId} FOR UPDATE`
+      const membership = await tx.orgMember.findUnique({
+        where: { userId_organizationId: { userId, organizationId: input.organizationId } },
+        select: { id: true },
+      })
+
+      if (!membership) {
+        throw new ForbiddenException('Not a member of the specified organization')
+      }
+
+      const created = await tx.apiKey.create({
+        data: {
+          name: input.name,
+          shortToken,
+          keyHash,
+          salt,
+          scopes: input.scopes,
+          expiresAt: input.expiresAt ? new Date(input.expiresAt) : null,
+          userId,
+          organizationId: input.organizationId,
+        },
+      })
+
+      await this.auditLog.record(
+        {
+          action: 'api_key.created',
+          actorId: userId,
+          actorType: AuditActorType.USER,
+          metadata: {
+            expiresAt: created.expiresAt?.toISOString() ?? null,
+            name: created.name,
+            pinoEvent: 'api_key.created',
+            scopes: created.scopes,
+          },
+          organizationId: created.organizationId,
+          targetId: created.id,
+          targetType: AuditTargetType.API_KEY,
+        },
+        { tx }
+      )
+
+      return created
+    })
+
+    this.logger.info(
+      { userId, apiKeyId: apiKey.id, organizationId: apiKey.organizationId },
+      'API key created'
+    )
+
+    return {
+      id: apiKey.id,
+      name: apiKey.name,
+      key,
+      organizationId: apiKey.organizationId,
+      scopes: apiKey.scopes,
+      expiresAt: apiKey.expiresAt?.toISOString() ?? null,
+      createdAt: apiKey.createdAt.toISOString(),
+    }
+  }
+
+  async findAllForUser(
+    userId: string,
+    page: number,
+    limit: number,
+    status: 'all' | 'unexpired' | 'expired' | 'revoked' = 'all',
+    filters: Pick<ApiKeyQuery, 'search' | 'organizationId' | 'organizationAvailability'> = {}
+  ): Promise<ApiKeyListResponse> {
+    // ADR-036: paginated envelope. ORDER BY createdAt DESC, id ASC for
+    // deterministic page boundaries (createdAt is usually unique but
+    // not guaranteed; id tie-break is mandatory).
+    const now = new Date()
+    const where = {
+      userId,
+      ...apiKeyStatusWhere(status, now),
+      ...(filters.search && {
+        name: {
+          contains: filters.search.replace(/[\\%_]/g, (c) => `\\${c}`),
+          mode: 'insensitive' as const,
+        },
+      }),
+      ...(filters.organizationId && { organizationId: filters.organizationId }),
+      ...(filters.organizationAvailability && { organization: { members: { none: { userId } } } }),
+    }
+    const skip = (page - 1) * limit
+    const [keys, total] = await this.prisma.$transaction(
+      async (tx) =>
+        Promise.all([
+          tx.apiKey.findMany({
+            where,
+            skip,
+            take: limit,
+            orderBy: [{ createdAt: 'desc' }, { id: 'asc' }],
+            select: {
+              id: true,
+              name: true,
+              organizationId: true,
+              scopes: true,
+              expiresAt: true,
+              lastUsedAt: true,
+              createdAt: true,
+              revokedAt: true,
+              revocationReason: true,
+              organization: {
+                select: {
+                  name: true,
+                  members: { where: { userId }, take: 1, select: { id: true } },
+                },
+              },
+            },
+          }),
+          tx.apiKey.count({ where }),
+        ]),
+      { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead }
+    )
+
+    return {
+      data: keys.map((k) => ({
+        organizationName: k.organization.members.length ? k.organization.name : null,
+        id: k.id,
+        name: k.name,
+        organizationId: k.organizationId,
+        scopes: k.scopes,
+        expiresAt: k.expiresAt?.toISOString() ?? null,
+        lastUsedAt: k.lastUsedAt?.toISOString() ?? null,
+        createdAt: k.createdAt.toISOString(),
+        revokedAt: k.revokedAt?.toISOString() ?? null,
+        revocationReason: k.revocationReason as ApiKeyListItem['revocationReason'],
+        status: apiKeyStatus(k, now),
+      })),
+      total,
+      page,
+      limit,
+    }
+  }
+
+  async revoke(id: string, userId: string): Promise<void> {
+    const result = await this.revocation.revoke([id], userId, false)
+    this.logger.info(
+      { userId, apiKeyId: id, affectedCount: result.affectedCount },
+      'API key revoked'
+    )
+  }
+
+  async verifyByShortToken(
+    shortToken: string,
+    longToken: string
+  ): Promise<Prisma.ApiKeyGetPayload<{
+    include: { user: { select: { systemRole: true } } }
+  }> | null> {
+    const apiKey = await this.prisma.apiKey.findUnique({
+      where: { shortToken },
+      include: { user: { select: { systemRole: true } } },
+    })
+
+    const now = new Date()
+    if (!apiKey || apiKey.revokedAt || !apiKey.keyHash || !apiKey.salt) return null
+    if (apiKey.expiresAt && apiKey.expiresAt <= now) return null
+    if (!this.verifyLongToken(longToken, apiKey.keyHash, apiKey.salt)) return null
+
+    return apiKey
+  }
+
+  // AK-12: lastUsedAt is operational metadata and must never make a
+  // valid request fail. The caller (`ApiKeyGuard`) intentionally
+  // discards the returned promise (`void touchLastUsed(...)`), so any
+  // error escaping this method becomes an unhandled rejection. Every
+  // I/O is wrapped — cache flakiness or a revoke race only ever
+  // produces a warn log, never propagates.
+  async touchLastUsed(id: string): Promise<void> {
+    const cacheKey = `api_key:last_used:${id}`
+
+    // One atomic claim per key per hour: the first caller gets `OK` and writes.
+    // A stale claim after a failed DB write only leaves lastUsedAt old for up to
+    // an hour; the claim is deliberately not deleted on failure.
+    let claimed = true
+    try {
+      claimed =
+        (await this.redis.run((client) =>
+          client.set(cacheKey, '1', {
+            expiration: { type: 'PX', value: 3600 * 1000 },
+            condition: 'NX',
+          })
+        )) === 'OK'
+    } catch (err) {
+      this.logger.warn({ err, apiKeyId: id }, 'Failed to claim api_key last_used gate (continuing)')
+      // Fall through: without the gate we'll do one extra DB
+      // write per request, but the request itself succeeds.
+    }
+
+    if (!claimed) return
+    // Started inside an admission that has since expired: the claim may have settled late, but a
+    // fresh database write must not start. Stop quietly; this promise is discarded by the caller.
+    if (isStageExpired()) return
+
+    // Conditional metadata update cannot modify a terminal credential or resurrect a row.
+    const now = new Date()
+    void this.prisma.apiKey
+      .updateMany({
+        where: { id, revokedAt: null, OR: [{ expiresAt: null }, { expiresAt: { gt: now } }] },
+        data: { lastUsedAt: now },
+      })
+      .catch((err: unknown) => this.logger.warn({ err }, 'Failed to update lastUsedAt'))
+  }
+
+  // AK-08: only `live` is supported. A real test/sandbox mode would need
+  // data-scope separation (Stripe-style) and is a future feature with its
+  // own ADR — until then the prefix is a constant.
+  private generateKey(): {
+    key: string
+    shortToken: string
+    longToken: string
+  } {
+    const shortToken = randomBytes(8).toString('base64url')
+    const longToken = randomBytes(24).toString('base64url')
+    const key = `amcore_live_${shortToken}_${longToken}`
+    return { key, shortToken, longToken }
+  }
+
+  private hashLongToken(longToken: string, salt: string): string {
+    return createHash('sha256')
+      .update(longToken + salt)
+      .digest('hex')
+  }
+
+  private verifyLongToken(longToken: string, storedHash: string, salt: string): boolean {
+    const computed = createHash('sha256')
+      .update(longToken + salt)
+      .digest('hex')
+    return timingSafeEqual(Buffer.from(computed, 'hex'), Buffer.from(storedHash, 'hex'))
+  }
+}

@@ -1,0 +1,123 @@
+import { cache } from 'react'
+import { cookies, headers } from 'next/headers'
+import type { Locale } from 'next-intl'
+import { getLocale } from 'next-intl/server'
+import type { UserResponse } from '@amcore/shared'
+
+import { redirect } from '@/i18n/navigation'
+
+import { createBrowserBindingVerifier } from './browser-binding.server'
+import { ContextRequestError } from './context-errors'
+import { ensureFreshSession } from './ensure-fresh-session'
+import { isInvalidRefreshError, SessionNotFoundError, SessionRefreshUnsafeError } from './errors'
+import { type ProductRouteKind, resolveProductWebContext } from './product-web-context.server'
+import type { VaultEntry } from './session-vault.types'
+import { createUpstreamRefresh } from './upstream-refresh'
+
+import 'server-only'
+
+export interface DalSession {
+  user: UserResponse
+}
+
+/**
+ * Data Access Layer (Next's own recommended auth pattern — see
+ * `apps/web/node_modules/next/dist/docs/01-app/02-guides/authentication.md`
+ * "Creating a Data Access Layer (DAL)"). `cache()`-wrapped so several Server
+ * Components on one page share a single Redis round-trip per request
+ * instead of one each.
+ *
+ * Splits errors exactly like `authenticated-proxy.ts`'s
+ * `authFailureResponse` (round 2 of that slice's review): "no session"
+ * (missing cookie, `SessionNotFoundError`, an explicit invalid/reuse-detected
+ * refresh, or lost refresh exclusivity) resolves to `null` — genuinely
+ * logged out. Everything else (Redis unreachable, lock contention, a
+ * transient upstream refresh failure) **rethrows**: auth could not be
+ * *proven* one way or the other, which callers must not silently treat as
+ * "logged out" (see `requireSession` and `(dashboard)/error.tsx`).
+ *
+ * Split from `getOptionalSession` (below) so `shared/api/server/access-token.ts`
+ * can read the raw `accessToken` without a second Redis round-trip on a page
+ * that also calls `getOptionalSession`/`requireSession` — `cache()` dedupes
+ * both to this one call per request.
+ */
+export const getOptionalSessionEntry = cache(
+  async (kind: ProductRouteKind = 'product-data'): Promise<VaultEntry | null> => {
+    const source = await headers()
+    const context = resolveProductWebContext(source, kind)
+    const sessionId = (await cookies()).get(context.cookieName)?.value
+    if (!sessionId) return null
+
+    try {
+      return await ensureFreshSession(sessionId, {
+        store: context.store,
+        expectedAudience: context.audience,
+        lock: context.lock,
+        upstreamRefresh: createUpstreamRefresh(source, context),
+        verifyBinding: createBrowserBindingVerifier(source, context.audience),
+      })
+    } catch (error) {
+      if (
+        (error instanceof ContextRequestError && error.status === 401) ||
+        error instanceof SessionNotFoundError ||
+        error instanceof SessionRefreshUnsafeError ||
+        isInvalidRefreshError(error)
+      ) {
+        return null
+      }
+      throw error
+    }
+  }
+)
+
+export const getOptionalSession = cache(
+  async (kind: ProductRouteKind = 'product-data'): Promise<DalSession | null> => {
+    const entry = await getOptionalSessionEntry(kind)
+    return entry ? { user: entry.userSnapshot } : null
+  }
+)
+
+/**
+ * The real gate for protected pages — call this in the page itself, not
+ * only the layout. Layouts don't re-render on client-side navigation
+ * between sibling routes underneath them, so a check that only lives there
+ * stops being a real gate the moment a second protected page exists.
+ *
+ * Redirects to the localized login page when there is no session.
+ * Rethrows, does **not** redirect, when `getOptionalSession` couldn't prove
+ * auth one way or the other — a Redis blip must surface as "temporarily
+ * unavailable" (an error boundary), never as a false "you're logged out."
+ */
+export const requireSession = cache(async (): Promise<DalSession> => {
+  const session = await getOptionalSession()
+  if (!session) {
+    return redirectToLogin()
+  }
+  return session
+})
+
+/** Shared missing-session navigation; performs no credential or authority work. */
+export async function redirectToLogin(href = '/login'): Promise<never> {
+  return redirect({ href, locale: await getLocale() })
+}
+
+/**
+ * For auth pages only (login/register): redirects to `/` if a session
+ * already exists. Fails open on any error, including vault-unavailable —
+ * unlike `requireSession`, there is no security downside to rendering a
+ * login form to someone who might already be logged in; blocking the form
+ * during a Redis blip would be a strictly worse outcome for a page whose
+ * only job is to let someone authenticate.
+ */
+export async function redirectIfAuthenticated(locale: Locale): Promise<void> {
+  let session: DalSession | null
+  try {
+    session = await getOptionalSession()
+  } catch (error) {
+    console.error('[auth pages] session read failed, rendering the form anyway', error)
+    return
+  }
+  if (session) {
+    redirect({ href: '/', locale })
+  }
+}

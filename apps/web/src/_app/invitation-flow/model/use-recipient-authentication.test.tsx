@@ -1,0 +1,306 @@
+import type { PropsWithChildren } from 'react'
+import {
+  AuthErrorCode,
+  DEFAULT_LOCALE,
+  invitationFlowAuthResponseSchema,
+  invitationFlowPendingResponseSchema,
+  PRODUCT_ADMIN_CONFIG,
+  type UserResponse,
+} from '@amcore/shared'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { act, renderHook, waitFor } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+import { notificationKeys } from '@/entities/notifications'
+import { userKeys } from '@/entities/user'
+import { ApiRequestError } from '@/shared/api/http-client'
+
+import { useRecipientAuthentication } from './use-recipient-authentication'
+
+const { context, acknowledge, createAdapters } = vi.hoisted(() => ({
+  context: vi.fn(),
+  acknowledge: vi.fn(),
+  createAdapters: vi.fn((_input: unknown) => ({})),
+}))
+const navigation = vi.hoisted(() => ({ replace: vi.fn() }))
+vi.mock('@/shared/lib/route-progress/use-route-progress-router', () => ({
+  useRouteProgressRouter: () => navigation,
+}))
+vi.mock('@/entities/invitation-flow', () => ({ invitationFlowClient: { context, acknowledge } }))
+vi.mock('./credential-adapters', () => ({ createInvitationCredentialAdapters: createAdapters }))
+afterEach(() => vi.clearAllMocks())
+const binding = { flowId: 'a'.repeat(22), flowRevision: 1, sessionBinding: null }
+function setup(
+  actionBase: '/auth' | '/product-admin/auth' = '/auth',
+  initialUser: UserResponse | null = null
+) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const wrapper = ({ children }: PropsWithChildren) => (
+    <QueryClientProvider client={client}>{children}</QueryClientProvider>
+  )
+  return {
+    client,
+    ...renderHook(() => useRecipientAuthentication(binding, initialUser, actionBase), { wrapper }),
+  }
+}
+
+it('retires A private entries through signedOut and real context/ack recovery for B', async () => {
+  const user = {
+    id: 'B',
+    email: 'b@example.test',
+    emailVerified: true,
+    name: null,
+    avatarUrl: null,
+    phone: null,
+    locale: DEFAULT_LOCALE,
+    timezone: 'UTC',
+    createdAt: '2026-11-06T00:00:00.000Z',
+    lastLoginAt: null,
+  }
+  const { result, client } = setup('/auth', { ...user, id: 'A' })
+  const ownerA = { userId: 'A', contextSession: 'A-context' }
+  const key = userKeys.sessions(ownerA, DEFAULT_LOCALE, 1, 10)
+  client.setQueryData(userKeys.me(), { user: { ...user, id: 'A' }, contextSession: 'A-context' })
+  client.setQueryData(key, ['A-session'])
+  client.setQueryData(notificationKeys.preferences(ownerA), ['A-preference'])
+  const epochA = result.current.capture()
+  const signedOut = { ...binding, flowRevision: 2 }
+  await act(async () => {
+    await result.current.signedOut(signedOut)
+  })
+  expect(result.current.user).toBeNull()
+  expect(result.current.current(epochA)).toBe(false)
+  expect(client.getQueryData(userKeys.me())).toEqual({ user: null })
+  const next = { ...binding, flowRevision: 3, sessionBinding: 'b'.repeat(64) }
+  const handoff = { attemptId: 'h'.repeat(22) }
+  context.mockResolvedValueOnce(
+    invitationFlowPendingResponseSchema.parse({
+      state: 'completing_signin',
+      binding: next,
+      handoff,
+    })
+  )
+  const confirmed = invitationFlowAuthResponseSchema.parse({
+    binding: next,
+    handoff,
+    data: { user, contextSession: 'c'.repeat(64) },
+  })
+  acknowledge.mockResolvedValueOnce(confirmed)
+  await act(async () => {
+    await result.current.recover()
+  })
+  expect(result.current.handoff).toBe(handoff.attemptId)
+  const beforeAck = result.current.capture()
+  await act(async () => {
+    await result.current.recover()
+  })
+  expect(context).toHaveBeenCalledWith(binding.flowId, expect.any(AbortSignal))
+  expect(acknowledge).toHaveBeenCalledWith(next, handoff.attemptId, expect.any(AbortSignal))
+  expect(result.current.user).toEqual(user)
+  expect(result.current.binding).toEqual(next)
+  expect(result.current.phase).toBe('active')
+  expect(result.current.current(beforeAck)).toBe(false)
+  expect(client.getQueryData(userKeys.me())).toEqual(confirmed.data)
+  expect.soft(client.getQueryData(key)).toBeUndefined()
+  expect.soft(client.getQueryData(notificationKeys.preferences(ownerA))).toBeUndefined()
+})
+
+describe('recipient pending authentication recovery', () => {
+  it.each(['/auth', '/product-admin/auth'] as const)(
+    'keeps MFA navigation on the selected %s surface',
+    async (actionBase) => {
+      setup(actionBase)
+      const callbacks = createAdapters.mock.calls.at(-1)?.[0] as {
+        onMfaRequired(binding: string): void
+      }
+      const flowBinding = '01900000-0000-7000-8000-000000000000'
+      await act(async () => callbacks.onMfaRequired(flowBinding))
+      expect(navigation.replace).toHaveBeenCalledWith(
+        expect.stringContaining(`/mfa?flow=${flowBinding}`)
+      )
+      const destination = navigation.replace.mock.calls.at(-1)?.[0] as string
+      const mfaPath =
+        actionBase === '/auth' || PRODUCT_ADMIN_CONFIG.mode === 'host'
+          ? '/mfa'
+          : `/${PRODUCT_ADMIN_CONFIG.alias}/mfa`
+      expect(destination).toBe(`${mfaPath}?flow=${flowBinding}`)
+      expect(context).not.toHaveBeenCalled()
+    }
+  )
+
+  it.each([AuthErrorCode.INVALID_CREDENTIALS, AuthErrorCode.RATE_LIMIT_EXCEEDED])(
+    'synchronizes known rejection %s without replaying credentials',
+    async (code) => {
+      const { result } = setup()
+      const callbacks = createAdapters.mock.calls.at(-1)?.[0] as unknown as {
+        onStart(): void
+        onFailure(error: unknown): Promise<void>
+      }
+      const failure = new ApiRequestError(code === AuthErrorCode.RATE_LIMIT_EXCEEDED ? 429 : 401, {
+        errorCode: code,
+      } as never)
+      context.mockResolvedValueOnce({
+        binding: { ...binding, flowRevision: 3 },
+        data: { email: 'invited@example.test' },
+      })
+      act(() => callbacks.onStart())
+      await act(() => callbacks.onFailure(failure))
+      expect(result.current.phase).toBe('active')
+      expect(result.current.binding.flowRevision).toBe(3)
+      expect(result.current.error).toBe(failure)
+      expect(context).toHaveBeenCalledOnce()
+    }
+  )
+
+  it.each(['INVITE_INVALID_OR_EXPIRED', 'INVITE_FLOW_CHANGED'])(
+    'requires reopening after %s',
+    async (code) => {
+      context.mockRejectedValueOnce(
+        new ApiRequestError(409, {
+          errorCode: code,
+          message: 'test failure',
+          timestamp: new Date(0).toISOString(),
+          path: '/test',
+          method: 'GET',
+          statusCode: 409,
+        })
+      )
+      const { result } = setup()
+      act(() => result.current.observePending(binding, 'authenticating'))
+      await act(() => result.current.recover())
+      await waitFor(() =>
+        expect(result.current.phase).toBe(code === 'INVITE_FLOW_CHANGED' ? 'retired' : 'unusable')
+      )
+      expect(result.current.user).toBeNull()
+      expect(result.current.handoff).toBeNull()
+      expect(context).toHaveBeenCalledOnce()
+    }
+  )
+
+  it('preserves the pending operation after a transport failure', async () => {
+    context.mockRejectedValueOnce(new TypeError('connection interrupted'))
+    const { result } = setup()
+    act(() => result.current.observePending(binding, 'authenticating'))
+    await act(() => result.current.recover())
+    expect(result.current.phase).toBe('authenticating')
+    expect(result.current.error).toBeInstanceOf(TypeError)
+  })
+})
+
+describe('confirmed registration without a published session', () => {
+  const created = new ApiRequestError(503, {
+    errorCode: AuthErrorCode.REGISTRATION_SIGN_IN_REQUIRED,
+  } as never)
+  function started() {
+    const hook = setup()
+    const callbacks = createAdapters.mock.calls.at(-1)?.[0] as unknown as {
+      onStart(): void
+      onFailure(error: unknown): Promise<void>
+    }
+    act(() => callbacks.onStart())
+    return { ...hook, callbacks }
+  }
+
+  it('keeps the notice, reads the context without replaying credentials and enables sign-in', async () => {
+    const { result, callbacks } = started()
+    context.mockResolvedValueOnce({
+      binding: { ...binding, flowRevision: 3 },
+      data: { email: 'invited@example.test' },
+    })
+    await act(() => callbacks.onFailure(created))
+    expect(context).toHaveBeenCalledOnce()
+    expect(result.current.phase).toBe('active')
+    expect(result.current.binding.flowRevision).toBe(3)
+    expect(result.current.created).toBe(true)
+    expect(result.current.error).toBeUndefined()
+  })
+
+  it('keeps the notice and the existing recovery screen while the context is still pending', async () => {
+    const { result, callbacks } = started()
+    context.mockResolvedValueOnce({
+      binding: { ...binding, flowRevision: 2 },
+      state: 'authenticating',
+    })
+    await act(() => callbacks.onFailure(created))
+    expect(result.current.phase).toBe('authenticating')
+    expect(result.current.created).toBe(true)
+    expect(result.current.createdFailure).toBe(created)
+  })
+
+  it.each([
+    ['INVITE_FLOW_CHANGED', 'retired'],
+    ['INVITE_INVALID_OR_EXPIRED', 'unusable'],
+  ])('falls back to re-entry guidance after %s', async (code, phase) => {
+    const { result, callbacks } = started()
+    context.mockRejectedValueOnce(
+      new ApiRequestError(409, {
+        errorCode: code,
+        message: 'test failure',
+        timestamp: new Date(0).toISOString(),
+        path: '/test',
+        method: 'GET',
+        statusCode: 409,
+      })
+    )
+    await act(() => callbacks.onFailure(created))
+    expect(result.current.phase).toBe(phase)
+    expect(result.current.created).toBe(false)
+  })
+
+  it('does not enable sign-in and keeps the notice when the context cannot be read', async () => {
+    const { result, callbacks } = started()
+    context.mockRejectedValueOnce(new TypeError('connection interrupted'))
+    await act(() => callbacks.onFailure(created))
+    expect(result.current.phase).toBe('authenticating')
+    expect(result.current.created).toBe(true)
+    expect(result.current.createdFailure).toBe(created)
+    expect(result.current.error).toBeInstanceOf(TypeError)
+  })
+
+  it('does not trust a context for a different flow', async () => {
+    const { result, callbacks } = started()
+    context.mockResolvedValueOnce({
+      binding: { ...binding, flowId: 'b'.repeat(22) },
+      data: { email: 'invited@example.test' },
+    })
+    await act(() => callbacks.onFailure(created))
+    expect(result.current.phase).toBe('authenticating')
+    expect(result.current.binding.flowId).toBe(binding.flowId)
+    expect(result.current.created).toBe(true)
+  })
+
+  it('keeps the notice when a later sign-in attempt is rejected', async () => {
+    const { result, callbacks } = started()
+    context.mockResolvedValueOnce({
+      binding: { ...binding, flowRevision: 3 },
+      data: { email: 'invited@example.test' },
+    })
+    await act(() => callbacks.onFailure(created))
+    const rejected = new ApiRequestError(401, {
+      errorCode: AuthErrorCode.INVALID_CREDENTIALS,
+    } as never)
+    context.mockResolvedValueOnce({
+      binding: { ...binding, flowRevision: 5 },
+      data: { email: 'invited@example.test' },
+    })
+    const latest = createAdapters.mock.calls.at(-1)?.[0] as unknown as {
+      onStart(): void
+      onFailure(error: unknown): Promise<void>
+    }
+    act(() => latest.onStart())
+    await act(() => latest.onFailure(rejected))
+    expect(result.current.created).toBe(true)
+    expect(result.current.error).toBe(rejected)
+  })
+
+  it('clears the notice when the person is retired from the flow', async () => {
+    const { result, callbacks } = started()
+    context.mockResolvedValueOnce({
+      binding: { ...binding, flowRevision: 3 },
+      data: { email: 'invited@example.test' },
+    })
+    await act(() => callbacks.onFailure(created))
+    act(() => result.current.retire())
+    expect(result.current.created).toBe(false)
+  })
+})

@@ -1,0 +1,114 @@
+import { AMCORE_CLIENT_IP_HEADER, BROWSER_AUTH_HEADERS, WEB_FRONTEND_HEADERS } from '@amcore/shared'
+
+// Re-exported so existing local imports (`./proxy-headers`) keep working;
+// `apps/api`'s throttler guard imports the same shared constant directly
+// (ADR-072) — never a locally duplicated literal on either side.
+export { AMCORE_CLIENT_IP_HEADER }
+
+// Hop-by-hop / connection-specific — meaningless or wrong to replay verbatim
+// on a new outgoing request. `origin`/`referer` are stripped too: the CSRF
+// boundary is browser<->Next (already checked by `isTrustedOrigin` before
+// this runs); replaying the *browser's* origin on this server-to-server
+// call could make `apps/api`'s own `OriginCheckGuard` reject it against
+// `CORS_ORIGIN`, which is API-owned and may legitimately differ from the
+// web origin (round 2 finding).
+const STRIP_REQUEST_HEADERS = new Set([
+  ...Object.values(WEB_FRONTEND_HEADERS),
+  ...Object.values(BROWSER_AUTH_HEADERS),
+  'x-amcore-oauth-attempt',
+  'x-amcore-login-attempt',
+  'x-amcore-mfa-flow',
+  'host',
+  'connection',
+  'cookie',
+  'content-length',
+  'origin',
+  'referer',
+  'x-amcore-organization-id',
+  'x-amcore-context-session',
+  'x-invitation-continuation',
+  'x-invitation-attempt-id',
+  'x-invitation-auth-attempt-id',
+  'x-invitation-handoff-key',
+  'x-invitation-operation-id',
+])
+
+// Forwarded/client-IP signals a browser could set on its own request to
+// `apps/web`. Never relay these upstream verbatim (ADR-072): apps/api must
+// only ever see a client-IP claim that `apps/web` itself derived from a
+// trusted source, via `AMCORE_CLIENT_IP_HEADER` — never one the browser
+// supplied. `X-Forwarded-*` is matched by prefix since the set of variants
+// (`-For`, `-Host`, `-Proto`, `-Port`, ...) is open-ended; the rest are
+// known lookalikes used by common proxies/CDNs (OWASP's IP-spoofing guide).
+const FORWARDED_HEADER_PREFIX = 'x-forwarded-'
+const CLIENT_IP_LOOKALIKE_HEADERS = new Set([
+  'forwarded',
+  // Bare `X-Forwarded` (no `-For`/`-Host`/`-Proto` suffix) isn't matched by
+  // the prefix above but is a real, if rare, legacy header some proxies
+  // still send — list it explicitly for maximum conservatism.
+  'x-forwarded',
+  'x-real-ip',
+  'x-client-ip',
+  'client-ip',
+  'true-client-ip',
+  'cf-connecting-ip',
+  'fastly-client-ip',
+  'x-original-forwarded-for',
+  'x-original-remote-addr',
+  'via',
+  AMCORE_CLIENT_IP_HEADER,
+])
+
+export function isSpoofableForwardingHeader(name: string): boolean {
+  return name.startsWith(FORWARDED_HEADER_PREFIX) || CLIENT_IP_LOOKALIKE_HEADERS.has(name)
+}
+
+// `content-encoding`/`content-length` describe the *upstream's* compressed
+// bytes, but Node's `fetch` (undici) transparently decompresses
+// `Content-Encoding` when exposing `response.body` — forwarding those
+// headers verbatim while streaming already-decompressed bytes would tell
+// the browser to gunzip data that isn't gzipped. `transfer-encoding` is
+// hop-by-hop (the `Response` constructor re-frames it itself).
+// `set-cookie` is never forwarded to the browser — no proxied endpoint is
+// expected to set one, but the browser must never receive a backend cookie
+// directly either way (ADR-068).
+const STRIP_RESPONSE_HEADERS = new Set([
+  'content-encoding',
+  'content-length',
+  'connection',
+  'transfer-encoding',
+  'set-cookie',
+])
+
+/** Selective proxy headers. The backend transport sets the visitor claim at send time. */
+export function forwardRequestHeaders(
+  source: Headers,
+  accessToken: string,
+  bindingHeaders?: Record<string, string>
+): Headers {
+  const headers = new Headers()
+  for (const [name, value] of source.entries()) {
+    const lower = name.toLowerCase()
+    if (
+      STRIP_REQUEST_HEADERS.has(lower) ||
+      lower.startsWith('x-mfa-') ||
+      isSpoofableForwardingHeader(lower)
+    )
+      continue
+    headers.set(name, value)
+  }
+  headers.set('Authorization', `Bearer ${accessToken}`)
+  for (const [name, value] of Object.entries(bindingHeaders ?? {})) headers.set(name, value)
+  return headers
+}
+
+/** Response headers to send back to the browser: the backend's own, minus
+ * the ones that would misdescribe an already-streamed-through body. */
+export function forwardResponseHeaders(source: Headers): Headers {
+  const headers = new Headers()
+  for (const [name, value] of source.entries()) {
+    if (STRIP_RESPONSE_HEADERS.has(name.toLowerCase())) continue
+    headers.set(name, value)
+  }
+  return headers
+}

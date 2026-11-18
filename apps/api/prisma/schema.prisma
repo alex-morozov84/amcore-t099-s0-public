@@ -1,0 +1,18 @@
+// ===========================================
+// AMCore Database Schema
+// ===========================================
+// Main configuration file for Prisma
+// Models are split into separate files by module
+
+generator client {
+  provider        = "prisma-client"
+  output          = "../src/generated/prisma"
+  moduleFormat    = "esm"
+  importFileExtension = "js"
+  previewFeatures = ["partialIndexes"]
+}
+
+datasource db {
+  provider = "postgresql"
+  schemas  = ["core", "notifications", "ai", "fitness", "finance", "subscriptions"]
+}

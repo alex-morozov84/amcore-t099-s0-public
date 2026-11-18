@@ -1,0 +1,130 @@
+import { Injectable } from '@nestjs/common'
+
+import {
+  type CatalogueLocale,
+  coerceSupportedLocale,
+  type NotificationAction,
+  type NotificationFeedItem,
+  type NotificationFeedResponse,
+} from '@amcore/shared'
+
+import type { Notification } from '../../generated/prisma/client.js'
+import { PrismaService } from '../../prisma/index.js'
+
+import { NotificationDefinitionRegistry } from './notification-definition.registry.js'
+import { inAppFeedWhere } from './notification-feed.predicate.js'
+import { decodeFeedCursor, encodeFeedCursor } from './notification-feed-cursor.js'
+import { NotificationRealtimePublisher } from './realtime/notification-realtime.publisher.js'
+
+export interface FeedQuery {
+  cursor?: string
+  limit: number
+}
+
+/**
+ * Read model for the in-app feed (Arc A.6). Renders `title`/`body` server-side from
+ * the structured payload in the recipient's CURRENT locale at read time (ADR-052),
+ * and pages with a keyset cursor over `(createdAt DESC, id DESC)`.
+ */
+@Injectable()
+export class NotificationFeedService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly registry: NotificationDefinitionRegistry,
+    private readonly realtime: NotificationRealtimePublisher
+  ) {}
+
+  async getFeed(userId: string, query: FeedQuery): Promise<NotificationFeedResponse> {
+    const cursor = query.cursor ? decodeFeedCursor(query.cursor) : null
+    const locale = await this.recipientLocale(userId)
+
+    const rows = await this.prisma.notification.findMany({
+      where: inAppFeedWhere(
+        userId,
+        ...(cursor
+          ? [
+              {
+                OR: [
+                  { createdAt: { lt: cursor.createdAt } },
+                  { createdAt: cursor.createdAt, id: { lt: cursor.id } },
+                ],
+              },
+            ]
+          : [])
+      ),
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: query.limit + 1,
+    })
+
+    const hasMore = rows.length > query.limit
+    const page = hasMore ? rows.slice(0, query.limit) : rows
+    const last = page.at(-1)
+
+    return {
+      data: page.map((row) => this.toFeedItem(row, locale)),
+      nextCursor:
+        hasMore && last ? encodeFeedCursor({ createdAt: last.createdAt, id: last.id }) : null,
+      hasMore,
+    }
+  }
+
+  getUnreadCount(userId: string): Promise<number> {
+    return this.prisma.notification.count({ where: inAppFeedWhere(userId, { readAt: null }) })
+  }
+
+  async markRead(userId: string, notificationId: string): Promise<void> {
+    // Scoped to the recipient's FEED and idempotent: a foreign, archived, ineligible (not an
+    // in-app delivery) or already-read id is a no-op with no realtime hint.
+    const { count } = await this.prisma.notification.updateMany({
+      where: inAppFeedWhere(userId, { id: notificationId, readAt: null }),
+      data: { readAt: new Date() },
+    })
+    // Realtime hint only on a real state change (ADR-053); a no-op makes no noise.
+    if (count > 0) void this.realtime.publish(userId, 'read', notificationId)
+  }
+
+  async markAllRead(userId: string): Promise<number> {
+    const { count } = await this.prisma.notification.updateMany({
+      where: inAppFeedWhere(userId, { readAt: null }),
+      data: { readAt: new Date() },
+    })
+    // Aggregate hint (no single id) for cross-device/tab unread sync, only if any row changed.
+    if (count > 0) void this.realtime.publish(userId, 'unread_changed')
+    return count
+  }
+
+  async archive(userId: string, notificationId: string): Promise<void> {
+    const { count } = await this.prisma.notification.updateMany({
+      where: inAppFeedWhere(userId, { id: notificationId }),
+      data: { archivedAt: new Date() },
+    })
+    if (count > 0) void this.realtime.publish(userId, 'archived', notificationId)
+  }
+
+  private async recipientLocale(userId: string): Promise<CatalogueLocale> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { locale: true },
+    })
+    return coerceSupportedLocale(user?.locale)
+  }
+
+  private toFeedItem(row: Notification, locale: CatalogueLocale): NotificationFeedItem {
+    // Version-aware, fail-closed per row: unknown type, an unsupported schemaVersion,
+    // an invalid historical payload, or a throwing renderer fall back to a neutral
+    // item — never failing the whole feed page (ADR-052).
+    const rendered = this.registry.renderStored(row.type, row.schemaVersion, row.payload, locale)
+
+    return {
+      id: row.id,
+      type: row.type,
+      category: row.category,
+      title: rendered.title,
+      body: rendered.body,
+      action: (row.action as NotificationAction | null) ?? null,
+      createdAt: row.createdAt.toISOString(),
+      readAt: row.readAt?.toISOString() ?? null,
+      archivedAt: row.archivedAt?.toISOString() ?? null,
+    }
+  }
+}

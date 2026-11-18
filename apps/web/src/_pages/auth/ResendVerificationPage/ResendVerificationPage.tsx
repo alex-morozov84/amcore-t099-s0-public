@@ -1,0 +1,34 @@
+import { useTranslations } from 'next-intl'
+
+import { ResendVerificationForm } from '@/features/auth-resend-verification'
+import type { AuthActionBase } from '@/shared/api/auth-api'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/shared/ui/card'
+import { RouteProgressLink } from '@/shared/ui/route-progress-link'
+
+export function ResendVerificationPage({
+  actionBase,
+  loginHref = '/login',
+}: { actionBase?: AuthActionBase; loginHref?: string } = {}) {
+  const t = useTranslations('auth')
+
+  return (
+    <Card className="w-full max-w-md">
+      <CardHeader className="text-center">
+        <CardTitle as="h1" className="text-2xl">
+          {t('resendVerificationTitle')}
+        </CardTitle>
+        <CardDescription>{t('resendVerificationSubtitle')}</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <ResendVerificationForm actionBase={actionBase} />
+        <p className="mt-4 text-center text-sm text-muted-foreground">
+          {/* `underline`, not `hover:underline` — see LoginPage/RegisterPage's
+          identical link-in-text-block reasoning. */}
+          <RouteProgressLink href={loginHref} className="text-primary underline">
+            {t('backToLogin')}
+          </RouteProgressLink>
+        </p>
+      </CardContent>
+    </Card>
+  )
+}

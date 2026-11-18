@@ -1,0 +1,352 @@
+# API Keys
+
+API keys are for server-to-server access — scripts, integrations, CI pipelines, and any situation where a human isn't logging in interactively. Instead of a user session, you use a long-lived token bound to a specific organization and scoped to exactly what it needs.
+
+> Replace `https://api.example.com` with your deployment URL throughout this guide.
+
+---
+
+## How API keys differ from user tokens
+
+|                 | JWT (user session)                                                   | API key                                                       |
+| --------------- | -------------------------------------------------------------------- | ------------------------------------------------------------- |
+| **Issued via**  | Login flow                                                           | `POST /api/v1/api-keys` (JWT-auth)                            |
+| **Lifetime**    | 15 min access / 7 days refresh                                       | Set at creation, or no expiry                                 |
+| **Permissions** | Full user permissions                                                | `userPerms ∩ apiKey.scopes` (see Effective permissions below) |
+| **Header**      | `Authorization: Bearer eyJ...`                                       | `Authorization: Bearer amcore_live_...`                       |
+| **Org context** | Path selection on covered routes; `/switch` for legacy bound context | Bound to one org at creation                                  |
+| **Revocable**   | Session revocation blocks refresh; access expires                    | `DELETE /api/v1/api-keys/:id`                                 |
+
+Both auth methods use the same `Authorization: Bearer` header — the server tells them apart by the token format. JWTs are `eyJ...`; API keys are `amcore_live_...`.
+
+---
+
+API-key verification reads the owner's system role directly from primary on each
+request and retains it only as request-local audit evidence. Every API key has
+effective system role `USER`, including a key owned by a `SUPER_ADMIN`.
+Keys receive no synthetic platform permission or platform membership bypass.
+Live organization membership, explicit organization permissions and scope
+intersection remain required. Promoting an owner does not enlarge their keys.
+Keys cannot use `/switch` or enter bearer-only Console/FreshAuth routes.
+Invitation operations are bearer-only, including creation, reissue, revocation
+and acceptance. A current organization membership and full team authority are
+required for management; see [organization invitations](invites.md).
+
+## Scopes
+
+When you create an API key, you define its **scopes** — the exact operations it's allowed to perform. Even if the key's owner has full admin permissions, the key can't do more than its scopes allow.
+
+### Scope format
+
+Every scope is `action:Subject`, case-sensitive:
+
+| Part      | Allowed values                                                                            |
+| --------- | ----------------------------------------------------------------------------------------- |
+| `action`  | `create`, `read`, `update`, `delete`, `manage` (= all four)                               |
+| `Subject` | `User`, `Organization`, `Role`, `Permission`, `TeamAccess`, `all` (= registered subjects) |
+
+`Subject` is PascalCase for concrete types and lowercase `all` for the wildcard. Add domain subjects (e.g. `Contact`, `Deal`) by extending `packages/shared/src/enums/permissions.ts` — the scope schema picks them up automatically.
+
+### Examples
+
+| Scope                 | What it allows                                                          |
+| --------------------- | ----------------------------------------------------------------------- |
+| `read:User`           | Read only explicitly permitted User records and fields in the bound org |
+| `manage:Organization` | Narrow owner grants to Organization actions; no team administration     |
+| `read:all`            | Read only explicitly granted subjects, records and fields               |
+| `manage:TeamAccess`   | Full team administration only for an independently trusted owner        |
+| `manage:User`         | Narrow owner grants to User actions, records and fields                 |
+
+### `manage:all` is rejected
+
+`manage:all` is forbidden at the schema layer. It would mean "no narrowing" — the key would have the same power as the owner's JWT, defeating the purpose of a scoped credential. Use a narrower scope (e.g. `manage:Organization` or `read:all`), or use your JWT directly.
+
+### Effective permissions
+
+`Effective permissions = owner's org permissions ∩ key scopes`.
+
+```
+Owner has:        read:Organization (current org, explicit response fields)
+Key scopes:       read:Organization
+
+Effective rule:   read:Organization  (owner conditions and fields remain)
+```
+
+The intersection narrows actions and subjects independently, preserving owner
+conditions, fields and DENYs. A `read:all` scope intersects an explicit `read:User`
+grant; the scope or a new catalogue entry alone grants no resource. If the owner
+later receives a read grant on a new subject, an already issued `read:all` key
+can become effective where that subject's route explicitly accepts API keys.
+Adding a subject to the shared enum also makes a narrow scope such as
+`read:Contact` issuable; issuance alone grants nothing. Positive-all stored org
+grants are unsupported. Scope order and duplicates do not change authorization.
+
+Full team administration additionally requires owner trust computed **before**
+scopes and exact `manage:TeamAccess`. A Role/User/Permission/TeamAccess/all owner
+DENY cannot disappear behind a narrower key scope. `read:TeamAccess` is syntactically
+valid but grants no team administration; `manage:Organization` never substitutes.
+Old organization-management keys are not enlarged: create an intentional replacement,
+update/verify the integration, then revoke the old key. See the
+[controlled authorization upgrade](authorization-upgrade.md).
+
+If the owner loses a permission later, the key loses it too on the next request — there's no separate permission grant on the key itself.
+
+---
+
+## Creating an API key
+
+**Endpoint:** `POST /api/v1/api-keys` — **JWT only**, API keys cannot manage credentials.
+
+The creator must be a member of the bound organization. This includes ordinary members;
+there is no administrator-only issuance gate. The ready [My API keys page](../product-admin/own-api-keys.md)
+initially shows creation to full team administrators.
+
+```bash
+curl -X POST https://api.example.com/api/v1/api-keys \
+  -H "Authorization: Bearer eyJhbGci..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "CI Pipeline",
+    "organizationId": "cm1abc...",
+    "scopes": ["read:User", "read:Organization"],
+    "expiresAt": "2027-01-01T00:00:00.000Z"
+  }'
+```
+
+| Field            | Type     | Required | Description                                        |
+| ---------------- | -------- | -------- | -------------------------------------------------- |
+| `name`           | string   | ✅       | Human-readable label, 1–100 chars                  |
+| `organizationId` | CUID     | ✅       | The org this key is bound to; you must be a member |
+| `scopes`         | string[] | ✅       | At least one canonical `action:Subject` scope      |
+| `expiresAt`      | ISO date | —        | Omit for no expiry                                 |
+
+**Success response** `201 Created`:
+
+```json
+{
+  "id": "cm1xyz...",
+  "name": "CI Pipeline",
+  "key": "amcore_live_a1B2c3D4e5F_x9Y8z7W6v5U4t3S2r1Q0p9O8n7M6l5K4",
+  "organizationId": "cm1abc...",
+  "scopes": ["read:User", "read:Organization"],
+  "expiresAt": "2027-01-01T00:00:00.000Z",
+  "createdAt": "2026-05-16T10:00:00.000Z"
+}
+```
+
+> **Copy the `key` value immediately.** It's only returned once at creation. The server stores a salted SHA-256 hash and there's no way to retrieve the raw key later. Lost keys must be revoked and recreated.
+
+---
+
+## Using an API key
+
+Send the key in the `Authorization: Bearer` header — same as a JWT:
+
+```bash
+curl https://api.example.com/api/v1/auth/me \
+  -H "Authorization: Bearer amcore_live_a1B2c3D4e5F_x9Y8z7W6v5U4t3S2r1Q0p9O8n7M6l5K4"
+```
+
+Routes are JWT-only by default. A small, explicit allowlist of routes accepts API keys; everything else returns `401 Unauthorized` when called with one.
+
+The allowlist:
+
+| Route group                                                                                           | API key accepted? | Why                                                                                                                                                                                                                                                                                                                                           |
+| ----------------------------------------------------------------------------------------------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /auth/me`                                                                                        | ✅                | Identity self-check for integrations. Stable opt-in.                                                                                                                                                                                                                                                                                          |
+| `POST /organizations`                                                                                 | ❌                | Creates a new org and makes the caller ADMIN. A scoped key bound to org A could otherwise spin up org C — cross-org expansion via integration credential. Org creation is interactive.                                                                                                                                                        |
+| `GET /organizations`                                                                                  | ❌                | Returns every org the owner belongs to — leaks org-membership topology beyond the key's bound org. Use the key's `organizationId` instead.                                                                                                                                                                                                    |
+| `GET /organizations/:id`                                                                              | ✅                | API key allowed **only when bound to that exact org** (`principal.organizationId === :id`) — read of another org returns 403. Actual record conditions and all six response-field permissions must pass; partial grants return 403. JWT principals keep the existing membership-based read so users can browse orgs before calling `/switch`. |
+| `PATCH /organizations/:id`                                                                            | ✅                | Bound-org update requires owner permissions and scopes for every input field and all returned fields; actual post-state authorization runs inside the transaction.                                                                                                                                                                            |
+| `DELETE /organizations/:id`                                                                           | ✅                | Requires trusted owner TeamAccess, exact `manage:TeamAccess` scope, and scoped owner delete authority on every Organization scalar.                                                                                                                                                                                                           |
+| `/organizations/:id/switch`                                                                           | ❌                | Mints a new JWT — would let a scoped key trade itself for a full-permission token.                                                                                                                                                                                                                                                            |
+| `GET /organizations/:id/capabilities` and `POST /organizations/:id/roles/:roleId/permissions/presets` | ❌                | Role-editor discovery and preset authoring require an employee bearer token and full TeamAccess.                                                                                                                                                                                                                                              |
+| Existing member DELETE and legacy single-role writes                                                  | ✅                | Only existing member DELETE and legacy POST/DELETE role assignment accept keys with full owner TeamAccess and exact `manage:TeamAccess`. Member reads, complete role replacement, access explanation and member-key inventory/revoke are bearer-only. Role ownership remains organization-bound.                                              |
+| `/organizations/:id/roles/**`                                                                         | ✅                | Org-role management requires full owner TeamAccess and exact `manage:TeamAccess` scope. `GET /organizations/:id/roles` requires `principal.organizationId === :id` so an admin switched into one org cannot enumerate another org's role/permission catalogue.                                                                                |
+| `/api-keys/**`                                                                                        | ❌                | Credential management — you can't create/list/revoke keys with a key.                                                                                                                                                                                                                                                                         |
+| `/auth/sessions/**`                                                                                   | ❌                | Browser session management — out of scope for integrations.                                                                                                                                                                                                                                                                                   |
+| `/admin/**`                                                                                           | ❌                | Platform-admin operations — SUPER_ADMIN-owned keys would otherwise bypass scopes (the system-role guard ignores them).                                                                                                                                                                                                                        |
+| Everything else with auth                                                                             | ❌                | JWT-only by default — bearer-only is the safe baseline.                                                                                                                                                                                                                                                                                       |
+
+Team handlers use `RequireTeamAccess` and actual target binding; existing service
+ownership checks remain. Org PATCH separately checks actual pre/post rows, input
+fields and full response read inside one transaction. Org DELETE needs TeamAccess,
+owner delete on every scalar, and both team and Organization scopes on a key.
+No authorization failure retries another credential type.
+
+The `/admin/**` boundary includes `GET /admin/access`; a SUPER_ADMIN-owned API
+key is rejected there with `401` rather than acting as a console credential.
+
+Adding API-key acceptance to a new route requires updating the internally
+recorded bearer-only auth decision plus a matching entry in the shared
+ADR-034 allowlist
+(`apps/api/src/core/auth/decorators/adr-034-api-key-allowlist.ts`). The auth
+metadata test and the OpenAPI e2e guard both consume that list, so a new
+API-key route fails CI until runtime auth and Swagger security metadata agree.
+
+---
+
+## Organization binding
+
+An API key is bound to one organization at creation. The runtime re-verifies on every request that the key's owner is still a member of that organization — successful supported membership removal permanently revokes the member's keys in that organization. Rejoining requires a new key. The removal transaction retains safe metadata and audit; it does not restore authenticating verifier data. More than1000 unrevoked keys refuses removal without changes; see [member-key controls](../product-admin/member-api-keys.md).
+
+| Scenario                                   | Result                                 |
+| ------------------------------------------ | -------------------------------------- |
+| Owner removed from the bound org           | `401` on next request                  |
+| Bound org deleted                          | Key is cascaded; `401` on next request |
+| Request targets a different org's resource | `403` from policy guard, not auth      |
+
+Use one key per (owner, organization) pair. To grant cross-org access, issue multiple keys.
+
+### Failed attempts
+
+The API counts failed key verifications per source address and per key fingerprint. After
+100 failures from one address or 20 for one key within an hour, requests return `429`
+with `RATE_LIMIT_EXCEEDED` until the counters expire. When the counters cannot be
+checked, the API returns `503` with `SERVICE_UNAVAILABLE` and does not verify the key.
+Repeat the request after a short delay. A valid key still works if clearing its own
+counter fails. See [failure counters](concepts.md#api-key-and-invitation-failure-counters).
+
+---
+
+## Listing API keys
+
+**Endpoint:** `GET /api/v1/api-keys` — **JWT only**.
+
+Lists the signed-in owner’s keys across organizations, including former memberships.
+Each row requires nullable `organizationName`: the current name appears only when
+membership exists in the same REPEATABLE READ snapshot as the page and count.
+Otherwise it is null. This is not an instantaneous revocation of already-delivered names.
+Owner list/revoke does not require current organization membership.
+
+Paginated list. Accepts `?page=N&limit=M` with `1 ≤ page` and
+`1 ≤ limit ≤ 100`; defaults `page=1, limit=20`. Keys are ordered newest first
+(`createdAt DESC, id ASC`). No secret fields are exposed. The default includes retained historical rows; `status=all|unexpired|expired|revoked` filters lifecycle status. Rows include `status`, `revokedAt` and `revocationReason`. Revoked takes precedence over expired; expiry equal to the verification time is expired.
+
+```bash
+curl 'https://api.example.com/api/v1/api-keys?page=1&limit=20' \
+  -H "Authorization: Bearer eyJhbGci..."
+```
+
+```json
+{
+  "data": [
+    {
+      "id": "cm1xyz...",
+      "name": "CI Pipeline",
+      "organizationId": "cm1abc...",
+      "organizationName": "Acme",
+      "scopes": ["read:User", "read:Organization"],
+      "status": "unexpired",
+      "revokedAt": null,
+      "revocationReason": null,
+      "expiresAt": "2027-01-01T00:00:00.000Z",
+      "lastUsedAt": "2026-05-15T08:15:00.000Z",
+      "createdAt": "2026-05-01T10:00:00.000Z"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "limit": 20
+}
+```
+
+`lastUsedAt` is updated on a best-effort basis (throttled cache) — it's diagnostic, not authoritative.
+
+---
+
+## Revoking an API key
+
+**Endpoint:** `DELETE /api/v1/api-keys/:keyId` — **JWT only**.
+
+```bash
+curl -X DELETE https://api.example.com/api/v1/api-keys/cm1xyz... \
+  -H "Authorization: Bearer eyJhbGci..."
+```
+
+**Success response:** `204 No Content`. A known already-revoked key is a no-op; foreign, unknown or purged keys return404. The first actor/time/reason remains unchanged. Revocation destroys hash and salt in the same transaction as its audit event, retaining safe metadata. Authentication reads the key from the database, so verification starting after revocation commits returns `401`. A request already admitted before revocation may finish; revocation does not cancel in-flight handlers.
+
+---
+
+## Validation errors
+
+Invalid scopes are rejected at `POST /api/v1/api-keys` with `400 Bad Request` and a per-scope error in the `errors` array. Each entry's `errorCode` is machine-readable and stable across API versions; use it for frontend localization.
+
+| Code                                 | Reason                                                        |
+| ------------------------------------ | ------------------------------------------------------------- |
+| `API_KEY_SCOPE_INVALID_FORMAT`       | Not `action:Subject` shape (empty, `read`, `read:User:extra`) |
+| `API_KEY_SCOPE_UNKNOWN_ACTION`       | Action not in `{create, read, update, delete, manage}`        |
+| `API_KEY_SCOPE_UNKNOWN_SUBJECT`      | Subject not in the registry (typo, unknown module)            |
+| `API_KEY_SCOPE_MANAGE_ALL_FORBIDDEN` | `manage:all` is rejected (see Scopes section above)           |
+
+Example response for `{ "scopes": ["read:User", "manage:all"] }`:
+
+```json
+{
+  "statusCode": 400,
+  "message": "Validation failed",
+  "errors": [
+    {
+      "field": "scopes.1",
+      "message": "Invalid input",
+      "code": "custom",
+      "errorCode": "API_KEY_SCOPE_MANAGE_ALL_FORBIDDEN"
+    }
+  ]
+}
+```
+
+Note that the error is at `scopes.1` only — `read:User` at index 0 is valid and not reported.
+
+Branch on **`errorCode`**, not `message`. The scope-grammar rules deliberately
+carry no hand-written message: a literal message in a shared schema outranks the
+frontend's per-parse localization and would force English into a localized UI,
+so the meaning lives in `errorCode` and `message` is Zod's generic default.
+
+---
+
+## Authorization failures
+
+These are separate from schema validation — they happen at request time in TeamAccess admission and service record/field checks:
+
+| Status | Cause                                                                                 |
+| ------ | ------------------------------------------------------------------------------------- |
+| `401`  | Key revoked, expired, owner lost org membership, or org deleted                       |
+| `403`  | Authenticated successfully, but scope intersection doesn't grant the required ability |
+
+A common case: a key with `scopes: ["read:Organization"]` calling `PATCH /api/v1/organizations/:id`. The intersection grants no update action, so the service returns `403`. A permitted PATCH needs owner update rights for every supplied field, corresponding update scope, and read rights/scopes for every response field. TeamAccess is not required for PATCH.
+
+---
+
+## Security notes
+
+**Store keys like passwords.** Anyone who has your API key can make requests as the owner (within scope, within the bound org). Don't:
+
+- Commit keys to Git
+- Put them in client-side code
+- Log them in application logs
+- Share them in Slack or email
+
+**Use environment variables** on your server:
+
+```bash
+export AMCORE_API_KEY="amcore_live_..."
+```
+
+**Set expiry dates** for keys used in temporary contexts (a one-off migration, a contractor's access).
+
+**Use the narrowest scopes that work.** A read-only reporter doesn't need `manage:User`. Narrowing scopes is a one-way safety net — the intersection model means even a leaked narrow key can't escalate.
+
+**Replace deliberately.** For planned replacement create a new own key, migrate/test consumers, then revoke the old key. For suspected compromise revoke first, even if it causes downtime. There is no dedicated rotation endpoint, scope editing or reactivation. Scopes are an immutable issuance ceiling, not a permission snapshot: future owner grants can enlarge access within that ceiling. Last use cannot prove consumer migration.
+
+Safe metadata becomes purge-eligible30 days after the first expiry or revocation. Nightly/manual cleanup removes eligible rows; parent user/organization Cascade may remove them sooner. Audit retention is separate. No legacy deleted history can be recovered. No-expiry and past-expiry issuance remain supported. See the [deployment and restore runbook](../operations/api-key-lifecycle.md).
+
+## Organization administrator controls
+
+[Member-key management](../product-admin/member-api-keys.md) supplies bearer-only,
+org+member-scoped safe inventory and permanent single/all revocation. It does not
+extend owner-wide list/revoke authority to unrelated organizations. Owner endpoints
+remain available for cleanup even after loss of membership.
+
+Use [confirmed member removal](../product-admin/organization-members.md#remove-a-member)
+for the ready product flow and membership-fenced browser operation. Rejoining never restores removed-member keys.

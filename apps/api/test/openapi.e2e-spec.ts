@@ -1,0 +1,1327 @@
+import { type INestApplication, RequestMethod } from '@nestjs/common'
+import { type OpenAPIObject } from '@nestjs/swagger'
+
+import { ADMIN_ORGANIZATION_SORT_FIELDS, ADMIN_USER_SORT_FIELDS } from '@amcore/shared'
+
+import { ADR_034_APIKEY_ALLOWLIST } from '../src/core/auth/decorators/adr-034-api-key-allowlist'
+import { addQueueBoardOperation, buildApiDocument } from '../src/swagger.config'
+
+import type { E2ETestContext } from './helpers'
+import { setupE2ETest, teardownE2ETest } from './helpers'
+import { assertInvitationSchemaContracts } from './openapi-invitation-contracts'
+import { assertLoginDiagnosticsContract } from './openapi-login-diagnostics'
+
+/**
+ * Arc C — OpenAPI success-surface completeness (ADR-050).
+ *
+ * Generates the OpenAPI document the same way `main.ts` does (shared
+ * `buildApiDocument()`) from the fully-booted
+ * AppModule, then asserts the documented success response of every public
+ * operation **exactly** matches an explicit expected inventory: the precise
+ * success status code and the body kind (typed JSON schema / 204 no-content /
+ * 3xx redirect / text). The check runs both ways — every documented operation
+ * must be in the inventory and every inventory entry must be documented — so
+ * a new handler that ships without a typed `@SchemaResponse` (or with the wrong
+ * status) fails CI, and a silent status flip (e.g. a `POST` defaulting back
+ * to 200) is caught.
+ *
+ * Terminus health probes (`/health*`) document 200/503/500 via `@ApiResponse`
+ * without a body schema by design and are the one justified exclusion.
+ *
+ * A second guardrail below (`apiKeyBearer` security surface) shares
+ * `ADR_034_APIKEY_ALLOWLIST` with `auth-decorator-coverage.spec.ts` so both
+ * checks read from one list: every allowlisted route must document the
+ * `apiKeyBearer` OpenAPI security scheme, and no other route may (catching
+ * the class-vs-method security metadata leak risk described in
+ * `organizations.controller.ts`'s class doc-comment).
+ */
+type BodyKind = 'json' | 'none' | 'redirect' | 'text' | 'html' | 'stream' | 'binary'
+interface Expected {
+  status: string | readonly string[]
+  kind: BodyKind
+}
+
+// Paths carry no global prefix here — `setupE2ETest` does not call
+// `setGlobalPrefix('api/v1')`, matching how the document is scanned.
+const EXPECTED: Record<string, Expected> = {
+  // auth
+  'post /auth/register': { status: '201', kind: 'json' },
+  'post /auth/login': { status: ['200', '202'], kind: 'json' },
+  'post /auth/mfa/password': { status: '200', kind: 'json' },
+  'post /auth/mfa/verify': { status: '200', kind: 'json' },
+  'post /auth/mfa/status': { status: '200', kind: 'json' },
+  'post /auth/mfa/enrollment': { status: '200', kind: 'json' },
+  'post /auth/mfa/bind-factor': { status: '200', kind: 'json' },
+  'post /auth/mfa/acknowledge-codes': { status: '200', kind: 'json' },
+  'post /auth/mfa/session-flow': { status: '200', kind: 'json' },
+  'post /auth/mfa/settings-start': { status: '200', kind: 'json' },
+  'post /auth/mfa/settings-start/status': { status: '200', kind: 'json' },
+  'post /auth/mfa/settings-start/abandon': { status: '200', kind: 'json' },
+  'post /auth/mfa/reauthenticate': { status: '200', kind: 'json' },
+  'get /auth/mfa/settings': { status: '200', kind: 'json' },
+  'post /auth/mfa/rotate-codes': { status: '200', kind: 'json' },
+  'post /auth/mfa/recover-setup-codes': { status: '200', kind: 'json' },
+  'post /auth/mfa/redeem-recovery-ticket': { status: '200', kind: 'json' },
+  'post /auth/mfa/complete': { status: ['200', '202'], kind: 'json' },
+  'post /auth/browser-publications/invitation-confirm': { status: '200', kind: 'json' },
+  'post /auth/mfa/publication/acknowledge': { status: '200', kind: 'json' },
+  'post /auth/mfa/publication/status': { status: '200', kind: 'json' },
+  'post /auth/mfa/publication/retire': { status: '200', kind: 'json' },
+  'post /auth/logout': { status: '204', kind: 'none' },
+  'post /auth/refresh': { status: '200', kind: 'json' },
+  'get /auth/me': { status: '200', kind: 'json' },
+  'patch /auth/me': { status: '200', kind: 'json' },
+  'post /auth/me/avatar': { status: '201', kind: 'json' },
+  'delete /auth/me/avatar': { status: '204', kind: 'none' },
+  'post /auth/step-up': { status: ['200', '202'], kind: 'json' },
+  'post /auth/browser-publications/bootstrap': { status: '200', kind: 'json' },
+  'post /auth/browser-publications/logout-with-receipt': { status: '200', kind: 'json' },
+  'post /auth/browser-publications/logout-result': { status: '200', kind: 'json' },
+  'post /auth/browser-publications/return-claim': { status: '200', kind: 'json' },
+  'post /auth/browser-publications/status': { status: '200', kind: 'json' },
+  'post /auth/browser-publications/probe': { status: '200', kind: 'json' },
+  'get /auth/sessions': { status: '200', kind: 'json' },
+  'delete /auth/sessions/{sessionId}': { status: '204', kind: 'none' },
+  'delete /auth/sessions': { status: '204', kind: 'none' },
+  'post /auth/forgot-password': { status: '200', kind: 'json' },
+  'post /auth/reset-password': { status: '204', kind: 'none' },
+  'post /auth/verify-email': { status: '204', kind: 'none' },
+  'post /auth/resend-verification': { status: '200', kind: 'json' },
+  // oauth
+  'get /auth/oauth/providers': { status: '200', kind: 'json' },
+  'get /auth/oauth/{provider}': { status: '302', kind: 'redirect' },
+  'get /auth/oauth/{provider}/link': { status: '302', kind: 'redirect' },
+  'get /auth/oauth/{provider}/callback': { status: '302', kind: 'redirect' },
+  'post /auth/oauth/{provider}/callback': { status: '302', kind: 'redirect' },
+  'post /auth/oauth/exchange': { status: ['200', '202'], kind: 'json' },
+  'get /auth/signup-policy': { status: '200', kind: 'json' },
+  'post /auth/invites/continuations': { status: '201', kind: 'json' },
+  'post /auth/invites/continuations/context': { status: '200', kind: 'json' },
+  'post /auth/invites/continuations/inspect': { status: '200', kind: 'json' },
+  'post /auth/invites/inspect': { status: '200', kind: 'json' },
+  'post /auth/invites/register': { status: '201', kind: 'json' },
+  'get /auth/invites/operations/{operationId}': { status: '200', kind: 'json' },
+  'post /auth/invites/auth-handoffs/{attemptId}/confirm': { status: '200', kind: 'json' },
+  'post /auth/invites/auth-handoffs/{attemptId}/abort': { status: '200', kind: 'json' },
+  'post /organizations/{orgId}/invites': { status: '202', kind: 'json' },
+  'post /organizations/{orgId}/invites/{inviteId}/reissue': { status: '202', kind: 'json' },
+  'get /organizations/{orgId}/invites/role-choices': { status: '200', kind: 'json' },
+  'get /organizations/{orgId}/invite-operations/{operationId}': { status: '200', kind: 'json' },
+  // auth-invites
+  'post /auth/invites/accept': { status: '200', kind: 'json' },
+  'get /organizations/creation-policy': { status: '200', kind: 'json' },
+  'get /organizations/creation-results/{operationId}': { status: '200', kind: 'json' },
+  'get /admin/organization-establishment/status': { status: '200', kind: 'json' },
+  'post /admin/organization-establishment/accounts/prepare': { status: '200', kind: 'json' },
+  'get /admin/organization-establishment/accounts/{userId}/status': { status: '200', kind: 'json' },
+  'post /admin/organization-establishment/bootstrap': { status: '200', kind: 'json' },
+  'get /admin/organizations/attention': { status: '200', kind: 'json' },
+  'get /admin/organizations/{orgId}/administration': { status: '200', kind: 'json' },
+  'get /admin/organizations/{orgId}/administrator-invitations/{invitationId}': {
+    status: '200',
+    kind: 'json',
+  },
+  'get /admin/organizations/{orgId}/administrator-operations/{operationId}': {
+    status: '200',
+    kind: 'json',
+  },
+  'post /admin/organizations/{orgId}/administrator-invitations': { status: '201', kind: 'json' },
+  'post /admin/organizations/{orgId}/administrators': { status: '200', kind: 'json' },
+  'post /admin/organizations/{orgId}/administrator-invitations/{invitationId}/reissue': {
+    status: '200',
+    kind: 'json',
+  },
+  'post /admin/organizations/{orgId}/administrator-invitations/{invitationId}/replace-recipient': {
+    status: '200',
+    kind: 'json',
+  },
+  'post /admin/organizations/{orgId}/administrator-invitations/{invitationId}/cancel': {
+    status: '200',
+    kind: 'json',
+  },
+  'get /admin/organization-provisionings/policy': { status: '200', kind: 'json' },
+  'post /admin/organization-provisionings': { status: '201', kind: 'json' },
+  'get /admin/organization-provisionings/operations/{operationId}': { status: '200', kind: 'json' },
+  'get /admin/organizations/{orgId}/provisioning': { status: '200', kind: 'json' },
+  'post /admin/organizations/{orgId}/provisioning/reissue': { status: '200', kind: 'json' },
+  'post /admin/organizations/{orgId}/provisioning/replace-recipient': {
+    status: '200',
+    kind: 'json',
+  },
+  'post /admin/organizations/{orgId}/provisioning/cancel': { status: '200', kind: 'json' },
+  // admin
+  'get /admin/api-keys': { status: '200', kind: 'json' },
+  'delete /admin/api-keys/{id}': { status: '200', kind: 'json' },
+  'post /admin/api-keys/revoke': { status: '200', kind: 'json' },
+  'get /admin/access': { status: '204', kind: 'none' },
+  'get /admin/audit-logs': { status: '200', kind: 'json' },
+  'get /admin/users': { status: '200', kind: 'json' },
+  'get /admin/users/{id}': { status: '200', kind: 'json' },
+  'patch /admin/users/{id}': { status: '200', kind: 'json' },
+  'get /admin/users/{id}/support-mail': { status: '200', kind: 'json' },
+  'post /admin/users/{id}/support-mail/prepare': { status: '201', kind: 'json' },
+  'post /admin/users/{id}/support-mail/{attemptId}/send': { status: '200', kind: 'json' },
+  'get /admin/users/{id}/support-mail/{attemptId}': { status: '200', kind: 'json' },
+  'get /admin/users/{id}/sessions': { status: '200', kind: 'json' },
+  'delete /admin/users/{id}/sessions/{sessionId}': { status: '204', kind: 'none' },
+  'delete /admin/users/{id}/sessions': { status: '204', kind: 'none' },
+  'post /admin/cleanup': { status: '200', kind: 'json' },
+  'get /admin/organizations': { status: '200', kind: 'json' },
+  'get /admin/organizations/{id}': { status: '200', kind: 'json' },
+  'get /admin/overview': { status: '200', kind: 'json' },
+  'get /admin/background-work/queues': { status: '200', kind: 'json' },
+  'get /admin/background-work/scheduled-jobs': { status: '200', kind: 'json' },
+  'get /admin/background-work/scheduled-jobs/{jobId}/runs': { status: '200', kind: 'json' },
+  'get /admin/integrations': { status: '200', kind: 'json' },
+  'post /admin/integrations/{id}/probe/prepare': { status: '200', kind: 'json' },
+  'post /admin/integrations/{id}/probe': { status: '200', kind: 'json' },
+  'get /admin/integrations/{id}/probe/{attemptId}': { status: '200', kind: 'json' },
+  'get /admin/background-work/works': { status: '200', kind: 'json' },
+  'get /admin/background-work/works/{workId}/jobs': { status: '200', kind: 'json' },
+  'get /admin/background-work/works/{workId}/jobs/{jobId}': { status: '200', kind: 'json' },
+  'post /admin/background-work/commands': { status: ['200', '202'], kind: 'json' },
+  'get /admin/background-work/commands/{commandId}': { status: '200', kind: 'json' },
+  'post /admin/background-work/commands/{commandId}/reconciliation': {
+    status: '200',
+    kind: 'json',
+  },
+  'post /admin/background-work/works/{workId}/jobs/{jobId}/reconciliation': {
+    status: '204',
+    kind: 'none',
+  },
+  // the read-only queue board: a Fastify plugin UI documented programmatically
+  'get /admin/queues': { status: '200', kind: 'html' },
+  'get /admin/runtime-settings/storage-probe': { status: '200', kind: 'json' },
+  'patch /admin/runtime-settings/storage-probe': { status: '200', kind: 'json' },
+  'get /storage/public': { status: '200', kind: 'binary' },
+  // api-keys
+  'post /api-keys': { status: '201', kind: 'json' },
+  'get /api-keys/organizations': { status: '200', kind: 'json' },
+  'get /api-keys': { status: '200', kind: 'json' },
+  'delete /api-keys/{id}': { status: '204', kind: 'none' },
+  // organizations
+  'post /organizations': { status: '201', kind: 'json' },
+  'get /organizations': { status: '200', kind: 'json' },
+  'get /organizations/{id}': { status: '200', kind: 'json' },
+  'get /organizations/{id}/context': { status: '200', kind: 'json' },
+  'get /organizations/{orgId}/capabilities': { status: '200', kind: 'json' },
+  'patch /organizations/{id}': { status: '200', kind: 'json' },
+  'delete /organizations/{id}': { status: '204', kind: 'none' },
+  'post /organizations/{id}/switch': { status: '200', kind: 'json' },
+  // members
+  'get /organizations/{orgId}/members/{userId}/api-keys': { status: '200', kind: 'json' },
+  'post /organizations/{orgId}/members/{userId}/api-keys/{keyId}/revoke': {
+    status: '200',
+    kind: 'json',
+  },
+  'post /organizations/{orgId}/members/{userId}/api-keys/revoke-all': {
+    status: '200',
+    kind: 'json',
+  },
+  'get /organizations/{orgId}/members': { status: '200', kind: 'json' },
+  'get /organizations/{orgId}/members/{userId}/access': { status: '200', kind: 'json' },
+  'get /organizations/{orgId}/members/{userId}/roles': { status: '200', kind: 'json' },
+  'patch /organizations/{orgId}/members/{userId}/roles': { status: '200', kind: 'json' },
+  'delete /organizations/{orgId}/members/{userId}': { status: '204', kind: 'none' },
+  'post /organizations/{orgId}/members/{userId}/roles/{roleId}': { status: '204', kind: 'none' },
+  'delete /organizations/{orgId}/members/{userId}/roles/{roleId}': { status: '204', kind: 'none' },
+  // role definitions (bearer-only editor contracts)
+  'get /organizations/{orgId}/role-definitions': { status: '200', kind: 'json' },
+  'post /organizations/{orgId}/role-definitions': { status: '201', kind: 'json' },
+  'get /organizations/{orgId}/role-definitions/{roleId}': { status: '200', kind: 'json' },
+  'patch /organizations/{orgId}/role-definitions/{roleId}': { status: '200', kind: 'json' },
+  'post /organizations/{orgId}/role-definitions/{roleId}/deletion': {
+    status: '200',
+    kind: 'json',
+  },
+  // roles
+  'get /organizations/{orgId}/roles': { status: '200', kind: 'json' },
+  'post /organizations/{orgId}/roles': { status: '201', kind: 'json' },
+  'patch /organizations/{orgId}/roles/{roleId}': { status: '200', kind: 'json' },
+  'delete /organizations/{orgId}/roles/{roleId}': { status: '204', kind: 'none' },
+  'post /organizations/{orgId}/roles/{roleId}/permissions': { status: '201', kind: 'json' },
+  'post /organizations/{orgId}/roles/{roleId}/permissions/presets': {
+    status: '201',
+    kind: 'json',
+  },
+  'delete /organizations/{orgId}/roles/{roleId}/permissions/{permId}': {
+    status: '204',
+    kind: 'none',
+  },
+  // invites
+  'get /organizations/{orgId}/invites': { status: '200', kind: 'json' },
+  'delete /organizations/{orgId}/invites/{inviteId}': { status: '204', kind: 'none' },
+  // notifications (Arc A.6 — feed/preferences/master-toggle)
+  'get /notifications': { status: '200', kind: 'json' },
+  'get /notifications/unread-count': { status: '200', kind: 'json' },
+  'post /notifications/read-all': { status: '200', kind: 'json' },
+  'post /notifications/{id}/read': { status: '204', kind: 'none' },
+  'post /notifications/{id}/archive': { status: '204', kind: 'none' },
+  'get /notifications/capabilities': { status: '200', kind: 'json' },
+  'get /notifications/preferences': { status: '200', kind: 'json' },
+  'put /notifications/preferences': { status: '204', kind: 'none' },
+  'patch /notifications/settings': { status: '204', kind: 'none' },
+  // notifications Telegram linking (Arc D — the webhook route is @ApiExcludeEndpoint, not here)
+  'post /notifications/telegram/link': { status: '201', kind: 'json' },
+  'get /notifications/telegram/connection': { status: '200', kind: 'json' },
+  'delete /notifications/telegram/connection': { status: '204', kind: 'none' },
+  // notifications realtime (Arc C — SSE stream, text/event-stream not JSON)
+  'get /notifications/stream': { status: '200', kind: 'stream' },
+  // ai (Track C — ADR-054, Arc C: conversation + durable-run create/fetch)
+  'post /ai/conversations': { status: '201', kind: 'json' },
+  'get /ai/conversations/{id}': { status: '200', kind: 'json' },
+  'post /ai/runs': { status: '201', kind: 'json' },
+  'get /ai/runs': { status: '200', kind: 'json' },
+  'get /ai/runs/{id}': { status: '200', kind: 'json' },
+  'post /ai/runs/{id}/cancel': { status: '200', kind: 'json' },
+  // ai approvals (Arc E — human-in-the-loop decision surface)
+  'get /ai/approvals': { status: '200', kind: 'json' },
+  'post /ai/approvals/{id}/decision': { status: '200', kind: 'json' },
+  // ai assistant admin (Arc F.1 — SUPER_ADMIN registry surface)
+  'get /admin/ai/assistants': { status: '200', kind: 'json' },
+  'get /admin/ai/assistants/{id}': { status: '200', kind: 'json' },
+  'post /admin/ai/assistants': { status: '201', kind: 'json' },
+  'post /admin/ai/assistants/{slug}/versions': { status: '201', kind: 'json' },
+  'patch /admin/ai/assistants/{id}': { status: '200', kind: 'json' },
+  // ai human takeover / operator review (Arc F.3)
+  'post /ai/conversations/{id}/takeover': { status: '200', kind: 'json' },
+  'post /ai/conversations/{id}/release': { status: '200', kind: 'json' },
+  'get /ai/conversations/{id}/messages': { status: '200', kind: 'json' },
+  'post /ai/conversations/{id}/messages': { status: '201', kind: 'json' },
+  // ai artifacts (Arc G — upload is typed JSON; download is a binary attachment stream)
+  'post /ai/conversations/{id}/artifacts': { status: '201', kind: 'json' },
+  'get /ai/conversations/{id}/artifacts/{artifactId}': { status: '200', kind: 'binary' },
+  // ai realtime (Arc C — status-only SSE stream, text/event-stream not JSON)
+  'get /ai/runs/{id}/stream': { status: '200', kind: 'stream' },
+  // metrics — Prometheus exposition (text, not JSON)
+  'get /metrics': { status: '200', kind: 'text' },
+}
+
+describe('OpenAPI success surface (e2e)', () => {
+  let app: INestApplication
+  let context: E2ETestContext
+  let document: OpenAPIObject
+
+  it('documents optional frontend proof and fail-closed responses without changing native auth', () => {
+    const operation = document.paths['/auth/login']!.post!
+    const headers =
+      operation.parameters?.filter((parameter) => 'in' in parameter && parameter.in === 'header') ??
+      []
+    for (const name of [
+      'X-Amcore-Web-Frontend',
+      'X-Amcore-Web-Placement',
+      'X-Amcore-Web-Context-Key',
+    ]) {
+      expect(headers).toContainEqual(expect.objectContaining({ name, required: false }))
+    }
+    expect(operation.responses['403']).toBeDefined()
+    expect(operation.responses['503']).toBeDefined()
+  })
+
+  it('documents password limiter429 and fail-closed503 for login and step-up', () => {
+    for (const path of ['/auth/login', '/auth/step-up']) {
+      const responses = document.paths[path]!.post!.responses
+      expect(responses['429']).toBeDefined()
+      expect(responses['503']).toBeDefined()
+    }
+  })
+
+  it('documents credential-free partial step-up separately from a complete token response', () => {
+    const responses = document.paths['/auth/step-up']!.post!.responses
+    expect(responses['200']).toMatchObject({
+      content: {
+        'application/json': {
+          schema: { $ref: '#/components/schemas/RefreshResponseDto_Output' },
+        },
+      },
+    })
+    expect(responses['202']).toMatchObject({
+      content: {
+        'application/json': {
+          schema: { $ref: '#/components/schemas/StepUpPendingDto_Output' },
+        },
+      },
+    })
+    expect(document.components!.schemas!.StepUpPendingDto_Output).toMatchObject({
+      additionalProperties: false,
+      required: expect.arrayContaining(['kind', 'requiredProofs']),
+    })
+  })
+
+  it('documents the finite OAuth return destination under its public query name', () => {
+    const operation = document.paths['/auth/oauth/{provider}']!.get!
+    expect(operation.parameters).toContainEqual(
+      expect.objectContaining({
+        in: 'query',
+        name: 'returnTo',
+        required: false,
+      })
+    )
+  })
+
+  it('documents irreversible member deletion and its failure outcomes', () => {
+    const operation = document.paths['/organizations/{orgId}/members/{userId}']!.delete!
+    expect(operation.description).toContain('Rejoining never restores old keys')
+    expect(operation.description).toContain('1001 refuses without changes')
+    for (const [status, codes] of Object.entries({
+      '204': ['irreversibly revoked'],
+      '400': ['BUSINESS_RULE_VIOLATION'],
+      '404': ['RESOURCE_NOT_FOUND'],
+      '409': ['MEMBER_API_KEYS_LIMIT', 'MEMBER_API_KEYS_CONFLICT'],
+      '503': ['MEMBER_API_KEYS_WRITE_UNAVAILABLE', 'unknown'],
+    })) {
+      const response = operation.responses[status]!
+      expect(response).not.toHaveProperty('$ref')
+      for (const code of codes) expect(JSON.stringify(response)).toContain(code)
+    }
+    expect(operation.security).toEqual(
+      expect.arrayContaining([{ bearer: [] }, { apiKeyBearer: [] }])
+    )
+  })
+
+  it('keeps member and invitation schemas distinct', () => {
+    expect(document.components?.schemas).toBeDefined()
+    assertInvitationSchemaContracts(document)
+  })
+
+  const HTTP_METHODS = ['get', 'post', 'put', 'patch', 'delete'] as const
+  const EXCLUDED_PREFIXES = ['/health']
+
+  it('documents bounded registered filters on the common work list', () => {
+    const operation = document.paths['/admin/background-work/works/{workId}/jobs']?.get
+    expect(operation).toBeDefined()
+    expect(operation?.parameters).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'filters', in: 'query', required: false }),
+        expect.objectContaining({ name: 'search', in: 'query', required: false }),
+      ])
+    )
+    expect(JSON.stringify(operation?.parameters)).toContain('1024')
+    expect(operation?.responses).toHaveProperty('400')
+  })
+
+  beforeAll(async () => {
+    process.env.JWT_SECRET ??= 'openapi-e2e-secret-at-least-32-characters'
+    context = await setupE2ETest()
+    app = context.app
+
+    // The harness applies no global prefix, so the document is built without one.
+    document = buildApiDocument(app, '')
+  }, 120000)
+
+  afterAll(async () => {
+    if (context) {
+      await teardownE2ETest(context)
+    }
+  }, 120000)
+
+  it('documents strict hash-bound owner decisions and redacted preview metadata', () => {
+    const operation = document.paths['/ai/approvals/{id}/decision']?.post
+    expect(operation?.security).toEqual([{ bearer: [] }])
+    for (const status of ['400', '401', '403', '404', '409', '429'])
+      expect(operation?.responses?.[status]).toBeDefined()
+    const request = document.components?.schemas?.DecideAiApprovalDto
+    expect(request).toMatchObject({
+      required: expect.arrayContaining(['decision', 'intentHash']),
+      additionalProperties: false,
+    })
+    expect(JSON.stringify(request)).toContain('intentHash')
+    const success = operation?.responses?.['200'] as {
+      content?: { 'application/json'?: { schema?: { $ref?: string } } }
+    }
+    const responseRef = success?.content?.['application/json']?.schema?.$ref
+    expect(responseRef).toBeDefined()
+    const response = document.components?.schemas?.[responseRef!.split('/').at(-1)!]
+    expect(response).toMatchObject({
+      required: expect.arrayContaining(['toolVersion', 'intentHash', 'preview', 'disclosure']),
+    })
+    const serialized = JSON.stringify(response)
+    for (const privateField of ['intentSnapshot', 'argsSnapshot', 'inputHash'])
+      expect(serialized).not.toContain(privateField)
+    expect(document.paths['/ai/approvals']?.get?.security).toEqual([{ bearer: [] }])
+    for (const response of [
+      operation?.responses?.['200'],
+      document.paths['/ai/approvals']?.get?.responses?.['200'],
+    ]) {
+      expect(response).toMatchObject({
+        headers: {
+          'Cache-Control': {
+            schema: {
+              type: 'string',
+              enum: ['private, no-store'],
+            },
+          },
+        },
+      })
+    }
+  })
+
+  it('documents parser400/413/415 on all declared request bodies', () => {
+    const bodies = Object.values(document.paths).flatMap((item) =>
+      ['get', 'post', 'put', 'patch', 'delete', 'options', 'head'].flatMap((method) => {
+        const operation = item?.[method as 'post']
+        return operation?.requestBody ? [operation] : []
+      })
+    )
+    expect(bodies.length).toBeGreaterThan(0)
+    for (const operation of bodies)
+      for (const status of ['400', '413', '415']) expect(operation.responses[status]).toBeDefined()
+  })
+
+  it('documents the X-Correlation-Id response header on every response', () => {
+    expect(document.components?.headers?.CorrelationId).toBeDefined()
+    const missing = Object.entries(document.paths).flatMap(([path, item]) =>
+      HTTP_METHODS.flatMap((method) =>
+        Object.entries(item?.[method]?.responses ?? {})
+          .filter(
+            ([, response]) =>
+              !!response &&
+              !('$ref' in response) &&
+              (response.headers?.['X-Correlation-Id'] as { $ref?: string } | undefined)?.$ref !==
+                '#/components/headers/CorrelationId'
+          )
+          .map(([status]) => `${method.toUpperCase()} ${path} ${status}`)
+      )
+    )
+    expect(missing).toEqual([])
+  })
+
+  it('documents TeamAccess/record-field failures and permission assignment branches', () => {
+    const orgOperations = Object.entries(document.paths).filter(([path]) =>
+      path.startsWith('/organizations')
+    )
+    const operations = orgOperations.flatMap(([path, item]) =>
+      HTTP_METHODS.flatMap((method) => (item?.[method] ? [{ path, operation: item[method]! }] : []))
+    )
+    expect(operations.filter(({ operation }) => !operation.responses?.['401'])).toEqual([])
+    expect(
+      operations.filter(
+        ({ path, operation }) =>
+          ![
+            '/organizations',
+            '/organizations/creation-policy',
+            '/organizations/creation-results/{operationId}',
+          ].includes(path) && !operation.responses?.['403']
+      )
+    ).toEqual([])
+    const operation = document.paths['/organizations/{orgId}/roles/{roleId}/permissions']?.post
+    expect(operation?.responses?.['400']).toBeDefined()
+    const schema = document.components?.schemas?.AssignPermissionDto
+    expect(schema).toBeDefined()
+    const serialized = JSON.stringify(schema)
+    expect(serialized).toContain('TeamAccess')
+    expect(serialized).toMatch(/oneOf|anyOf/)
+    const org = document.paths['/organizations/{id}']!
+    expect(org.get?.description).toContain('membership-based discovery')
+    expect(org.get?.description).toContain('all six response fields')
+    for (const method of ['get', 'patch', 'delete'] as const)
+      expect(org[method]?.responses?.['404']).toBeDefined()
+  })
+
+  const isExcluded = (path: string): boolean =>
+    EXCLUDED_PREFIXES.some((p) => path === p || path.startsWith(`${p}/`))
+
+  const jsonSchema = (response: Record<string, unknown> | undefined): object | undefined =>
+    (response?.content as Record<string, { schema?: object }> | undefined)?.['application/json']
+      ?.schema
+  const textSchema = (response: Record<string, unknown> | undefined): object | undefined =>
+    (response?.content as Record<string, { schema?: object }> | undefined)?.['text/plain']?.schema
+  const htmlSchema = (response: Record<string, unknown> | undefined): object | undefined =>
+    (response?.content as Record<string, { schema?: object }> | undefined)?.['text/html']?.schema
+  const eventStreamSchema = (response: Record<string, unknown> | undefined): object | undefined =>
+    (response?.content as Record<string, { schema?: object }> | undefined)?.['text/event-stream']
+      ?.schema
+  const octetSchema = (response: Record<string, unknown> | undefined): object | undefined =>
+    (response?.content as Record<string, { schema?: object }> | undefined)?.[
+      'application/octet-stream'
+    ]?.schema
+  const nonEmpty = (schema: object | undefined): boolean =>
+    !!schema && Object.keys(schema).length > 0
+
+  // Collect every documented operation as `${method} ${path}` → responses.
+  const collectOperations = (): Map<string, Record<string, object>> => {
+    const ops = new Map<string, Record<string, object>>()
+    for (const [path, item] of Object.entries(document.paths)) {
+      if (isExcluded(path)) continue
+      for (const method of HTTP_METHODS) {
+        const op = (item as Record<string, { responses?: Record<string, object> }>)[method]
+        if (op) ops.set(`${method} ${path}`, op.responses ?? {})
+      }
+    }
+    return ops
+  }
+
+  it('documents exactly the expected success status and body kind for every operation', () => {
+    const ops = collectOperations()
+    const violations: string[] = []
+
+    // 1. Every documented operation must be in the inventory (forces a new
+    //    handler to be added here — the guard).
+    for (const key of ops.keys()) {
+      if (!EXPECTED[key]) violations.push(`${key}: documented but missing from the test inventory`)
+    }
+
+    // 2. Every inventory entry must be documented (catches removed/renamed ops).
+    for (const key of Object.keys(EXPECTED)) {
+      if (!ops.has(key)) violations.push(`${key}: in the inventory but not documented`)
+    }
+
+    // 3. Each operation documents exactly the expected success status and a
+    //    body of the expected kind, with no conflicting extra success status.
+    for (const [key, responses] of ops) {
+      const expected = EXPECTED[key]
+      if (!expected) continue
+
+      const successCodes = Object.keys(responses).filter((c) => /^[23]\d\d$/.test(c))
+      const expectedCodes =
+        typeof expected.status === 'string' ? [expected.status] : [...expected.status]
+      if (JSON.stringify(successCodes.sort()) !== JSON.stringify(expectedCodes.sort())) {
+        violations.push(
+          `${key}: expected exactly [${expectedCodes.join(', ')}], got [${successCodes.join(', ')}]`
+        )
+        continue
+      }
+      for (const code of successCodes) {
+        const response = responses[code] as Record<string, unknown>
+        switch (expected.kind) {
+          case 'json':
+            if (!nonEmpty(jsonSchema(response))) {
+              violations.push(`${key}: ${code} has no application/json body schema`)
+            }
+            break
+          case 'text':
+            if (!nonEmpty(textSchema(response))) {
+              violations.push(`${key}: ${code} has no text/plain body schema`)
+            }
+            break
+          case 'html':
+            if (!nonEmpty(htmlSchema(response))) {
+              violations.push(`${key}: ${code} has no text/html body schema`)
+            }
+            break
+          case 'stream':
+            if (!nonEmpty(eventStreamSchema(response))) {
+              violations.push(`${key}: ${code} has no text/event-stream body schema`)
+            }
+            break
+          case 'binary':
+            if (!nonEmpty(octetSchema(response))) {
+              violations.push(`${key}: ${code} has no application/octet-stream body schema`)
+            }
+            break
+          case 'none':
+            if (jsonSchema(response))
+              violations.push(`${key}: ${code} must not carry a body schema`)
+            break
+          case 'redirect':
+            // 3xx already asserted by the status match; redirects carry no body.
+            break
+        }
+      }
+    }
+
+    expect(violations).toEqual([])
+  })
+
+  // Route signature (method + classPath + handlerPath, as declared on the
+  // controller) → OpenAPI path key (`:param` → `{param}`, leading slash).
+  const toOpenApiPathKey = (
+    method: RequestMethod,
+    classPath: string,
+    handlerPath: string
+  ): string => {
+    const joined = [classPath, handlerPath].filter(Boolean).join('/')
+    const path = `/${joined}`.replace(/:([A-Za-z0-9_]+)/g, '{$1}')
+    return `${RequestMethod[method]!.toLowerCase()} ${path}`
+  }
+
+  const securityOf = (key: string): ReadonlyArray<Record<string, string[]>> => {
+    const [method, ...pathParts] = key.split(' ')
+    const path = pathParts.join(' ')
+    const item = document.paths[path] as
+      Record<string, { security?: Array<Record<string, string[]>> }> | undefined
+    return item?.[method!]?.security ?? []
+  }
+
+  it('documents the member access explanation as three evaluations', () => {
+    const operation = document.paths['/organizations/{orgId}/members/{userId}/access']!.get!
+    const response = (operation.responses['200'] as { content: Record<string, { schema: object }> })
+      .content['application/json']!.schema
+    expect(response).toEqual({ $ref: '#/components/schemas/MemberAccessResponseDto_Output' })
+    const output = document.components!.schemas!.MemberAccessResponseDto_Output as {
+      properties: {
+        items: { items: { oneOf: { properties: Record<string, { enum?: string[] }> }[] } }
+      }
+    }
+    const variants = output.properties.items.items.oneOf
+    expect(variants.map((variant) => variant.properties.evaluation?.enum)).toEqual([
+      ['record'],
+      ['configured'],
+      ['notEvaluated'],
+    ])
+    // Only an exact item may claim a decision; a configured one names a state, not a boolean.
+    expect(variants.map((variant) => 'granted' in variant.properties)).toEqual([true, false, false])
+    expect(variants[1]!.properties.state?.enum).toEqual([
+      'allowed',
+      'configured',
+      'blocked',
+      'missingPrerequisite',
+      'none',
+    ])
+    const sources = variants[1]!.properties.sources as unknown as {
+      items: { oneOf: { properties: Record<string, { type?: string }> }[] }
+    }
+    const ruleSource = sources.items.oneOf.find((source) => 'permissionId' in source.properties)
+    expect(ruleSource?.properties.total?.type).toBe('integer')
+  })
+
+  it('documents invitation role intent, bounded errors and credential boundaries', () => {
+    const accept = document.paths['/auth/invites/accept']!.post!
+    for (const status of ['200', '400', '401', '403', '409', '429', '503'])
+      expect(accept.responses[status]).toBeDefined()
+    expect(accept.security).toEqual([{ bearer: [] }])
+    const create = document.paths['/organizations/{orgId}/invites']!.post!
+    for (const status of ['202', '400', '401', '403', '404', '409', '429', '503'])
+      expect(create.responses[status]).toBeDefined()
+    expect(create.responses['202']).toEqual(
+      expect.objectContaining({ description: expect.stringContaining('best-effort') })
+    )
+    const revoke = document.paths['/organizations/{orgId}/invites/{inviteId}']!.delete!
+    for (const status of ['204', '400', '401', '403', '404', '409', '429', '503'])
+      expect(revoke.responses[status]).toBeDefined()
+    expect(revoke.security).toEqual([{ bearer: [] }])
+  })
+
+  it('documents AI run creation errors (idempotency conflict, ownership, no model) and the cancel contract', () => {
+    const create = document.paths['/ai/runs']!.post!
+    for (const status of ['201', '404', '409', '410', '503'])
+      expect(create.responses[status]).toBeDefined()
+    expect(create.responses['409']).toEqual(
+      expect.objectContaining({
+        description: expect.stringContaining('AI_RUN_IDEMPOTENCY_CONFLICT'),
+      })
+    )
+    expect(create.description).toContain('AI_RUN_DEADLINE_MS')
+    expect(create.security).toEqual([{ bearer: [] }])
+    const cancel = document.paths['/ai/runs/{id}/cancel']!.post!
+    for (const status of ['200', '404', '410']) expect(cancel.responses[status]).toBeDefined()
+    expect(cancel.description).toContain('never lost')
+    for (const operation of [
+      create,
+      cancel,
+      document.paths['/ai/runs/{id}']!.get!,
+      document.paths['/ai/runs/{id}/stream']!.get!,
+    ]) {
+      const archived = JSON.stringify(operation.responses['410'])
+      for (const field of [
+        'AI_RUN_ARCHIVED',
+        'details',
+        'terminalStatus',
+        'finishedAt',
+        'archivedAt',
+      ])
+        expect(archived).toContain(field)
+    }
+  })
+
+  it('documents the fail-closed protection 503 on every ADR-034 operation and on invite accept, and nowhere else', () => {
+    // An abuse counter that cannot be checked answers 503 SERVICE_UNAVAILABLE. The response
+    // is documented exactly where the counter runs: operations that accept an API key
+    // (the allowlist) and the invitation accept route. Unrelated routes must not claim it.
+    const apiKeyMarker = 'API key failure counters could not be checked'
+    const inviteMarker = 'invitation failure counters could not be checked'
+    const expected = new Map<string, string>(
+      ADR_034_APIKEY_ALLOWLIST.map((entry) => [
+        toOpenApiPathKey(entry.method, entry.classPath, entry.handlerPath),
+        apiKeyMarker,
+      ])
+    )
+    expected.set('post /auth/invites/accept', inviteMarker)
+    const violations: string[] = []
+
+    for (const [path, item] of Object.entries(document.paths)) {
+      if (isExcluded(path)) continue
+      for (const method of HTTP_METHODS) {
+        const op = (item as Record<string, { responses?: Record<string, unknown> } | undefined>)[
+          method
+        ]
+        if (!op) continue
+        const key = `${method} ${path}`
+        const described = JSON.stringify(op.responses?.['503'] ?? '')
+        const marker = expected.get(key)
+        if (marker && !described.includes(marker))
+          violations.push(`${key}: missing the protection 503 (${marker})`)
+        if (!marker && (described.includes(apiKeyMarker) || described.includes(inviteMarker)))
+          violations.push(`${key}: documents a protection 503 but runs no abuse counter`)
+      }
+    }
+    for (const key of expected.keys()) {
+      const [method, ...parts] = key.split(' ')
+      if (!(document.paths[parts.join(' ')] as Record<string, unknown> | undefined)?.[method!])
+        violations.push(`${key}: expected operation is missing from the document`)
+    }
+
+    expect(violations).toEqual([])
+  })
+
+  it('merges the dependency-unavailable 503 into every protected operation and OAuth Redis step', () => {
+    // The overview states the contract once; each affected operation also names the outcome
+    // itself. An operation's own 503 keeps its meaning and its codes; the admission or OAuth case
+    // is added to it, so the two stay distinguishable. Coverage is an explicit rule, not "a 503 exists".
+    expect(document.info.description).toContain('SERVICE_UNAVAILABLE')
+    const admission = 'admission could not finish'
+    const oauthStepMarker = 'one-time OAuth step'
+    type Response = {
+      description?: string
+      $ref?: string
+      content?: Record<string, { schema?: { properties?: { errorCode?: { enum?: string[] } } } }>
+    }
+    // The queue board authenticates in a middleware outside the admission guard and declares its own
+    // 503 ('Access could not be verified'), so the admission case does not apply to it.
+    const middlewareAuth = new Set(['get /admin/queues'])
+    const violations: string[] = []
+    let protectedCount = 0
+    let specializedCount = 0
+    for (const [path, item] of Object.entries(document.paths)) {
+      if (isExcluded(path)) continue
+      for (const method of HTTP_METHODS) {
+        const op = (
+          item as Record<
+            string,
+            { security?: unknown[]; responses?: Record<string, Response> } | undefined
+          >
+        )[method]
+        if (!op) continue
+        const oauthStep =
+          /\/auth\/oauth(\/|$)/.test(path) && !path.endsWith('/auth/oauth/providers')
+        const protectedOp = (op.security?.length ?? 0) > 0
+        const described = op.responses?.['503']
+        const key = `${method} ${path}`
+        if (!oauthStep && !protectedOp) {
+          if (described?.description?.includes(admission))
+            violations.push(`${key}: public operation claims the admission 503`)
+          continue
+        }
+        if (!described) {
+          violations.push(`${key}: missing the 503 response`)
+          continue
+        }
+        if (described.$ref) violations.push(`${key}: 503 is a reference, not merged`)
+        if (protectedOp) protectedCount++
+        if (protectedOp && !middlewareAuth.has(key) && !described.description?.includes(admission))
+          violations.push(`${key}: 503 does not document the admission case`)
+        if (oauthStep && !described.description?.includes(oauthStepMarker))
+          violations.push(`${key}: 503 does not document the OAuth Redis case`)
+        for (const media of Object.values(described.content ?? {})) {
+          const codes = media.schema?.properties?.errorCode?.enum
+          if (codes && !codes.includes('SERVICE_UNAVAILABLE'))
+            violations.push(`${key}: errorCode enum omits SERVICE_UNAVAILABLE`)
+        }
+        if (
+          /ORGANIZATION_CREATION_UNCONFIRMED|failure counters could not be checked/.test(
+            described.description ?? ''
+          )
+        )
+          specializedCount++
+      }
+    }
+    expect(protectedCount).toBeGreaterThan(50)
+    expect(violations).toEqual([])
+    expect(specializedCount).toBeGreaterThan(0)
+
+    // Specialized meanings survive next to the new case.
+    const create = (
+      document.paths['/organizations'] as Record<string, { responses: Record<string, Response> }>
+    )['post']!.responses['503']!
+    expect(create.description).toContain('ORGANIZATION_CREATION_UNCONFIRMED')
+    expect(create.description).toContain(admission)
+    const me = (
+      document.paths['/auth/me'] as Record<string, { responses: Record<string, Response> }>
+    )['get']!.responses['503']!
+    expect(me.description).toContain('API key failure counters could not be checked')
+    expect(me.description).toContain(admission)
+
+    const exchange = (
+      document.paths['/auth/oauth/exchange'] as Record<
+        string,
+        { responses: Record<string, Response> }
+      >
+    )['post']!.responses['503']!
+    expect(exchange.description).toContain('API/web placement disagreement')
+    expect(exchange.description).toContain(oauthStepMarker)
+    expect(exchange.description).toContain('Start sign-in again')
+  })
+
+  it('documents the apiKeyBearer security scheme on exactly the ADR-034 allowlisted operations', () => {
+    // Guards against a dangling security reference: every @ApiSecurity('apiKeyBearer')
+    // reference below is meaningless if the scheme itself isn't registered in
+    // components.securitySchemes (e.g. buildSwaggerConfig() regresses).
+    expect(document.components?.securitySchemes?.['apiKeyBearer']).toBeDefined()
+
+    const allowlistedKeys = new Set(
+      ADR_034_APIKEY_ALLOWLIST.map((entry) =>
+        toOpenApiPathKey(entry.method, entry.classPath, entry.handlerPath)
+      )
+    )
+    const violations: string[] = []
+
+    for (const key of allowlistedKeys) {
+      const security = securityOf(key)
+      const hasApiKeyBearer = security.some((req) => 'apiKeyBearer' in req)
+      if (!hasApiKeyBearer) {
+        violations.push(`${key}: in ADR_034_APIKEY_ALLOWLIST but missing apiKeyBearer security`)
+      }
+    }
+
+    // The inverse direction: no operation outside the allowlist may document
+    // apiKeyBearer — this is the guard against the class-vs-method security
+    // metadata leak described in organizations.controller.ts (a class-level
+    // @ApiSecurity would concatenate onto bearer-only handlers too).
+    for (const [path, item] of Object.entries(document.paths)) {
+      if (isExcluded(path)) continue
+      for (const method of HTTP_METHODS) {
+        const op = (
+          item as Record<string, { security?: Array<Record<string, string[]>> } | undefined>
+        )[method]
+        if (!op) continue
+        const key = `${method} ${path}`
+        const hasApiKeyBearer = (op.security ?? []).some((req) => 'apiKeyBearer' in req)
+        if (hasApiKeyBearer && !allowlistedKeys.has(key)) {
+          violations.push(`${key}: documents apiKeyBearer but is not in ADR_034_APIKEY_ALLOWLIST`)
+        }
+      }
+    }
+
+    expect(violations).toEqual([])
+  })
+
+  it('documents parent-bounded switch without deprecation or key authentication', () => {
+    const operation = document.paths['/organizations/{id}/switch']?.post
+    expect(operation?.security).toEqual([{ bearer: [] }])
+    expect(operation?.description).toContain('expires no later than its parent')
+    expect(operation?.description).toContain('between organizations remains supported')
+    expect(operation?.deprecated).not.toBe(true)
+    expect(operation?.responses).toHaveProperty('200')
+    expect(operation?.responses).toHaveProperty('401')
+    expect(operation?.responses).toHaveProperty('403')
+  })
+
+  it('documents the bearer-only role-definition editor contracts with their stable failure statuses', () => {
+    const base = '/organizations/{orgId}/role-definitions'
+    const operations = [
+      [document.paths[base]?.get, ['200', '400', '401', '403', '503']],
+      [document.paths[base]?.post, ['201', '400', '401', '403', '409', '413', '503']],
+      [document.paths[`${base}/{roleId}`]?.get, ['200', '401', '403', '404', '503']],
+      [
+        document.paths[`${base}/{roleId}`]?.patch,
+        ['200', '400', '401', '403', '404', '409', '413', '503'],
+      ],
+      [
+        document.paths[`${base}/{roleId}/deletion`]?.post,
+        ['200', '400', '401', '403', '404', '409', '413', '503'],
+      ],
+    ] as const
+    for (const [operation, statuses] of operations) {
+      expect(operation?.security).toEqual([{ bearer: [] }])
+      expect(operation?.security).not.toContainEqual({ apiKeyBearer: [] })
+      for (const status of statuses) expect(operation?.responses).toHaveProperty(status)
+    }
+  })
+
+  it('documents the bearer-only, no-content Operations Console access probe', () => {
+    const operation = document.paths['/admin/access']?.get
+    const noContentResponse = operation?.responses?.['204'] as { content?: unknown } | undefined
+
+    expect(operation?.security).toEqual([{ bearer: [] }])
+    expect(noContentResponse?.content).toBeUndefined()
+    expect(operation?.responses).toHaveProperty('401')
+    expect(operation?.responses).toHaveProperty('403')
+    expect(operation?.security).not.toContainEqual({ apiKeyBearer: [] })
+  })
+
+  it('documents the command input byte-limit refusal', () => {
+    const operation = document.paths['/admin/background-work/commands']?.post
+    expect(operation?.responses).toHaveProperty('413')
+    const catalogue = document.paths['/admin/background-work/works']?.get
+    expect(catalogue?.responses?.['200']).toHaveProperty(
+      'description',
+      'At most64 registered resources within64KiB encoded JSON; oversize returns503 WORK_UNAVAILABLE'
+    )
+    expect(catalogue?.responses).toHaveProperty('503')
+    expect(operation?.responses?.['413']).toHaveProperty(
+      'description',
+      'Command input exceeds the 32KiB byte ceiling'
+    )
+  })
+
+  it('documents membership-safe nullable organization names only on the owner key inventory', () => {
+    const schemas = document.components?.schemas ?? {}
+    const resolve = (value: unknown): Record<string, unknown> => {
+      const schema = value as { $ref?: string }
+      return (schema?.$ref ? schemas[schema.$ref.split('/').at(-1)!] : value) as Record<
+        string,
+        unknown
+      >
+    }
+    const response = document.paths['/api-keys']!.get!.responses!['200'] as {
+      content?: { 'application/json'?: { schema?: unknown } }
+    }
+    const envelope = resolve(response.content?.['application/json']?.schema)
+    const data = (envelope.properties as Record<string, unknown>).data as { items: unknown }
+    const row = resolve(data.items)
+    expect(row.required).toContain('organizationName')
+    const name = (row.properties as Record<string, unknown>).organizationName
+    expect(JSON.stringify(name)).toContain('null')
+  })
+
+  it('documents closed registered failure maps on common work diagnostics', () => {
+    const schemas = document.components?.schemas ?? {}
+    const resolve = (value: unknown): Record<string, unknown> => {
+      const schema = value as { $ref?: string }
+      return (schema?.$ref ? schemas[schema.$ref.split('/').at(-1)!] : value) as Record<
+        string,
+        unknown
+      >
+    }
+    const operation = document.paths['/admin/background-work/works/{workId}/jobs/{jobId}']?.get
+    expect(operation?.security).toEqual([{ bearer: [] }])
+    const response = operation?.responses?.['200'] as {
+      content?: { 'application/json'?: { schema?: unknown } }
+    }
+    const job = resolve(response.content?.['application/json']?.schema)
+    const properties = job.properties as Record<string, unknown>
+    expect(resolve(properties.replay).enum).toContain('conservative')
+    const failure = resolve(properties.failure)
+    expect(Object.keys(failure.properties as object).sort()).toEqual(['code', 'nextStep', 'title'])
+    expect(failure.required).toEqual(expect.arrayContaining(['code', 'title']))
+    expect(job.required).not.toContain('failure')
+    expect(operation?.description).toContain('16KiB')
+    expect(document.paths['/admin/background-work/works']?.get?.description).toContain(
+      'masked original recipients and Telegram connection generations'
+    )
+  })
+
+  it('documents optional fenced member removal and actual legacy refusal codes', () => {
+    const op = document.paths['/organizations/{orgId}/members/{userId}']!.delete!
+    expect(op.parameters).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'expectedMemberId', in: 'query', required: false }),
+      ])
+    )
+    expect(op.responses['400']).toMatchObject({
+      description: expect.stringContaining('BUSINESS_RULE_VIOLATION'),
+    })
+    expect(op.responses['404']).toMatchObject({
+      description: expect.stringContaining('RESOURCE_NOT_FOUND'),
+    })
+    expect(op.responses['409']).toMatchObject({
+      description: expect.stringContaining('MEMBER_ROLES_CONFLICT'),
+    })
+  })
+
+  it('documents the bearer-only background-work queue summary away from the Bull Board path', () => {
+    const operation = document.paths['/admin/background-work/queues']?.get
+
+    expect(operation?.security).toEqual([{ bearer: [] }])
+    expect(operation?.security).not.toContainEqual({ apiKeyBearer: [] })
+    for (const status of ['200', '401', '403', '429']) {
+      expect(operation?.responses).toHaveProperty(status)
+    }
+    // `/admin/queues**` is the Bull Board mount; the summary must never live under it.
+    expect(Object.keys(document.paths).filter((path) => path.startsWith('/admin/queues/'))).toEqual(
+      []
+    )
+    const response = operation?.responses?.['200'] as {
+      content?: { 'application/json'?: { schema?: { $ref?: string } } }
+    }
+    const ref = response.content?.['application/json']?.schema?.$ref
+    expect(ref).toBeDefined()
+    const schema = document.components?.schemas?.[ref!.split('/').at(-1)!]
+    expect(schema).toMatchObject({ required: expect.arrayContaining(['checkedAt', 'queues']) })
+  })
+
+  it('documents the bearer-only Console Overview endpoint with its failure statuses', () => {
+    const operation = document.paths['/admin/overview']?.get
+
+    expect(operation?.security).toEqual([{ bearer: [] }])
+    expect(operation?.security).not.toContainEqual({ apiKeyBearer: [] })
+    expect(operation?.responses).toHaveProperty('200')
+    expect(operation?.responses).toHaveProperty('401')
+    expect(operation?.responses).toHaveProperty('403')
+    // Provider bugs are 500; browser timeouts are not an API HTTP 503 response. The only 503
+    // is the shared authentication one: admission could not finish because a dependency was slow.
+    expect(operation?.responses).toHaveProperty('500')
+    expect(
+      (operation?.responses?.['503'] as { description?: string } | undefined)?.description
+    ).toContain('Authentication temporarily unavailable')
+    const response = operation?.responses?.['200'] as {
+      content?: { 'application/json'?: { schema?: { $ref?: string } } }
+    }
+    const ref = response.content?.['application/json']?.schema?.$ref
+    expect(ref).toBeDefined()
+    const schema = document.components?.schemas?.[ref!.split('/').at(-1)!]
+    expect(schema).toMatchObject({
+      required: expect.arrayContaining([
+        'readiness',
+        'dependencies',
+        'version',
+        'processRole',
+        'checkedAt',
+        'completedAt',
+        'build',
+        'storage',
+        'publicDelivery',
+        'storageHealthEnabled',
+        'api',
+        'process',
+        'resources',
+      ]),
+      properties: {
+        storage: {
+          required: expect.arrayContaining(['state', 'checkedAt', 'nextScheduledAt', 'inProgress']),
+        },
+      },
+    })
+  })
+
+  it('documents the bounded bearer-only audit read without raw metadata', () => {
+    const operation = document.paths['/admin/audit-logs']?.get
+    expect(operation?.security).toEqual([{ bearer: [] }])
+    expect(operation?.security).not.toContainEqual({ apiKeyBearer: [] })
+    for (const status of ['200', '400', '401', '403', '429', '500', '503']) {
+      expect(operation?.responses).toHaveProperty(status)
+    }
+    const parameters = (operation?.parameters ?? []) as Array<{
+      name: string
+      in: string
+      required?: boolean
+      schema?: { minimum?: number; maximum?: number; maxLength?: number }
+    }>
+    const params = new Map(parameters.map((p) => [p.name, p]))
+    for (const key of [
+      'actorId',
+      'actorType',
+      'action',
+      'actions',
+      'targetId',
+      'targetType',
+      'organizationId',
+      'includeReadEvents',
+      'from',
+      'to',
+      'limit',
+      'cursor',
+    ]) {
+      expect(params.get(key)).toMatchObject({ in: 'query', required: false })
+    }
+    expect(params.get('limit')?.schema).toMatchObject({ minimum: 1, maximum: 50 })
+    expect(params.get('cursor')?.schema).toMatchObject({ maxLength: 512 })
+    const response = operation?.responses?.['200'] as {
+      content?: { 'application/json'?: { schema?: { $ref?: string } } }
+    }
+    const ref = response.content?.['application/json']?.schema?.$ref
+    expect(ref).toBeDefined()
+    const visited = new Set<string>()
+    const forbidden = new Set(['metadata', 'ip', 'emailHash', 'pinoEvent'])
+    const missingRefs: string[] = []
+    const forbiddenKeys: string[] = []
+    const detailFields = new Set<string>()
+    const inspect = (value: unknown): void => {
+      if (!value || typeof value !== 'object') return
+      if (Array.isArray(value)) {
+        value.forEach(inspect)
+        return
+      }
+      const node = value as Record<string, unknown>
+      if (typeof node.$ref === 'string' && !visited.has(node.$ref)) {
+        visited.add(node.$ref)
+        const referenced = document.components?.schemas?.[node.$ref.split('/').at(-1)!]
+        if (referenced) inspect(referenced)
+        else missingRefs.push(node.$ref)
+      }
+      if (node.properties && typeof node.properties === 'object') {
+        if ('commandId' in node.properties && 'operation' in node.properties)
+          Object.keys(node.properties).forEach((key) => detailFields.add(key))
+        for (const key of Object.keys(node.properties)) {
+          if (forbidden.has(key)) forbiddenKeys.push(key)
+        }
+      }
+      Object.values(node).forEach(inspect)
+    }
+    inspect(response.content?.['application/json']?.schema)
+    expect(missingRefs).toEqual([])
+    expect(forbiddenKeys).toEqual([])
+    expect([...detailFields]).toEqual(
+      expect.arrayContaining(['commandId', 'workId', 'jobId', 'operation', 'reason', 'outcome'])
+    )
+  })
+
+  it('documents the admin discovery search/sortBy/sortOrder query contract on both list endpoints (ADR-082)', () => {
+    interface ParamLike {
+      name: string
+      in: string
+      required?: boolean
+      schema?: { type?: string; maxLength?: number; enum?: string[] }
+    }
+
+    const DISCOVERY_ENDPOINTS = [
+      { key: 'get /admin/users', sortFields: ADMIN_USER_SORT_FIELDS },
+      { key: 'get /admin/organizations', sortFields: ADMIN_ORGANIZATION_SORT_FIELDS },
+    ] as const
+
+    const violations: string[] = []
+
+    for (const { key, sortFields } of DISCOVERY_ENDPOINTS) {
+      const [, ...pathParts] = key.split(' ')
+      const path = pathParts.join(' ')
+      const operation = document.paths[path]?.get as
+        { parameters?: ParamLike[]; responses?: Record<string, unknown> } | undefined
+      const params = new Map((operation?.parameters ?? []).map((p) => [p.name, p]))
+
+      if (!operation?.responses?.['400']) {
+        violations.push(`${key}: must document a 400 response for invalid discovery query values`)
+      }
+
+      const search = params.get('search')
+      if (!search || search.in !== 'query' || search.required !== false) {
+        violations.push(`${key}: "search" must be documented as an optional query parameter`)
+      } else if (search.schema?.maxLength !== 255) {
+        violations.push(`${key}: "search" schema must document maxLength: 255`)
+      }
+
+      const sortBy = params.get('sortBy')
+      const sortByEnum = sortBy?.schema?.enum ?? []
+      if (!sortBy || sortBy.in !== 'query' || sortBy.required !== false) {
+        violations.push(`${key}: "sortBy" must be documented as an optional query parameter`)
+      } else if (
+        sortByEnum.length !== sortFields.length ||
+        !sortFields.every((f) => sortByEnum.includes(f))
+      ) {
+        violations.push(
+          `${key}: "sortBy" enum [${sortByEnum.join(', ')}] must exactly match the allowlist [${sortFields.join(', ')}]`
+        )
+      }
+
+      const sortOrder = params.get('sortOrder')
+      const sortOrderEnum = sortOrder?.schema?.enum ?? []
+      if (!sortOrder || sortOrder.in !== 'query' || sortOrder.required !== false) {
+        violations.push(`${key}: "sortOrder" must be documented as an optional query parameter`)
+      } else if (
+        sortOrderEnum.length !== 2 ||
+        !['asc', 'desc'].every((v) => sortOrderEnum.includes(v))
+      ) {
+        violations.push(`${key}: "sortOrder" enum must be exactly ["asc", "desc"]`)
+      }
+    }
+
+    expect(violations).toEqual([])
+  })
+
+  it('documents safe detail-only login diagnostics with bearer-only admission', () => {
+    assertLoginDiagnosticsContract(document)
+  })
+
+  it('documents both admin detail searches and their guarded response contract', () => {
+    for (const path of ['/admin/users/{id}', '/admin/organizations/{id}']) {
+      const operation = document.paths[path]?.get as {
+        parameters?: Array<{
+          name: string
+          in: string
+          required?: boolean
+          schema?: { maxLength?: number }
+        }>
+        responses?: Record<string, unknown>
+      }
+      const parameters = new Map(operation.parameters?.map((param) => [param.name, param]))
+      expect(parameters.get('id')).toMatchObject({ in: 'path', required: true })
+      expect(parameters.get('search')).toMatchObject({
+        in: 'query',
+        required: false,
+        schema: { maxLength: 255 },
+      })
+      for (const status of ['200', '400', '401', '403', '404', '503']) {
+        expect(operation.responses?.[status]).toBeDefined()
+      }
+    }
+  })
+
+  it('documents a multipart/form-data request body with a binary file field for both upload operations', () => {
+    const MULTIPART_UPLOADS = [
+      'post /auth/me/avatar',
+      'post /ai/conversations/{id}/artifacts',
+    ] as const
+
+    interface RequestBodyLike {
+      content?: Record<string, { schema?: { properties?: Record<string, { format?: string }> } }>
+    }
+
+    const violations: string[] = []
+
+    for (const key of MULTIPART_UPLOADS) {
+      const [method, ...pathParts] = key.split(' ')
+      const path = pathParts.join(' ')
+      const item = document.paths[path] as
+        Record<string, { requestBody?: RequestBodyLike } | undefined> | undefined
+      const op = item?.[method!]
+      const multipart = op?.requestBody?.content?.['multipart/form-data']
+      if (!multipart) {
+        violations.push(`${key}: no multipart/form-data request body documented`)
+        continue
+      }
+      if (multipart.schema?.properties?.['file']?.format !== 'binary') {
+        violations.push(
+          `${key}: multipart body's "file" property is not documented as format: binary`
+        )
+      }
+    }
+
+    expect(violations).toEqual([])
+  })
+
+  describe('queue board operation', () => {
+    it('is documented once, as HTML, with bearer OR cookie authentication', () => {
+      const operation = document.paths['/admin/queues']?.get
+      expect(operation).toBeDefined()
+      expect(operation?.security).toEqual([{ bearer: [] }, { cookie: [] }])
+      expect(operation?.security).not.toContainEqual({ apiKeyBearer: [] })
+      for (const status of ['200', '401', '403', '503']) {
+        expect(operation?.responses).toHaveProperty(status)
+      }
+      expect(operation?.description).toContain('405')
+    })
+
+    it('references only security schemes that exist, with the cookie name inside the scheme', () => {
+      const schemes = document.components?.securitySchemes ?? {}
+      const operation = document.paths['/admin/queues']?.get
+      for (const requirement of operation?.security ?? []) {
+        for (const name of Object.keys(requirement)) expect(schemes).toHaveProperty(name)
+      }
+      expect(schemes['cookie']).toMatchObject({
+        type: 'apiKey',
+        in: 'cookie',
+        name: 'refresh_token',
+      })
+      expect(schemes).not.toHaveProperty('refresh_token')
+    })
+
+    it('carries the global prefix when the API is started with one, and only then', () => {
+      const prefixed = addQueueBoardOperation(
+        { ...document, paths: {} },
+        { mounted: true },
+        'api/v1'
+      )
+      expect(Object.keys(prefixed.paths)).toEqual(['/api/v1/admin/queues'])
+      const slashed = addQueueBoardOperation(
+        { ...document, paths: {} },
+        { mounted: true },
+        '/api/v1/'
+      )
+      expect(Object.keys(slashed.paths)).toEqual(['/api/v1/admin/queues'])
+    })
+
+    it('documents nothing when the board is not mounted', () => {
+      const without = addQueueBoardOperation({ ...document, paths: {} }, { mounted: false }, '')
+      expect(without.paths).toEqual({})
+    })
+  })
+})

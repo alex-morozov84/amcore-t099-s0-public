@@ -1,0 +1,91 @@
+/** Current semantic actions offered by the Console selector. Historical codes remain queryable. */
+export const AUDIT_ACTIONS = [
+  'admin.user.support_mail_requested',
+  'admin.user.support_mail_dispatching',
+  'admin.user.support_mail_settled',
+  'admin.user.support_mail_refused',
+  'org.administrator_invitation_created',
+  'org.administrator_invitation_reissued',
+  'org.administrator_invitation_replaced',
+  'org.administrator_invitation_cancelled',
+  'org.administrator_invitation_completed',
+  'org.administrator_assigned',
+
+  'admin.audit_logs.viewed',
+  'admin.api_keys.viewed',
+  'admin.api_keys.revocation_requested',
+  'admin.cleanup.executed',
+  'admin.runtime_setting.changed',
+  'integration.email_test_requested',
+  'integration.email_test_settled',
+  'admin.user.session_revoked',
+  'admin.user.sessions_revoked',
+  'admin.user.sessions_viewed',
+  'admin.user.system_role_changed',
+  'ai.approval.approved',
+  'ai.approval.expired',
+  'ai.approval.rejected',
+  'ai.approval.requested',
+  'ai.assistant.created',
+  'ai.assistant.disabled',
+  'ai.assistant.enabled',
+  'ai.assistant.updated',
+  'ai.assistant.version_published',
+  'ai.conversation.artifact_accessed',
+  'ai.conversation.operator_message',
+  'ai.conversation.released',
+  'ai.conversation.taken_over',
+  'ai.conversation.transcript_accessed',
+  'ai.tool.execution_failed',
+  'ai.tool.invoked',
+  'api_key.created',
+  'api_key.revoked',
+  'organization.api_keys.revocation_requested',
+  'organization.member_removed',
+  'auth.step_up_failed',
+  'auth.mfa_backup_codes_replaced',
+  'auth.mfa_backup_codes_saved',
+  'auth.mfa_setup_completed',
+  'auth.mfa_factor_enrolled',
+  'auth.mfa_factor_replaced',
+  'auth.mfa_protocol_activated',
+  'auth.mfa_offline_recovery_started',
+  'auth.mfa_recovery_ticket_redeemed',
+  'auth.mfa_proof_verified',
+  'auth.mfa_verification_failed',
+  'auth.mfa_backup_code_used',
+  'auth.step_up_succeeded',
+  'background_work.command_intent',
+  'background_work.command_outcome',
+  'background_work.command_denied',
+  'background_work.command_resolution',
+  'background_work.evidence_resolution',
+  'org.created',
+  'org.setup_account_prepared',
+  'org.invite_accepted',
+  'org.invite_created',
+  'org.invite_revoked',
+  'org.invite_reissued',
+  'org.member_roles_changed',
+  'org.role_created',
+  'org.role_deleted',
+  'org.role_updated',
+  'telegram.connection_linked',
+  'telegram.connection_unlinked',
+] as const
+
+export type AuditAction = (typeof AUDIT_ACTIONS)[number]
+
+/**
+ * Read-only "viewing sensitive data" actions, hidden from Audit browsing
+ * by default (ADR-083's precedent): a successful privileged read is
+ * itself audited so the read is not invisible, but surfacing every routine
+ * read alongside actual mutations would drown out the events an operator
+ * usually wants. `includeReadEvents=true` (or an explicit `action`/`actions`
+ * filter naming one of these codes) opts back in.
+ */
+export const HIDDEN_READ_AUDIT_ACTIONS: readonly AuditAction[] = [
+  'admin.audit_logs.viewed',
+  'admin.api_keys.viewed',
+  'admin.user.sessions_viewed',
+]

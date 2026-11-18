@@ -1,0 +1,189 @@
+import { types } from 'node:util'
+
+import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus } from '@nestjs/common'
+import { HttpAdapterHost } from '@nestjs/core'
+import { ClsService } from 'nestjs-cls'
+import { PinoLogger } from 'nestjs-pino'
+
+import { REQUEST_BODY_LIMIT_BYTES } from '../../../bootstrap/request-body-policy.js'
+import { sanitizeRequestUrl } from '../../config/logging.config.js'
+import { sanitizeHeaders } from '../../utils/index.js'
+import { PayloadTooLargeException } from '../domain/index.js'
+import type { ErrorResponse } from '../types.js'
+
+/**
+ * Catch-all exception filter (last resort)
+ * Handles all unhandled exceptions that other filters didn't catch
+ */
+@Catch()
+export class AllExceptionsFilter implements ExceptionFilter {
+  constructor(
+    private readonly httpAdapterHost: HttpAdapterHost,
+    private readonly logger: PinoLogger,
+    private readonly cls: ClsService
+  ) {
+    this.logger.setContext(AllExceptionsFilter.name)
+  }
+
+  catch(exception: unknown, host: ArgumentsHost): void {
+    const { httpAdapter } = this.httpAdapterHost
+    const ctx = host.switchToHttp()
+    const request = ctx.getRequest()
+    const response = ctx.getResponse()
+
+    // Translate framework-level errors that are not HttpExceptions (e.g. the
+    // body-parser size error) into domain exceptions before classification.
+    const normalized = this.normalizeException(exception)
+
+    // Determine status code
+    const statusCode = this.getStatusCode(normalized)
+    const message = this.getErrorMessage(normalized)
+    const errorCode = this.getErrorCode(normalized)
+    if (
+      statusCode === 415 &&
+      types.isNativeError(exception) &&
+      (exception as Error & { type?: string }).type === 'encoding.unsupported'
+    )
+      httpAdapter.setHeader(response, 'Accept-Encoding', 'identity, gzip, deflate, br')
+
+    // Build error response
+    const errorResponse: ErrorResponse = {
+      statusCode,
+      message,
+      errorCode,
+      timestamp: new Date().toISOString(),
+      path: sanitizeRequestUrl(request.url),
+      method: request.method,
+      correlationId: this.cls.getId(),
+    }
+
+    // Add stack trace in development
+    if (process.env.NODE_ENV === 'development' && exception instanceof Error) {
+      errorResponse.stack = exception.stack
+    }
+
+    // Log error
+    if (statusCode >= 500) {
+      this.logger.error(
+        {
+          err: exception,
+          req: {
+            method: request.method,
+            url: sanitizeRequestUrl(request.url),
+            // Explicit source-side redaction. Pino's path-based redact still
+            // applies on top, but does not silently fail if the log shape
+            // changes or a new sensitive header is added later.
+            headers: sanitizeHeaders(request.headers),
+          },
+        },
+        `Unhandled exception: ${message}`
+      )
+    } else {
+      this.logger.warn(
+        { statusCode, path: sanitizeRequestUrl(request.url) },
+        `Client error: ${message}`
+      )
+    }
+
+    // Send response
+    httpAdapter.reply(response, errorResponse, statusCode)
+  }
+
+  /**
+   * Translate non-`HttpException` framework errors into domain exceptions so the
+   * rest of the filter classifies them consistently.
+   *
+   * body-parser raises a plain `Error` with `type === 'entity.too.large'` (and a
+   * `.status`/`.statusCode` of 413) when a request body exceeds the configured
+   * limit. Without this the catch-all would report it as 500. Detection keys on
+   * the `type` discriminator, which is stable across body-parser's localized
+   * messages, rather than parsing the message text.
+   */
+  private normalizeException(exception: unknown): unknown {
+    if (
+      exception instanceof Error &&
+      ((exception as { type?: unknown }).type === 'entity.too.large' ||
+        (exception as { code?: unknown }).code === 'FST_ERR_CTP_BODY_TOO_LARGE')
+    ) {
+      return new PayloadTooLargeException('Request body exceeds the maximum allowed size', {
+        limitBytes:
+          typeof (exception as { limit?: unknown }).limit === 'number'
+            ? (exception as Error & { limit?: number }).limit
+            : REQUEST_BODY_LIMIT_BYTES,
+      })
+    }
+    if (types.isNativeError(exception)) {
+      const parser = exception as Error & { type?: string; status?: number }
+      const known = new Map([
+        ['entity.parse.failed', 400],
+        ['querystring.parse.rangeError', 400],
+        ['request.aborted', 400],
+        ['request.size.invalid', 400],
+        ['charset.unsupported', 415],
+        ['encoding.unsupported', 415],
+      ])
+      if (parser.type === 'parameters.too.many' && parser.status === 413)
+        return new PayloadTooLargeException('Too many form parameters', { parameterLimit: 1000 })
+      const status = parser.type ? known.get(parser.type) : undefined
+      if (status && parser.status === status)
+        return new HttpException(
+          status === 415 ? 'Unsupported request format' : 'Invalid request body',
+          status
+        )
+    }
+    return exception
+  }
+
+  /**
+   * Extract HTTP status code from exception
+   */
+  private getStatusCode(exception: unknown): number {
+    if (exception instanceof HttpException) {
+      return exception.getStatus()
+    }
+    return HttpStatus.INTERNAL_SERVER_ERROR
+  }
+
+  /**
+   * Extract error message from exception
+   */
+  private getErrorMessage(exception: unknown): string {
+    if (exception instanceof HttpException) {
+      const response = exception.getResponse()
+      if (typeof response === 'object' && 'message' in response) {
+        const message = response.message
+        return Array.isArray(message) ? message.join(', ') : String(message)
+      }
+      return exception.message
+    }
+
+    if (exception instanceof Error) {
+      return exception.message
+    }
+
+    if (typeof exception === 'string') {
+      return exception
+    }
+
+    return 'Internal server error'
+  }
+
+  /**
+   * Extract error code from exception
+   */
+  private getErrorCode(exception: unknown): string | undefined {
+    if (exception instanceof HttpException) {
+      const response = exception.getResponse()
+      if (typeof response === 'object' && 'errorCode' in response) {
+        return String(response['errorCode'])
+      }
+    }
+
+    // Default error code for unhandled exceptions
+    if (this.getStatusCode(exception) >= 500) {
+      return 'INTERNAL_SERVER_ERROR'
+    }
+
+    return undefined
+  }
+}

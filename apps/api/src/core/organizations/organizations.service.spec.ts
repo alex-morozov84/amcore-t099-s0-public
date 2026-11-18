@@ -1,0 +1,325 @@
+import { type DeepMockProxy, mockDeep } from 'jest-mock-extended'
+
+import type { RequestPrincipal } from '@amcore/shared'
+import { SystemRole } from '@amcore/shared'
+
+import { ForbiddenException, NotFoundException } from '../../common/exceptions'
+import type { PrismaService } from '../../prisma'
+import type { AppAbility } from '../auth/casl/ability.factory'
+import type { OrgAclVersionService } from '../auth/org-acl-version.service'
+
+import { CapabilityRegistry } from './capability-registry.service'
+import { OrganizationCreationService } from './organization-creation.service'
+import { OrganizationsService } from './organizations.service'
+
+import type { Organization, OrgMember } from '@/generated/prisma/client'
+import type { PrismaClient } from '@/generated/prisma/client'
+
+// findOne reads `ability.can(Read, Organization)` only for api_key
+// principals (OA-03). JWT cases pass `allowAbility()`; api_key cases
+// pick the variant that matches the scenario under test.
+const allowAbility = (): AppAbility =>
+  ({ can: jest.fn().mockReturnValue(true) }) as unknown as AppAbility
+const denyAbility = (): AppAbility =>
+  ({ can: jest.fn().mockReturnValue(false) }) as unknown as AppAbility
+
+describe('OrganizationsService', () => {
+  let creation: jest.Mocked<Pick<OrganizationCreationService, 'create'>>
+  let service: OrganizationsService
+  let prisma: DeepMockProxy<PrismaClient>
+  let aclVersionService: jest.Mocked<Pick<OrgAclVersionService, 'invalidate'>>
+
+  const mockOrg: Organization = {
+    id: 'org-1',
+    name: 'Acme Corp',
+    slug: 'acme-corp',
+    aclVersion: 0,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  }
+
+  // Arc C: create/findOne/update map Prisma rows to the response shape
+  // (Date → ISO string) before returning, so handlers can `@SchemaResponse`.
+  const expectedOrgResponse = {
+    id: mockOrg.id,
+    name: mockOrg.name,
+    slug: mockOrg.slug,
+    aclVersion: mockOrg.aclVersion,
+    createdAt: mockOrg.createdAt.toISOString(),
+    updatedAt: mockOrg.updatedAt.toISOString(),
+  }
+
+  const mockMember: OrgMember = {
+    id: 'member-1',
+    userId: 'user-1',
+    organizationId: 'org-1',
+    createdAt: new Date(),
+  }
+
+  const mockPrincipal: RequestPrincipal = {
+    type: 'jwt',
+    sub: 'user-1',
+    email: 'user@example.com',
+    systemRole: SystemRole.User,
+    organizationId: 'org-1',
+    aclVersion: 0,
+  }
+
+  beforeEach(() => {
+    prisma = mockDeep<PrismaClient>()
+    aclVersionService = { invalidate: jest.fn().mockResolvedValue(undefined) }
+    creation = { create: jest.fn() }
+    service = new OrganizationsService(
+      prisma as unknown as PrismaService,
+      aclVersionService as unknown as OrgAclVersionService,
+      new CapabilityRegistry(),
+      creation as unknown as OrganizationCreationService
+    )
+  })
+
+  describe('create', () => {
+    it('uses the shared creation operation and preserves its response', async () => {
+      creation.create.mockResolvedValue(expectedOrgResponse)
+      expect(await service.create('user-1', { name: 'Acme Corp' }, 'operation')).toEqual(
+        expectedOrgResponse
+      )
+      expect(creation.create).toHaveBeenCalledWith('user-1', { name: 'Acme Corp' }, 'operation')
+    })
+  })
+
+  describe('findAllForUser', () => {
+    it('returns paginated envelope with mapped organizations (OB-05)', async () => {
+      prisma.orgMember.findMany.mockResolvedValue([
+        { ...mockMember, organization: mockOrg } as OrgMember & { organization: Organization },
+      ] as never)
+      prisma.orgMember.count.mockResolvedValue(1)
+
+      const result = await service.findAllForUser('user-1', 1, 20)
+
+      expect(result.total).toBe(1)
+      expect(result.page).toBe(1)
+      expect(result.limit).toBe(20)
+      expect(result.data).toHaveLength(1)
+      expect(result.data[0]?.id).toBe(mockOrg.id)
+      expect(typeof result.data[0]?.createdAt).toBe('string')
+    })
+
+    it('applies skip/take and deterministic ORDER BY (ADR-036)', async () => {
+      prisma.orgMember.findMany.mockResolvedValue([])
+      prisma.orgMember.count.mockResolvedValue(0)
+
+      await service.findAllForUser('user-1', 2, 10)
+
+      const arg = prisma.orgMember.findMany.mock.calls[0]![0]!
+      expect(arg.skip).toBe(10)
+      expect(arg.take).toBe(10)
+      expect(arg.orderBy).toEqual([
+        { organization: { createdAt: 'desc' } },
+        { organization: { id: 'asc' } },
+      ])
+    })
+  })
+
+  describe('findOne', () => {
+    it('returns org when JWT principal is a member', async () => {
+      prisma.organization.findUnique.mockResolvedValue(mockOrg)
+      prisma.orgMember.findUnique.mockResolvedValue(mockMember)
+
+      // JWT path does not consult ability — denyAbility() proves the
+      // check is skipped (would otherwise throw).
+      const result = await service.findOne('org-1', mockPrincipal, denyAbility())
+      expect(result).toEqual(expectedOrgResponse)
+    })
+
+    it('returns org when JWT principal has no org-context but is a member (read does not require /switch)', async () => {
+      prisma.organization.findUnique.mockResolvedValue(mockOrg)
+      prisma.orgMember.findUnique.mockResolvedValue(mockMember)
+
+      const noOrgPrincipal: RequestPrincipal = {
+        ...mockPrincipal,
+        organizationId: undefined,
+        aclVersion: undefined,
+      }
+
+      // JWT without org-context has an empty personal ability;
+      // denyAbility() simulates that exactly. The check is skipped
+      // for JWT.
+      const result = await service.findOne('org-1', noOrgPrincipal, denyAbility())
+      expect(result).toEqual(expectedOrgResponse)
+    })
+
+    it('throws NotFoundException when org does not exist', async () => {
+      prisma.organization.findUnique.mockResolvedValue(null)
+      prisma.orgMember.findUnique.mockResolvedValue(null)
+
+      await expect(service.findOne('org-1', mockPrincipal, allowAbility())).rejects.toThrow(
+        NotFoundException
+      )
+    })
+
+    /**
+     * OB-04: JWT non-member access conceals org existence. Existing-
+     * but-not-member and missing-org both return NotFoundException —
+     * previously the former returned ForbiddenException and let an
+     * attacker enumerate org IDs by status code. The API-key OA-03
+     * branch (403 credential-boundary) is intentionally untouched —
+     * see its own describe below.
+     */
+    it('throws NotFoundException when JWT user is not a member (OB-04)', async () => {
+      prisma.organization.findUnique.mockResolvedValue(mockOrg)
+      prisma.orgMember.findUnique.mockResolvedValue(null)
+
+      await expect(service.findOne('org-1', mockPrincipal, allowAbility())).rejects.toThrow(
+        NotFoundException
+      )
+    })
+
+    // OA-03: API-key principals are bound to one org per ADR-033 and
+    // must not read another org's record, even when the owning user is
+    // a member of both. The 403 here proves the credential-boundary
+    // check fires before the membership/existence Prisma queries — note
+    // the mocks are not asserted, because the early return prevents
+    // them from being called.
+    it('OA-03: throws ForbiddenException when api_key principal targets a different org', async () => {
+      const apiKeyPrincipal: RequestPrincipal = {
+        ...mockPrincipal,
+        type: 'api_key',
+        organizationId: 'org-bound', // bound to a different org than the request
+        aclVersion: 0,
+        scopes: ['read:Organization'],
+      }
+
+      await expect(service.findOne('org-1', apiKeyPrincipal, allowAbility())).rejects.toThrow(
+        ForbiddenException
+      )
+      expect(prisma.organization.findUnique).not.toHaveBeenCalled()
+      expect(prisma.orgMember.findUnique).not.toHaveBeenCalled()
+    })
+
+    // OA-03 (follow-up): api_key bound to the requested org but with a
+    // scope that does NOT include read:Organization (e.g. `read:User`)
+    // must still be denied — `userPerms ∩ scopes` per ADR-033. The
+    // ability is built from `permsInBoundOrg ∩ scopes` so a key with
+    // only `read:User` resolves can(Read, Organization) === false.
+    it('OA-03: throws ForbiddenException when api_key bound to same org but ability denies read:Organization', async () => {
+      const apiKeyPrincipal: RequestPrincipal = {
+        ...mockPrincipal,
+        type: 'api_key',
+        organizationId: 'org-1',
+        aclVersion: 0,
+        scopes: ['read:User'], // does not allow read:Organization
+      }
+
+      prisma.organization.findUnique.mockResolvedValue(mockOrg)
+      prisma.orgMember.findUnique.mockResolvedValue(mockMember)
+      const ability = denyAbility() // actual record read denied
+      await expect(service.findOne('org-1', apiKeyPrincipal, ability)).rejects.toThrow(
+        ForbiddenException
+      )
+      expect(ability.can).toHaveBeenCalledWith('read', expect.objectContaining({ id: 'org-1' }))
+    })
+
+    it('OA-03: returns org when api_key principal targets its bound org with read:Organization in ability', async () => {
+      prisma.organization.findUnique.mockResolvedValue(mockOrg)
+      prisma.orgMember.findUnique.mockResolvedValue(mockMember)
+
+      const apiKeyPrincipal: RequestPrincipal = {
+        ...mockPrincipal,
+        type: 'api_key',
+        organizationId: 'org-1',
+        aclVersion: 0,
+        scopes: ['read:Organization'],
+      }
+
+      const result = await service.findOne('org-1', apiKeyPrincipal, allowAbility())
+      expect(result).toEqual(expectedOrgResponse)
+    })
+  })
+
+  describe('update', () => {
+    it('throws ForbiddenException when principal.organizationId does not match', async () => {
+      const wrongPrincipal: RequestPrincipal = { ...mockPrincipal, organizationId: 'org-other' }
+
+      await expect(
+        service.update('org-1', wrongPrincipal, { name: 'New Name' }, allowAbility())
+      ).rejects.toThrow(ForbiddenException)
+    })
+
+    it('updates org when caller is in the correct org context', async () => {
+      prisma.$transaction.mockImplementation(async (callback: any) => callback(prisma))
+      prisma.organization.findUnique.mockResolvedValue(mockOrg)
+      prisma.orgMember.findUnique.mockResolvedValue(mockMember)
+      prisma.organization.findFirst.mockResolvedValue(null) // no slug conflict
+      prisma.organization.update.mockResolvedValue({ ...mockOrg, name: 'New Name' })
+
+      const result = await service.update(
+        'org-1',
+        mockPrincipal,
+        { name: 'New Name' },
+        allowAbility()
+      )
+      expect(result.name).toBe('New Name')
+    })
+  })
+
+  describe('remove', () => {
+    it('throws ForbiddenException when principal.organizationId does not match', async () => {
+      const wrongPrincipal: RequestPrincipal = { ...mockPrincipal, organizationId: undefined }
+      await expect(service.remove('org-1', wrongPrincipal, allowAbility())).rejects.toThrow(
+        ForbiddenException
+      )
+    })
+
+    it('deletes org when caller is in the correct org context', async () => {
+      prisma.$transaction.mockImplementation(async (callback: any) => callback(prisma))
+      prisma.organization.findUnique.mockResolvedValue(mockOrg)
+      prisma.orgMember.findUnique.mockResolvedValue(mockMember)
+      prisma.organization.delete.mockResolvedValue(mockOrg)
+      await expect(service.remove('org-1', mockPrincipal, allowAbility())).resolves.toBeUndefined()
+    })
+  })
+
+  describe('getForSwitch', () => {
+    it('throws ForbiddenException when user is not a member', async () => {
+      prisma.orgMember.findUnique.mockResolvedValue(null)
+      await expect(service.getForSwitch('org-1', 'user-1')).rejects.toThrow(ForbiddenException)
+    })
+
+    it('returns aclVersion when user is a member', async () => {
+      prisma.orgMember.findUnique.mockResolvedValue({
+        ...mockMember,
+        organization: { aclVersion: 5 },
+      } as never)
+
+      const result = await service.getForSwitch('org-1', 'user-1')
+      expect(result).toEqual({ aclVersion: 5 })
+    })
+  })
+
+  describe('bumpAclVersion', () => {
+    it('increments aclVersion in the database', async () => {
+      prisma.organization.update.mockResolvedValue({ ...mockOrg, aclVersion: 1 })
+      await service.bumpAclVersion('org-1')
+      expect(prisma.organization.update).toHaveBeenCalledWith({
+        where: { id: 'org-1' },
+        data: { aclVersion: { increment: 1 } },
+      })
+      expect(aclVersionService.invalidate).toHaveBeenCalledWith('org-1')
+    })
+
+    it('increments aclVersion inside an existing transaction without invalidating Redis', async () => {
+      await service.bumpAclVersionTx('org-1', prisma as never)
+
+      expect(prisma.organization.update).toHaveBeenCalledWith({
+        where: { id: 'org-1' },
+        data: { aclVersion: { increment: 1 } },
+      })
+      expect(aclVersionService.invalidate).not.toHaveBeenCalled()
+    })
+
+    it('invalidates aclVersion cache through the dedicated wrapper', async () => {
+      await service.invalidateAclVersion('org-1')
+      expect(aclVersionService.invalidate).toHaveBeenCalledWith('org-1')
+    })
+  })
+})

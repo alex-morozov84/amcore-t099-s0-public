@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source_root=$(cd "$(dirname "$0")/../.." && pwd)
+# Only a single canonical declaration can disable this starter-only proof.
+mode=$(awk '
+  /^[[:space:]]*[-*][[:space:]]+\*\*Mode:/ {
+    count++
+    if ($0 == "- **Mode:** `downstream-product`") downstream++
+  }
+  END { if (count == 1 && downstream == 1) print "downstream-product" }
+' "$source_root/PROJECT_CONTEXT.md" 2>/dev/null || true)
+if [[ "$mode" == downstream-product ]]; then
+  # GitHub supplies the repository identity; this guards AMCore, not product forks.
+  if [[ "${GITHUB_REPOSITORY:-}" == alex-morozov84/AMCore ]]; then
+    echo '::error::AMCore must retain Mode upstream-starter; capability extension cannot be disabled here.' >&2
+    exit 1
+  fi
+  message='Capability extension did not run: Mode is downstream-product. Its fixed source patch proves the starter extension path and cannot track product edits. A green Test no longer proves that full path on this product. Inherited tests remain; product PostgreSQL tests must cover roles, organizations, rows, DENY, fields and API keys for its own modules.'
+  echo "::warning::$message"
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    printf '%s\n' "### Capability extension not run" "$message" >> "$GITHUB_STEP_SUMMARY"
+  fi
+  exit 0
+fi
+if [[ "${1:-}" == --check-only && $# == 1 ]]; then
+  git -C "$source_root" apply --check "$source_root/scripts/fixtures/t024-capability-extension.patch"
+  exit 0
+fi
+if [[ $# != 0 ]]; then
+  echo 'Usage: t024-capability-extension.sh [--check-only]' >&2
+  exit 2
+fi
+
+fixture_root=$(mktemp -d "${TMPDIR:-/tmp}/t024-extension.XXXXXX")
+finished=false
+cleanup() {
+  if [[ "$finished" == true ]]; then
+    rm -rf -- "$fixture_root"
+  else
+    echo "Fixture preserved for diagnosis: $fixture_root" >&2
+  fi
+}
+trap cleanup EXIT
+
+rsync -a \
+  --exclude='/.git' --exclude='/ai/' --exclude='.amcore/' \
+  --exclude='/.worktrees/' --exclude='node_modules/' --exclude='dist/' \
+  --exclude='.next/' --exclude='.env*' \
+  --exclude='/apps/api/src/generated/prisma/' \
+  "$source_root/" "$fixture_root/"
+ln -s "$source_root/node_modules" "$fixture_root/node_modules"
+for package in apps/api apps/web packages/shared; do
+  mkdir -p "$fixture_root/$package/node_modules"
+  rsync -a "$source_root/$package/node_modules/" "$fixture_root/$package/node_modules/"
+done
+
+git -C "$fixture_root" apply --check \
+  "$source_root/scripts/fixtures/t024-capability-extension.patch"
+git -C "$fixture_root" apply \
+  "$source_root/scripts/fixtures/t024-capability-extension.patch"
+chmod +x "$fixture_root/fixture-bin/pnpm"
+
+# A product registers copy for its capabilities in every web catalogue it keeps. The fixture does the
+# same for whichever catalogues this checkout has (a fork may keep one locale, or others).
+node -e '
+  const fs = require("node:fs")
+  const dir = process.argv[1] + "/apps/web/messages"
+  const copy = {
+    fixtureOrderRead: { label: "View orders", description: "See the orders in this organization." },
+    fixtureOrderUpdate: { label: "Edit orders", description: "Change the status and the note of orders." },
+  }
+  for (const file of fs.readdirSync(dir).filter((name) => name.endsWith(".json"))) {
+    const json = JSON.parse(fs.readFileSync(dir + "/" + file, "utf8"))
+    Object.assign(json.organizationRoles.capabilities, copy)
+    json.organizationRoles.areas.FixtureOrder = "Orders"
+    fs.writeFileSync(dir + "/" + file, JSON.stringify(json, null, 2) + "\n")
+  }
+' "$fixture_root"
+
+(cd "$fixture_root/packages/shared" && pnpm run build)
+(cd "$fixture_root/apps/api" && ./node_modules/.bin/prisma generate)
+(cd "$fixture_root/apps/api" && pnpm run typecheck)
+(cd "$fixture_root/apps/web" && pnpm run typecheck)
+(cd "$fixture_root/apps/api" && \
+  NODE_OPTIONS=--experimental-vm-modules \
+  ./node_modules/.bin/jest --config jest.config.js --runInBand \
+  --runTestsByPath src/core/organizations/capability-policy-parity.spec.ts --silent)
+(cd "$fixture_root/apps/api" && \
+  PATH="$fixture_root/fixture-bin:$PATH" NODE_OPTIONS=--experimental-vm-modules \
+  ./node_modules/.bin/jest --config jest-e2e.config.js --runInBand \
+  --runTestsByPath test/fixture-order-extension.e2e-spec.ts test/openapi.e2e-spec.ts --silent)
+cat "$fixture_root/apps/api/fixture-order-measurement.json"
+
+# The access journey: register -> configure a role -> assign -> explain, compared with the real
+# handlers. Run by name, with a floor on the reported counts so a skipped suite cannot pass silently.
+expect_passed() {
+  node -e '
+    const [file, minimum, label] = process.argv.slice(1)
+    const result = JSON.parse(require("node:fs").readFileSync(file, "utf8"))
+    const passed = result.numPassedTests ?? result.numPassed ?? 0
+    const failed = result.numFailedTests ?? result.numFailed ?? 0
+    if (failed !== 0 || passed < Number(minimum)) {
+      console.error(label + ": passed " + passed + " (need >= " + minimum + "), failed " + failed)
+      process.exit(1)
+    }
+    console.log(label + ": " + passed + " passed")
+  ' "$@"
+}
+(cd "$fixture_root/apps/api" && \
+  PATH="$fixture_root/fixture-bin:$PATH" NODE_OPTIONS=--experimental-vm-modules \
+  ./node_modules/.bin/jest --config jest-e2e.config.js --runInBand \
+  --runTestsByPath test/fixture-order-access.e2e-spec.ts --silent \
+  --json --outputFile="$fixture_root/access-journey.json")
+expect_passed "$fixture_root/access-journey.json" 13 "access journey (API e2e)"
+# Every catalogue entry must have copy in every web catalogue, so both screens can show it.
+(cd "$fixture_root/apps/web" && \
+  ./node_modules/.bin/vitest run --project=unit \
+  src/entities/organization-context/model/catalogue-copy.test.ts \
+  --reporter=json --outputFile="$fixture_root/catalogue-copy.json")
+expect_passed "$fixture_root/catalogue-copy.json" 1 "catalogue copy (web unit)"
+finished=true

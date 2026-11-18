@@ -1,0 +1,114 @@
+'use client'
+import { useState } from 'react'
+import { useLocale, useTranslations } from 'next-intl'
+import type { ProductAccessBootstrap } from '@amcore/shared'
+
+import { useOrganizationContext } from '@/entities/organization-context'
+import { roleHrefUnder, RoleLinkProvider } from '@/shared/lib/role-links'
+import { useRouteProgressRouter } from '@/shared/lib/route-progress/use-route-progress-router'
+import { ApiErrorAlert } from '@/shared/ui/api-error-alert'
+import { BackLink } from '@/shared/ui/back-link'
+import { Button } from '@/shared/ui/button'
+import { PageTitle } from '@/shared/ui/page-title'
+import { OrganizationMembers } from '@/widgets/organization-members'
+import { OrganizationSectionNav } from '@/widgets/organization-nav'
+
+import { memberListHref, type MemberListView } from '../model/member-list-navigation'
+
+export function OrganizationMembersClient({
+  deniedContent,
+  admission,
+  organizationId,
+  initialOrganizationName,
+  backHref,
+  membersHref,
+  invitationsHref,
+  rolesHref,
+  listHref,
+  query,
+}: {
+  deniedContent?: React.ReactNode
+  admission: ProductAccessBootstrap
+  organizationId: string
+  initialOrganizationName?: string
+  backHref: string
+  membersHref?: string
+  invitationsHref?: string
+  rolesHref?: string
+  listHref?: string
+  query?: MemberListView
+}) {
+  const [removedIdentity, setRemovedIdentity] = useState<string>()
+  const router = useRouteProgressRouter()
+  const locale = useLocale()
+  const t = useTranslations('organizationMembers')
+  const input = { kind: 'selected' as const, id: organizationId, locale }
+  const access = useOrganizationContext(admission.binding, input, true)
+  const allowed =
+    access.data && 'canManageTeamAccess' in access.data.data && access.data.data.canManageTeamAccess
+  const identity = `${admission.binding}:${organizationId}`
+  const expectedAccessLoss = removedIdentity === identity && access.state.status === 'denied'
+  if (
+    ((access.state.status === 'denied' && !expectedAccessLoss) ||
+      (access.state.status === 'ready' && !allowed)) &&
+    deniedContent
+  )
+    return deniedContent
+  return (
+    <section className="space-y-6">
+      <BackLink href={listHref ?? backHref}>{t('allOrganizations')}</BackLink>
+      <PageTitle>
+        {access.data && 'organization' in access.data.data
+          ? access.data.data.organization.name
+          : access.initialPending || access.state.status === 'denied'
+            ? initialOrganizationName
+            : undefined}
+      </PageTitle>
+      <OrganizationSectionNav
+        active="members"
+        hrefs={{
+          overview: backHref,
+          members: membersHref ?? `${backHref}/members`,
+          invitations: invitationsHref,
+          roles: rolesHref,
+        }}
+      />
+      {!expectedAccessLoss && <ApiErrorAlert error={access.state.error} />}
+      <RoleLinkProvider roleHref={roleHrefUnder(rolesHref)}>
+        <OrganizationMembers
+          key={`${admission.binding}:${organizationId}`}
+          controller={access.controller}
+          actorId={admission.actor.id}
+          onSelfRemoved={() => setRemovedIdentity(identity)}
+          organizationsHref={listHref ?? backHref}
+          organizationName={
+            access.data && 'organization' in access.data.data
+              ? access.data.data.organization.name
+              : initialOrganizationName
+          }
+          authorityStatus={access.state.status}
+          query={query}
+          onQueryChange={
+            membersHref
+              ? (next, reason) => {
+                  const href = memberListHref(membersHref, next)
+                  if (reason === 'page') router.push(href, { scroll: false })
+                  else router.replace(href, { scroll: false })
+                }
+              : undefined
+          }
+        />
+      </RoleLinkProvider>
+      {access.state.status === 'ready' && !allowed && <p role="status">{t('denied')}</p>}
+      {!expectedAccessLoss && Boolean(access.state.error) && (
+        <Button
+          variant="outline"
+          disabled={access.state.status === 'pending' || access.busy}
+          onClick={() => void access.refresh()}
+        >
+          {t('retry')}
+        </Button>
+      )}
+    </section>
+  )
+}

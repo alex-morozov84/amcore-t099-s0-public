@@ -1,0 +1,20 @@
+# AMCore — optional bundled edge (COMPOSE_PROFILES=...,edge). Caddy REPLACES a
+# reverse proxy — do not run it alongside nginx/Traefik/a cloud LB. See
+# docs/operations/deployment.md → "TLS & reverse proxy" → "Optional bundled
+# edge: Caddy".
+#
+# Automatic HTTPS needs CADDY_DOMAIN's A/AAAA record pointed at this host and
+# ports 80/443 reachable from the internet (ACME HTTP-01 challenge). For local
+# testing without a public domain, replace `{$CADDY_DOMAIN}` below with
+# `localhost` and add `tls internal` inside the block instead.
+{
+	email {$CADDY_EMAIL}
+}
+
+{$CADDY_DOMAIN} {
+	reverse_proxy api:5002 {
+		# The API trusts this header only from TRUSTED_WEB_PEERS (the web BFF relay). A client
+		# must never deliver it through the edge, whatever that setting is.
+		header_up -X-AMCore-Client-Ip
+	}
+}

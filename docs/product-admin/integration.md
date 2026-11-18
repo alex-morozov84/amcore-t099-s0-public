@@ -1,0 +1,394 @@
+# Integrate organization pages and custom UI
+
+Initialize your downstream identity with `pnpm init:brand` before manual route
+movement. The examples below use the multi-locale `[locale]` route tree. Use
+nonreserved same-host destinations that do not overlap API,
+authentication, assets or Operations Console routes.
+
+## Ordinary placement
+
+For the bundled administration area, configure the
+[shared placement source and matching physical subtree](placement-and-sessions.md).
+Its default path is `/manage`; host mode exposes the same pages at the staff host root.
+The adapter examples below apply to custom organization integrations, not a second
+source of deployment placement. Keep their custom login gate and API family aligned.
+
+Change `organizationAccessPlacement` once as shown in the
+[entry guide](README.md#connect-the-ready-pages). `organizationsPath` is a
+locale-neutral, nonroot absolute path with literal `[A-Za-z0-9_-]+` segments;
+`homeHref` uses the same syntax or `/`. A single trailing slash is normalized at the application source and when deriving
+destinations, including the home destination. Queries,
+hashes, encoded paths, dot/empty segments, backslashes and external URLs are
+unsupported. This bounded adapter does not validate all route or deployment
+collisions. Use the explicit page API for other destinations.
+
+For a custom integration, wire your chosen physical pages and retain their
+ancestor layout and error boundary; route groups do not contribute URL segments. Supply actual physical
+pages; a placement descriptor does not create routes.
+
+The list page stays a thin server entry:
+
+```tsx
+import { OrganizationAccessMount } from '@/_app/organization-access/index.server'
+
+export const dynamic = 'force-dynamic'
+export default OrganizationAccessMount
+```
+
+The selected page awaits its route parameter:
+
+```tsx
+import { OrganizationAccessMount } from '@/_app/organization-access/index.server'
+
+export const dynamic = 'force-dynamic'
+export default async function SelectedOrganization({
+  params,
+  searchParams,
+}: {
+  params: Promise<{ id: string }>
+  searchParams: Promise<Record<string, string | string[] | undefined>>
+}) {
+  return <OrganizationAccessMount id={(await params).id} searchParams={searchParams} />
+}
+```
+
+The ancestor layout may keep `OrganizationAccessFrame` from the
+`@/_app/organization-access` entry. It renders AppShell. The ready server mount's
+`index.server` entry has no AppShell dependency, so a downstream can instead wrap
+it with its own server composition and shell. Keep an error boundary that renders
+safe recovery for failed infrastructure reads. The page retains its own admission
+check; a layout alone is insufficient as an authentication gate.
+
+The dashboard layout reuses `OrganizationAccessFrame`, which owns home placement,
+the Organizations menu and client message selection. A separate composition can
+pass one shared `placement` object to Frame, Mount and NavigationEntry; pass data
+across the server/client boundary, not href functions. Content mounts use
+`index.server`; the shell entry does not reexport them. The bundled default uses
+`productAdminPath()` for organizations, home, own keys and login.
+
+The nested members route moves with the selected route. Its thin page renders
+`OrganizationMembersMount` from the same `index.server` entry, after awaiting
+`params.id`. The mount independently verifies membership and full TeamAccess;
+the ready overview derives the Members link from placement's `membersHref(id)`.
+An explicitly composed `OrganizationAccessClient` can supply `membersHref` or
+omit it when that downstream does not mount the reference members page.
+
+## Explicit nonhierarchical destinations
+
+The bundled admin routes supply `deniedContent` to ready organization/member/
+invitation/role mounts. It renders the shared local unavailable recovery
+without retaining protected organization details. Keep this application-owned
+slot separate from domain data/permission checks. Custom consumers can supply
+their own recovery; the default headless lifecycle still hides refused data.
+Use the fixed-shop variant without the list action when choosing another
+organization is not a supported journey. The selected logout action must remain
+usable even when profile or organization reads are refused.
+
+Own-key mounts retain the [personal key inventory](./own-api-keys.md), including
+inspection of keys after organization access is lost. They do not accept the
+organization `deniedContent` slot.
+
+`OrganizationAccessClient` from `@/_pages/organization-access` retains its explicit
+props: `admission`, `input`, `explicitList`, `contextHref`, `pageHref`, `listHref`,
+`loginHref`, `dashboardHref`, `onReplace` and `onReload`. A client composition may
+supply independent destinations and callbacks. Obtain safe admission through the
+public entity server DAL and keep the page-level server gate. Use
+`useRouteProgressRouter()` and `RouteProgressLink` for internal navigation.
+Optional `initialOrganizationName`/`initialCanManageTeamAccess` props may seed
+selected-page presentation only from a fresh server context read with the same
+expected admission binding. They do not authorize client commands. The reference
+mount supplies these values so tab navigation does not flash a generic heading;
+subsequent authority failures hide protected data.
+For custom login links, align the mount's `loginHref` and page-level server
+gate with the selected frontend. The bundled default uses its configured admin login.
+
+## A headless block inside CRM
+
+Keep the Next route thin and compose custom server/client UI in a `_pages` slice.
+Its server composition reads `readOrganizationBootstrap(await headers())` from
+`@/entities/organization-context/index.server`, validates the requested organization
+ID, and passes only safe admission and target to a client component. Missing
+session uses `redirectToLogin()`; infrastructure errors rethrow to the error
+boundary. Reuse existing `SessionNotFoundError`/`ContextRequestError` classification.
+
+The interactive block imports only public entity APIs and shared primitives:
+
+```tsx
+'use client'
+
+import { useLocale, useTranslations } from 'next-intl'
+import type { ProductAccessBootstrap } from '@amcore/shared'
+
+import { useOrganizationContext } from '@/entities/organization-context'
+import { ApiErrorAlert } from '@/shared/ui/api-error-alert'
+import { Button } from '@/shared/ui/button'
+import { RouteProgressLink } from '@/shared/ui/route-progress-link'
+
+export function CrmClient({ admission, id }: { admission: ProductAccessBootstrap; id: string }) {
+  const locale = useLocale()
+  const t = useTranslations('crmContext')
+  const context = useOrganizationContext(admission.binding, { kind: 'selected', id, locale })
+  const company =
+    context.data && 'organization' in context.data.data ? context.data.data.organization : undefined
+  return (
+    <main className="mx-auto max-w-3xl space-y-6 p-6">
+      <h1 className="text-2xl font-semibold">{t('title')}</h1>
+      <section
+        className="space-y-4 rounded-lg border border-border bg-card p-4 text-card-foreground"
+        aria-busy={context.state.status === 'pending'}
+      >
+        <h2 className="font-semibold">{t('heading')}</h2>
+        <p role="status">{t(context.state.status)}</p>
+        {company && (
+          <dl>
+            <dt>{t('company')}</dt>
+            <dd>{company.name}</dd>
+            <dt>{t('account')}</dt>
+            <dd>{admission.actor.email}</dd>
+          </dl>
+        )}
+        {context.state.status === 'error' && <ApiErrorAlert error={context.state.error} />}
+        <Button
+          disabled={
+            ['pending', 'missing', 'changed'].includes(context.state.status) ||
+            Boolean(context.state.retryAt)
+          }
+          onClick={() => void context.refresh().catch(() => undefined)}
+        >
+          {t('refresh')}
+        </Button>
+        {context.state.status === 'missing' && (
+          <RouteProgressLink href="/login" prefetch={false}>
+            {t('login')}
+          </RouteProgressLink>
+        )}
+        {context.state.status === 'changed' && (
+          <Button onClick={() => window.location.reload()}>{t('reload')}</Button>
+        )}
+        <RouteProgressLink href="/" prefetch={false}>
+          {t('home')}
+        </RouteProgressLink>
+      </section>
+    </main>
+  )
+}
+```
+
+Add every `crmContext` key to each supported catalogue, including all lifecycle
+statuses. Compose Refresh, missing-session sign-in and changed-session Reload in
+your own presentation using shared Button/RouteProgressLink. Render structured
+errors with ApiErrorAlert; disable recovery controls where the current status
+requires it. Refresh remains available after a transport error or denied authority
+once Retry-After expires; missing and changed sessions use Sign in and Reload
+instead. The hook exposes data only for a ready, current consumer. One parent
+owns context and passes its result to multiple blocks; do not duplicate request
+lifecycle, call bootstrap manually in effects or refetch a disabled Query observer.
+
+A CRM route may use `?organization=<id>` and its own navigation, with a compact
+status card or definition list instead of the ready overview. It imports no ready
+organization feature, widget, page, mount, AppShell or Console. The typed browser
+namespace remains `/api/product-access`; page placement never changes it.
+
+For a downstream CRM list, load rows and their server-evaluated record/field hints
+in one response. Omit unreadable rows. An authorized row can enable Delete;
+for a readable row where deletion is denied, keep the action disabled and give a
+visible reason associated with it, plus a keyboard-reachable explanation:
+
+```tsx
+<div>
+  <button type="button" disabled aria-describedby={`delete-reason-${row.id}`}>
+    {t('delete')}
+  </button>
+  <span id={`delete-reason-${row.id}`} role="note" tabIndex={0}>
+    {t('deleteDenied')}
+  </span>
+</div>
+```
+
+Use `deleteDenied` = “You can't delete this record.” / “Вы не можете удалить
+эту запись.” in the CRM's EN/RU catalogues. Hide stale row controls while
+authority refreshes; on a 403, explain and refresh authority without replaying
+the delete. The server must check the operation again. This is an integration
+example, not a delivered CRM screen. See the
+[capability guide](../auth/capability-catalogue.md) for `recordRequired` and
+field decisions.
+
+## Custom invitation forms
+
+Keep invitation state and presentation separate. The public browser transport in
+`@/entities/invitation-flow` sends strict flow bindings, validates safe responses,
+and exposes receipt recovery independently of an expired invitation flow.
+`createInvitationAcceptJournal` stores only the operation ID and inspected
+invitation ID/generation in tab storage. It stores no password, token, cookie,
+continuation credential or permission to join. If storage is disabled, retain
+the descriptor in memory and explain that reload recovery is limited.
+
+The ready `RecipientAuth`, `RecipientStatus`, `RecipientFrame` and
+`RecipientSkeleton` components from `@/_pages/invitation-recipient` are optional
+presentation. `InvitationConsent` from `@/features/invitation-acceptance` renders
+the complete inspected role set, expiry and explicit actions. A downstream may
+replace these components with its own fields, cards or layout while retaining
+the transport and continuation protocol.
+
+Existing `LoginForm` and `RegisterForm` accept a cohesive
+`CredentialFormAdapter` from `@/shared/lib/credential-form-adapter`. Application
+composition supplies `submit`, `isCurrent` and `onSuccess`; invited registration
+also supplies `fixedEmail`. Use `createInvitationCredentialAdapters` from
+`@/_app/invitation-flow/index.client` to compose the ready forms. It authenticates
+once, reports the safe pending handoff, sends a separate acknowledgment, and
+resolves only after confirmation. The registration request derives its email
+from the server-held invitation, regardless of client form contents.
+
+Keep one continuation owner for the screen. Its callbacks show progress,
+refresh safe state after failure, and retire stale results on account or flow
+changes. Recreate forms/adapters when the authoritative flow revision changes;
+do not resend an authentication request whose outcome is unknown. Recover the
+same handoff acknowledgment instead. Authentication, verification and screen
+mounting never accept organization membership. Joining requires a separate
+explicit action with the inspected intent and a stable operation ID.
+
+## Validate your composition
+
+Check menu links from dashboard and organization frame, direct list/id entry,
+single-organization auto-open, explicit-list return and page two. Check a no-cookie
+visit, mounted session loss, a nonmember/removed organization and a replaced login.
+A changed login must hide old content and offer explicit recovery before new
+identity authority is shown. Check locales, keyboard/focus, mobile navigation,
+themes and error boundaries. Use the [managed stands](../operations/local-stands.md)
+for real sessions and membership proof. Type/lint alone do not prove these flows.
+
+## Custom member editor
+
+Use the public `useOrganizationMembers(context.controller, {page, search})` and
+`useMemberRoleAssignments(context.controller, {userId, page, search, section})`
+hooks with that same parent owner. Keep a complete assigned-set snapshot and
+its membership/ACL revision separate from paginated choices and your dirty draft.
+Call `save({expectedMemberId, expectedAclVersion, roleIds})`; inspect `committed`,
+`rejected`, `unknown`, `busy` and `retired` outcomes. A committed result includes
+follow-up status. Never turn a failed follow-up into a claimed write rollback.
+
+The account menu and avatar editor have the same kind of fixture:
+`scripts/fixtures/account-avatar-headless.mjs` (see the
+[account menu guide](account-menu-and-profile.md#executed-custom-ui-example)).
+
+The executable `scripts/fixtures/organization-members-headless.mjs` includes an inline member-key panel using the same controller and explicit revoke confirmation. It creates a
+separate disposable consumer with a list and inline editor instead of the ready
+table/dialog. By default it preserves the source's selected project choices.
+Run it after identity initialization. It prints the managed real-stack browser
+command; no standalone sample product route is added to the starter. See the
+[members contract](organization-members.md) for permissions, complete-set/byte
+limits, truthful self-edit warnings and safe recovery.
+
+## Custom role manager
+
+Use `useRoleDefinitions`, `useRoleDefinition`, `useCreateRoleDefinition` and
+`useCapabilityCatalogue` from the public entity API with the same parent
+`context.controller`. Seed your draft from the role's `managedPresets`, keep the snapshot's
+`aclVersion` with it, show `advancedRules` read-only and send the complete preset selection on
+save. Handle the `committed`, `rejected`, `unknown`, `busy` and `retired` outcomes, enable
+controls from `ready` and gate writes on `available`. Details, the command contracts and the
+executable fixture are in the [role definitions guide](role-definitions.md#browser-and-headless-transport).
+The ready Roles tab is built on these same hooks; see [Ready role screens](role-definitions.md#ready-role-screens).
+
+## Custom invitation manager
+
+Run `node scripts/fixtures/organization-invitations-headless.mjs` to prepare a
+disposable consumer with a persistent inline form beside an invitation list.
+It imports the public organization-context hooks, without the ready invitation
+page, widget or form. The printed managed command exercises create, repeat and
+revoke through the real BFF, the concrete default role, primary/secondary read
+faults, committed-write/failed-refresh recovery, session retirement and accessibility.
+The fixture distinguishes `list.ready` (authority) from `list.available` (the
+current primary read succeeded). Gate writes and cached row presentation with
+`available`; pending/error is not authorization to act on old data. Keep secondary
+role choices independent of revoke. The role-choices hook registers a secondary
+refresh: its failure remains in the local role error and does not fail an
+otherwise successful primary write followup. Display committed success separately from
+followup failure and offer `operation.controller.review()` to refresh current state
+without sending the original command again. Unknown results use `recover()`.
+Install dependencies and run the printed browser command in that separate copy;
+preparing it alone does not verify the example.
+
+This small fixture demonstrates composition, not a complete replacement manager.
+For your product, add your own search/paging, complete-set draft review and
+confirmation UI while retaining the headless operation's identity, generation
+and recovery semantics. See [invitation reuse](invitations.md#reuse-with-your-own-design).
+
+## Fixed internal organization for a shop
+
+Use a server-owned immutable organization ID returned by trusted initial setup
+or operator create-and-invite. After the invited employee accepts, the same fixed
+organization recipe applies.
+The product can keep buyer registration enabled and self-service company creation
+disabled. Buyers remain personal accounts without staff membership.
+
+A custom server mount reads safe admission through `readOrganizationBootstrap`,
+then calls `readOrganizationContext(configuredId, {headers,expectedSession})`.
+Require current membership and `canManageTeamAccess` before rendering team tools.
+Redirect missing sessions through `redirectToLogin`; conceal denied/missing targets
+with `notFound`; let infrastructure errors reach the error boundary.
+Never infer the target from the first membership or accept it from buyer input.
+
+Compose the public member/role hooks in a custom page without the organization
+frame, selector, company heading or all-organizations links. The API still checks
+current membership and authority for every team operation. Hiding company UI does
+not remove the organization model or grant employee access to customers.
+
+The executable example creates a separate sanitized source fixture:
+
+```sh
+node scripts/fixtures/organization-shop-headless.mjs
+```
+
+The generator preserves the source's project choices; `/shop-team` is prefixed with
+each locale of the source.
+The shop example independently composes the public organization-context hooks into
+a crew directory, personnel dossier and separate role, key and membership sections.
+Local CSS and product-owned semantic tokens define its appearance. See the
+[adoption guide](adoption.md) for initialization, safe local data and
+[your own appearance](adoption.md#your-own-appearance). It uses the generic backend
+organization API and the compiled setup command.
+Its `organization-shop` test fixture enables buyer registration and disables
+self-service organization creation; it proves that a signed-in buyer cannot create a company.
+The shop browser fixture checks backend authentication, staff role editing,
+and server denial for buyers and removed staff. The dedicated initial-setup
+fixture proves the compiled command and actual mailbox confirmation without Console.
+
+The helper prints the exact install and managed E2E commands. Its server-only
+`SHOP_ORGANIZATION_ID` is a deliberately fixed test identity. In your product,
+replace it with the ID recorded during your installation. Its tests show an ADMIN
+using the headless member editor, a buyer denied by the server, and removed staff
+losing access with their existing login. No turnkey shop or new initializer mode
+is supplied. See [establishment](organization-establishment.md) for initial setup
+prerequisites, account proof, retention and recovery.
+
+## Organizations created by an operator
+
+[Provisioning](organization-provisioning.md) adds protected backend operations and optional Console UI. Console-disabled forks retain that API and the product recipient journey. A custom frontend implements the existing invitation APIs. A fixed shop stores the resulting immutable organization ID server-side and still checks current employee membership; buyer registration never grants staff rights.
+
+## Member-key integration
+
+Use the [member-key guide](member-api-keys.md#custom-presentation-without-ready-ui)
+for `useMemberApiKeys`, named server operations and explicit unknown-result
+handling. Pass the existing organization controller. Do not add a context provider
+inside a dialog or couple product controls to Operations Console.
+
+### Member removal in a custom layout
+
+Use the [public removal hook and server operation](organization-members.md#custom-removal-presentation)
+with the existing organization controller. Keep the result owner mounted after its row disappears or authority becomes denied.
+Physical routes, navigation and messages remain application-owned; no Console dependency or new placement mode is introduced.
+
+## Own-key integration
+
+See [own-key custom presentation](own-api-keys.md#custom-presentation) for actor-bound
+entity hooks and the independent settings mount. These operations require no
+organization controller; inventory/revocation survives membership loss. Keep one
+transient page host per binding, with no credential persistence or MutationCache.
+The optional placement `ownApiKeysPath` controls the personal navigation entry.
+Omit that property from your custom placement to hide the entry. This does not
+remove the ready route or revoke API access. Remove the unwanted product-owned
+page separately; retain the shared BFF and member-key consumers you still use.
+Own-key entity, feature and widget roots belong to the product surface, independently
+of Console. Shared catalogue metadata, BFF primitives, translations and route wiring
+retain their explicit consumers when omitting a ready screen.

@@ -1,0 +1,307 @@
+import { ArgumentsHost, HttpException, HttpStatus } from '@nestjs/common'
+import { HttpAdapterHost } from '@nestjs/core'
+import { PinoLogger } from 'nestjs-pino'
+
+import { AllExceptionsFilter } from './all-exceptions.filter'
+
+describe('AllExceptionsFilter', () => {
+  let filter: AllExceptionsFilter
+  let mockLogger: jest.Mocked<PinoLogger>
+  let mockCls: any
+  let mockHttpAdapter: any
+  let mockResponse: any
+  let mockRequest: any
+  let mockHost: jest.Mocked<ArgumentsHost>
+  let mockHttpAdapterHost: jest.Mocked<HttpAdapterHost>
+
+  beforeEach(() => {
+    mockLogger = {
+      setContext: jest.fn(),
+      error: jest.fn(),
+      warn: jest.fn(),
+    } as any
+
+    mockCls = {
+      getId: jest.fn().mockReturnValue('test-correlation-id'),
+      get: jest.fn(),
+    }
+
+    mockHttpAdapter = {
+      reply: jest.fn(),
+      setHeader: jest.fn(),
+    }
+
+    mockResponse = {}
+    mockRequest = {
+      url: '/api/test',
+      method: 'POST',
+      headers: { 'user-agent': 'jest' },
+    }
+
+    mockHost = {
+      switchToHttp: jest.fn().mockReturnValue({
+        getResponse: () => mockResponse,
+        getRequest: () => mockRequest,
+      }),
+    } as any
+
+    mockHttpAdapterHost = {
+      httpAdapter: mockHttpAdapter,
+    } as any
+
+    filter = new AllExceptionsFilter(mockHttpAdapterHost, mockLogger, mockCls)
+  })
+
+  it('should handle HttpException', () => {
+    const exception = new HttpException('Not found', HttpStatus.NOT_FOUND)
+
+    filter.catch(exception, mockHost)
+
+    expect(mockHttpAdapter.reply).toHaveBeenCalledWith(
+      mockResponse,
+      expect.objectContaining({
+        statusCode: 404,
+        message: 'Not found',
+        timestamp: expect.any(String),
+        path: '/api/test',
+        method: 'POST',
+      }),
+      404
+    )
+  })
+
+  it('should handle standard Error as 500', () => {
+    const exception = new Error('Unexpected error')
+
+    filter.catch(exception, mockHost)
+
+    expect(mockHttpAdapter.reply).toHaveBeenCalledWith(
+      mockResponse,
+      expect.objectContaining({
+        statusCode: 500,
+        message: 'Unexpected error',
+        errorCode: 'INTERNAL_SERVER_ERROR',
+      }),
+      500
+    )
+  })
+
+  it('should handle unknown exceptions as 500', () => {
+    const exception = { weird: 'object' }
+
+    filter.catch(exception, mockHost)
+
+    expect(mockHttpAdapter.reply).toHaveBeenCalledWith(
+      mockResponse,
+      expect.objectContaining({
+        statusCode: 500,
+        message: 'Internal server error',
+        errorCode: 'INTERNAL_SERVER_ERROR',
+      }),
+      500
+    )
+  })
+
+  it('should handle string exceptions', () => {
+    const exception = 'Something went wrong'
+
+    filter.catch(exception, mockHost)
+
+    expect(mockHttpAdapter.reply).toHaveBeenCalledWith(
+      mockResponse,
+      expect.objectContaining({
+        statusCode: 500,
+        message: 'Something went wrong',
+      }),
+      500
+    )
+  })
+
+  it('should extract errorCode from HttpException', () => {
+    const exception = new HttpException(
+      { message: 'Conflict', errorCode: 'DUPLICATE_ENTRY' },
+      HttpStatus.CONFLICT
+    )
+
+    filter.catch(exception, mockHost)
+
+    expect(mockHttpAdapter.reply).toHaveBeenCalledWith(
+      mockResponse,
+      expect.objectContaining({
+        errorCode: 'DUPLICATE_ENTRY',
+      }),
+      409
+    )
+  })
+
+  it('should log server errors (5xx)', () => {
+    const exception = new Error('Database connection failed')
+
+    filter.catch(exception, mockHost)
+
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      expect.objectContaining({
+        err: exception,
+        req: expect.objectContaining({
+          method: 'POST',
+          url: '/api/test',
+        }),
+      }),
+      expect.stringContaining('Unhandled exception')
+    )
+  })
+
+  it('sanitizes sensitive headers in 5xx logs at the source', () => {
+    mockRequest.headers = {
+      'user-agent': 'jest',
+      authorization: 'Bearer leaked-token',
+      cookie: 'refresh_token=leaked',
+      'x-api-key': 'leaked-key',
+    }
+
+    filter.catch(new Error('boom'), mockHost)
+
+    expect(mockLogger.error).toHaveBeenCalled()
+    const logArg = mockLogger.error.mock.calls[0]?.[0] as {
+      req: { headers: Record<string, string> }
+    }
+    expect(logArg.req.headers).toEqual({
+      'user-agent': 'jest',
+      authorization: '[REDACTED]',
+      cookie: '[REDACTED]',
+      'x-api-key': '[REDACTED]',
+    })
+  })
+
+  it('should log client errors (4xx) as warnings', () => {
+    const exception = new HttpException('Bad request', HttpStatus.BAD_REQUEST)
+
+    filter.catch(exception, mockHost)
+
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        statusCode: 400,
+        path: '/api/test',
+      }),
+      expect.stringContaining('Client error')
+    )
+  })
+
+  it.each([400, 500])('redacts audit query values in %i error paths', (status) => {
+    mockRequest.url = '/api/v1/admin/audit-logs?organizationId=secret-org&cursor=secret-cursor'
+    const error = status === 400 ? new HttpException('Invalid cursor', 400) : new Error('Failure')
+
+    filter.catch(error, mockHost)
+
+    const response = mockHttpAdapter.reply.mock.calls[0][1] as { path: string }
+    const context = (status === 400 ? mockLogger.warn : mockLogger.error).mock.calls[0]?.[0] as {
+      path?: string
+      req?: { url: string }
+    }
+    for (const path of [response.path, context.path ?? context.req?.url ?? '']) {
+      expect(path).not.toContain('secret-org')
+      expect(path).not.toContain('secret-cursor')
+      expect(new URL(path, 'http://test.invalid').searchParams.get('cursor')).toBe('[REDACTED]')
+    }
+  })
+
+  it('should include stack trace in development', () => {
+    const originalEnv = process.env.NODE_ENV
+    process.env.NODE_ENV = 'development'
+
+    const exception = new Error('Test error')
+
+    filter.catch(exception, mockHost)
+
+    const replyCall = mockHttpAdapter.reply.mock.calls[0][1]
+    expect(replyCall).toHaveProperty('stack')
+    expect(typeof replyCall.stack).toBe('string')
+
+    process.env.NODE_ENV = originalEnv
+  })
+
+  it('should not include stack trace in production', () => {
+    const originalEnv = process.env.NODE_ENV
+    process.env.NODE_ENV = 'production'
+
+    const exception = new Error('Test error')
+
+    filter.catch(exception, mockHost)
+
+    const replyCall = mockHttpAdapter.reply.mock.calls[0][1]
+    expect(replyCall).not.toHaveProperty('stack')
+
+    process.env.NODE_ENV = originalEnv
+  })
+
+  it.each([{ type: 'entity.too.large' }, { code: 'FST_ERR_CTP_BODY_TOO_LARGE' }])(
+    'maps parser overflow %j to 413 PAYLOAD_TOO_LARGE',
+    (discriminator) => {
+      // Shape of the error body-parser raises when a body exceeds the limit.
+      const exception = Object.assign(new Error('request entity too large'), {
+        ...discriminator,
+        status: 413,
+        statusCode: 413,
+        expose: true,
+      })
+
+      filter.catch(exception, mockHost)
+
+      expect(mockHttpAdapter.reply).toHaveBeenCalledWith(
+        mockResponse,
+        expect.objectContaining({
+          statusCode: 413,
+          errorCode: 'PAYLOAD_TOO_LARGE',
+        }),
+        413
+      )
+      // A client error (4xx), so it is logged as a warning, never a 5xx error.
+      expect(mockLogger.warn).toHaveBeenCalled()
+      expect(mockLogger.error).not.toHaveBeenCalled()
+    }
+  )
+
+  it('should handle validation error arrays', () => {
+    const exception = new HttpException(
+      { message: ['email is required', 'password too short'] },
+      HttpStatus.BAD_REQUEST
+    )
+
+    filter.catch(exception, mockHost)
+
+    expect(mockHttpAdapter.reply).toHaveBeenCalledWith(
+      mockResponse,
+      expect.objectContaining({
+        message: 'email is required, password too short',
+      }),
+      400
+    )
+  })
+  it.each([
+    Object.assign(new Error('storage failure'), { statusCode: 400 }),
+    Object.assign(new RangeError('internal bound'), { status: 400 }),
+    { type: 'entity.parse.failed', status: 400 },
+    Object.assign(new Error('wrong pair'), { type: 'charset.unsupported', status: 400 }),
+  ])('retains500 for non-parser or mismatched errors', (error) => {
+    filter.catch(error, mockHost)
+    expect(mockHttpAdapter.reply).toHaveBeenCalledWith(
+      mockResponse,
+      expect.objectContaining({ statusCode: 500, errorCode: 'INTERNAL_SERVER_ERROR' }),
+      500
+    )
+  })
+  it.each([
+    ['entity.parse.failed', 400],
+    ['querystring.parse.rangeError', 400],
+    ['charset.unsupported', 415],
+    ['encoding.unsupported', 415],
+  ])('maps named parser pair %s/%s safely', (type, status) => {
+    filter.catch(Object.assign(new Error('secret parser body'), { type, status }), mockHost)
+    expect(mockHttpAdapter.reply).toHaveBeenCalledWith(
+      mockResponse,
+      expect.objectContaining({ statusCode: status }),
+      status
+    )
+    expect(mockHttpAdapter.reply.mock.calls[0][1].message).not.toContain('secret parser body')
+  })
+})

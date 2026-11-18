@@ -1,0 +1,610 @@
+# Backend Architecture & Conventions
+
+How to add a backend module to AMCore **the same way the existing ones are built**.
+
+This guide is about _decisions and wiring_ — the sequence across Prisma, shared
+contracts, NestJS modules, authorization, process roles, and tests. It deliberately
+does **not** re-explain features that already have a home; it links them. If you want
+to _use_ a built-in capability, start from [the feature docs](#see-also) instead.
+
+For the high-level module tree, tech stack, and runtime layers, read
+[`apps/api/README.md`](../../apps/api/README.md) first.
+
+## HTTP runtime
+
+The API uses one Fastify production adapter. Use the shared bootstrap in tests
+and native plugins for extensions; do not rely on Express response methods.
+See [HTTP runtime](http-runtime.md) and [request bodies](request-body-contract.md)
+for uploads, cookies, raw streams, error policies and upgrade checks.
+
+## Module boundaries
+
+AMCore is a **modular monolith**. The rules that keep it modular:
+
+- **A schema per bounded area.** `core` is the shared system foundation — auth,
+  organizations, api-keys, and admin cooperate closely and may read each other's
+  tables. Each distinct product or reusable capability gets its own schema
+  (for example, `notifications`, `ai`, or a downstream app's domain schema).
+  Every Prisma model is tagged `@@schema("<area>")`.
+- **Product areas don't reach into another area's tables.** Cross-area access goes
+  through an exported NestJS **service**, never a direct Prisma read of another
+  area's tables. (Within the shared `core` foundation, modules may read each other.)
+- **Contracts are shared, language-agnostic Zod.** Anything crossing the api/web
+  boundary or representing an API request/response lives in
+  [`packages/shared`](../../packages/shared/src) — a single source of truth, no
+  hardcoded messages ([`AGENTS.md` → Code conventions](../../AGENTS.md)).
+- **Redis is shared infrastructure, not an event bus.** It backs caches, locks, rate
+  limits, idempotency, OAuth state, and BullMQ — it is not a mandatory module
+  message bus.
+- **Redis access: one purpose-built operation per need; there is no generic cache
+  layer.** The API has no `CacheModule`. Inject `REDIS_CLIENT` and use the command that
+  fits the job: `SET … NX PX` for a claim, a token-checked lock
+  ([`redis-lock.service.ts`](../../apps/api/src/infrastructure/redis/redis-lock.service.ts)),
+  or an `eval` script that receives every key it touches in `KEYS`. A hot-read cache
+  follows [`permissions-cache.service.ts`](../../apps/api/src/core/auth/permissions-cache.service.ts).
+  - **Authentication-path Redis use goes through `AuthRedis`**, not `REDIS_CLIENT`: a
+    supervised client that is replaced when it stops answering. Call `authRedis.call(...)`
+    so an outage becomes the typed `503 SERVICE_UNAVAILABLE` and programming errors stay
+    `500`; cap each call with `nestedDeadlineMs(...)` so it respects the admission
+    deadline. See [authentication when Redis is slow or unavailable](../auth/redis-outage.md).
+  - **Failure counters over an address key and a credential key** use
+    [`AbuseCounterStore`](../../apps/api/src/infrastructure/redis/abuse-counter.store.ts):
+    plain integers under `rate:v2:…`, one atomic script per update that validates both
+    keys before writing, and an error — never zero — for any other value. It needs one
+    Redis server and does not reserve admission.
+  - **A request-path call that must not wait forever** goes through
+    [`BoundedRedis`](../../apps/api/src/infrastructure/redis/bounded-redis.ts). It gives
+    the caller a typed error at a deadline, aborts a command that is still queued and
+    never retries. It reserves a slot before dispatch (a fixed capacity per process) and
+    refuses new calls at once when all slots are held. A slot is released only when the
+    call settles, so a command already sent can still run after its caller gave up, and a
+    connection that stalls without closing holds its slots until replies resume or the
+    connection errors or closes; no finite recovery time is promised. It does not bound
+    other users of the shared client. Tests use the
+    `redis-transport-stall` fixture
+    ([`apps/api/test/fixtures`](../../apps/api/test/fixtures/redis-transport-stall.ts))
+    to hold replies from a real server.
+  - **The shared client has one fixed contract.** The API
+    ([`redis-client-options.ts`](../../apps/api/src/infrastructure/redis/redis-client-options.ts))
+    and the web BFF
+    ([`redis-client-options.ts`](../../apps/web/src/shared/api/bff/redis-client-options.ts))
+    each build their `@redis/client` 6 client from one options function. RESP 2 is explicit,
+    so the client never sends `HELLO` or enables maintenance notifications. An ordinary
+    command waits at most 5000 ms to be written; this covers reconnect backoff and write
+    backpressure. A local limit on a call overrides it and may be shorter or longer;
+    existing bounded consumers keep their own shorter limits. The first keepalive probe
+    goes out after 5000 ms of idle; this is not a failure-detection guarantee. There is deliberately no `socketTimeout`, because it would
+    disconnect idle subscriber connections. Do not create a client with bare `createClient`
+    for code that production injects; tests use `appClientOptions()` (a convention, not a lint rule).
+  - **What the 5000 ms limit does not bound:** connecting, a command already written (if
+    its reply is lost, its effect can be unknown), a `MULTI` or pipeline batch (the user cache uses `MULTI` for
+    tags and invalidation, and it waits in a reconnect backoff without a limit), the whole
+    HTTP request, or the total number of queued commands. A Redis error in the user or
+    permissions cache is not caught: it reaches the caller and the global filter answers
+    `500`. Only lock contention falls back to the database.
+
+`core/` holds domain modules (auth, organizations, api-keys, admin).
+`infrastructure/` holds cross-cutting providers (email, queue, storage, redis,
+webhooks, idempotency, schedule, observability). Put a new product module under
+`core/` (or its own top-level area); put a reusable technical capability under
+`infrastructure/`.
+
+### Do I need CQRS?
+
+**No — not as a default.** AMCore does **not** use a global command/query bus
+(`@nestjs/cqrs`), and adopting one is not required to build a module "the right
+way". The default shape is `Controller → Service → Prisma`. You already get the
+healthy part of the split for free: keep methods side-effect-honest (a method
+changes state _or_ returns data) and decompose a module into focused,
+single-responsibility services rather than one god-service.
+
+_Local_ command/query separation — distinct read vs. write services, or a
+purpose-built read model — is fine **where read/write complexity actually
+justifies it** (e.g. reporting, audit-log search, a support inbox). That is a
+per-context judgement, not a mandate, and it needs no framework. Reach for a full
+CQRS bus only in a bounded context with a large, measured read/write asymmetry
+that must scale independently, or an event-sourcing requirement — decide that for
+that context alone, never globally.
+
+The [runtime settings foundation](settings.md) covers code-owned ordinary
+platform settings, typed definitions, CAS/audit and local runtime reconciliation.
+It remains available independently of the optional Console frontend.
+
+## Decide the state model first
+
+Before writing code, classify where each piece of your module's state lives — this
+drives almost every later choice:
+
+| Kind              | Lives in           | Use for                                                       |
+| ----------------- | ------------------ | ------------------------------------------------------------- |
+| **Authoritative** | Postgres (Prisma)  | the source of truth; anything you must not lose               |
+| **Cached**        | Redis              | a measured hot read of authoritative data (opt-in, see below) |
+| **Queued**        | BullMQ             | deferred/async work; retried on failure                       |
+| **External**      | Storage (S3/local) | binary objects; reference them from Postgres                  |
+
+## The recipe — adding a module
+
+### 1. Persistence (Prisma)
+
+Add your models to a Prisma schema file under
+[`apps/api/prisma/`](../../apps/api/prisma) (models are split by area; the generator
+and datasource live in `schema.prisma`). Tag every model with `@@schema("<area>")`.
+**If you introduce a new schema, add it to `datasource db { schemas = [...] }` in
+`schema.prisma` first** — otherwise the migration won't create it.
+
+AMCore uses Prisma 7's source-generated client (`provider = "prisma-client"`,
+`output = "../src/generated/prisma"`). Runtime API code imports Prisma enums,
+types, and `PrismaClient` from `@/generated/prisma/client`, not from the
+deprecated `@prisma/client` generated package surface. The generated directory is
+created by `pnpm --filter api db:generate` / API `postinstall` before
+typecheck/build/test.
+
+Let Prisma diff the schema against your local dev DB; **don't hand-craft migration
+history, and never run `migrate dev` against production:**
+
+```bash
+pnpm --filter api db:migrate                                  # prisma migrate dev (LOCAL only)
+pnpm --filter api db:migrate -- --create-only --name <slug>  # emit SQL to review/edit before it applies
+```
+
+Hand-written SQL must match the constraint/index names, types, defaults and referential actions declared in Prisma.
+
+Editing the _generated_ SQL is fine and sometimes necessary (data backfills, safe
+rollouts) — use `--create-only` to review it before apply; schema migrations must originate from the Prisma diff. For a data-only policy
+upgrade with no schema delta, use explicitly reviewed versioned SQL with exact-state
+preconditions, atomic version updates and a controlled operator procedure; see
+[authorization upgrade](../auth/authorization-upgrade.md). Production applies migrations as a one-shot
+`db:migrate:prod` ([`deployment.md`](../operations/deployment.md)), never on app
+startup.
+
+### 2. Contract (shared Zod)
+
+Define request/response schemas in
+[`packages/shared/src/schemas/<module>.ts`](../../packages/shared/src/schemas) and
+export them from `schemas/index.ts`.
+
+**Keep them message-free.** A literal `message` outranks the frontend's
+per-parse error map (Zod precedence: schema-level → per-parse → global →
+locale), so it silently forces English into a localized UI. When a refinement
+needs a specific meaning, attach a code instead:
+
+```ts
+ctx.addIssue({
+  code: 'custom',
+  params: { errorCode: ApiKeyScopeErrorCode.API_KEY_SCOPE_UNKNOWN_ACTION },
+})
+```
+
+The frontend translates that code through the same catalogue it uses for API
+errors — see
+[`docs/frontend/i18n-and-errors.md`](../frontend/i18n-and-errors.md). Raw API
+consumers branch on `errorCode`; `errors[].message` is diagnostic only.
+
+**Test the schema's own validation boundary beside it**, in
+`packages/shared/src/schemas/<module>.test.ts` (Vitest) — accepted/rejected
+inputs, defaults, and any custom `errorCode`. It runs standalone against the
+schema's source, with no NestJS/DTO/HTTP setup, and the same module both the
+api DTO and any frontend form import validates identically. Don't duplicate
+this coverage as an `apps/api` Jest spec.
+
+Rebuild shared so the api/web can import it:
+
+```bash
+pnpm --filter @amcore/shared build
+```
+
+The [shared build contract](shared-package-build.md) describes dual outputs,
+watch mode and checks against the built package.
+
+### 3. Implement: DTO → service (+ mapper) → controller → module
+
+- **DTO** — wrap each schema with `createSchemaDto()` to retain handler types. Declare the schema in Nest12 parameter metadata;
+  the native global pipe validates it, and Swagger reads the same metadata:
+
+  ```ts
+  // dto/thing-response.dto.ts
+  export class ThingResponseDto extends createSchemaDto(thingResponseSchema) {}
+  ```
+
+- **Service** — own the Prisma access and **map raw Prisma rows to the shared
+  response type**. Do not return Prisma entities from a handler; return a value typed
+  to the shared contract (pattern: `api-keys.service.ts` → `findAllForUser` maps
+  `keys.map((k) => ({ ... }))` into `ApiKeyListResponse`).
+
+- **Controller** — declare the accepted auth types, matching Swagger auth metadata,
+  and a **typed success response** on every public handler:
+
+  ```ts
+  @ApiTags('things')
+  @ApiBearerAuth()
+  @Auth(AuthType.Bearer)
+  @Controller('things')
+  export class ThingsController {
+    @ApiOperation({ summary: 'Create a thing' })
+    @Post()
+    @SchemaResponse({ type: ThingResponseDto, status: 201, description: 'Thing created' })
+    create(
+      @CurrentUser() user: RequestPrincipal,
+      @Body({ schema: CreateThingDto.schema }) dto: CreateThingDto
+    ) {
+      return this.thingsService.create(user.sub, dto)
+    }
+  }
+  ```
+
+  Typed responses are **enforced** — see [Tests](#tests).
+  See [request and response schemas](schema-validation.md) for native metadata,
+  transformations, safe failures and OpenAPI input/output components.
+
+- **Module** — compose controller + service into a NestJS module; export any service
+  other modules are allowed to call.
+
+Request parsing and transport refusals follow the [request body contract](request-body-contract.md).
+
+### 4. Authentication & authorization
+
+Every handler under `core/**` must **explicitly** declare its accepted auth types
+with `@Auth(...)` — a guardrail test fails otherwise. Bearer (an interactive user
+session) is the default credential; allow API keys only on handlers that should
+accept them, and never for credential management or other high-risk operations. For
+role/permission checks and adding your own CASL subjects, follow
+[`docs/auth/rbac.md`](../auth/rbac.md) — don't reinvent it.
+If the action should be authorable in a future role editor, also register its
+implemented route, presets and record/field evaluator through the
+[capability catalogue](../auth/capability-catalogue.md). That metadata does not
+grant access or replace route authorization. The disposable PostgreSQL
+extension fixture runs through `pnpm test:capability-extension` on the starter only.
+Products receive a warning and must test their own modules against PostgreSQL;
+see the capability catalogue's product test requirements.
+When AMCore itself adds a built-in capability, also add its ID to `BUILT_IN_CAPABILITY_IDS`
+in `apps/api/src/core/organizations/member-access/access.testkit.ts`. That list fails when a
+built-in disappears, but not when one is added, so a missed entry silently leaves the new
+capability out of the starter access truth tables.
+
+Organization handlers additionally opt into the scoped
+[context boundary and own-method policy](../auth/organization-context.md#authorization-freshness-and-extension).
+Resolve the target after credential/current-privilege admission and before the
+single ability build. Keep business record/field/tenant checks in the domain;
+context metadata does not replace them. Other public/personal handlers do not
+need a global context registration.
+
+If a handler accepts API keys, add it to the ADR-034 allowlist
+(`apps/api/src/core/auth/decorators/adr-034-api-key-allowlist.ts`) and document
+the operation with `@ApiSecurity('apiKeyBearer')` at the **handler level**. Do
+not put `apiKeyBearer` on the controller class: `@nestjs/swagger` concatenates
+class and method security metadata, so class-level API-key metadata leaks onto
+bearer-only handler overrides. The OpenAPI e2e test checks this allowlist in
+both directions. Add `@ApiProtectionUnavailable('API key')` to each eligible
+handler to document the 503 response when API-key failure counters cannot be checked.
+
+### 5. Register in the correct process role
+
+The same image runs as `web`, `worker`, or `all`. Composition lives in
+[`apps/api/src/app-imports.ts`](../../apps/api/src/app-imports.ts). Put each piece in
+the **right** list — a misplaced processor runs in the wrong process:
+
+- **Business HTTP module** (controllers) → `webImports`.
+- **`@Processor` / `@Cron`** → a **worker-only** module → `workerImports`. A periodic
+  job is declared once in the scheduled-jobs catalogue and uses `@ScheduledJob`, never a
+  raw `@Cron` or `@Interval` (a test fails otherwise): see
+  [Scheduled jobs](scheduled-jobs.md). NestJS
+  starts a `Worker` for _any_ `@Processor` in the graph, so a processor that leaks
+  into `web` via a transitive import will also run there. Keep the producer (the
+  service that _enqueues_) separate from the consumer (the processor). Email is the
+  reference: `EmailModule` (producer, everywhere) vs `EmailWorkerModule` (processor,
+  worker only).
+- **Genuinely shared infrastructure / producers** → `coreImports`.
+- **Outside service status:** register a reader once in the integrations composition list
+  to expose stored state through the backend status API. See [Register an integration](integrations.md).
+
+### Shared configured extension modules
+
+Notification and AI tool registrations each construct their configured core once.
+Import the static facade (`NotificationsModule` or `AiToolContractsModule`) from
+consumers; worker factories and optional channel web factories receive that same
+core identity. Register recipient readers and domain authority dependencies in the
+core graph, transport clients and effect executors only in worker modules. A web
+process can normalize, persist and authorize intent without gaining execution
+capability. A JavaScript file import alone does not prove a Nest provider exists
+in that role; verify the compiled module graph.
+
+For transaction-aware current domain checks, use `DomainAuthorizationModule` and
+`DomainAuthorizationService` with the caller's transaction. They do not require
+JWT guards, HTTP context or a fabricated privileged principal. Mutation must lock
+rights/revision state and check permission in the same transaction as the effect;
+preparation or approval is not a substitute. See [channel composition](../notifications/channels.md)
+and [tool registration and approvals](../ai/tools-and-approvals.md).
+
+## Adding an environment variable
+
+Env is validated once at boot by a Zod schema. It is split into domain sections
+under [`apps/api/src/env/schema/`](../../apps/api/src/env/schema) (one `*.env.ts`
+per area), composed flat in `base.ts`, with cross-field logic in `refinements/`.
+`apps/api/src/env.ts` is a re-export shim, so consumers keep importing from `@/env`.
+Nest Config reads only validated values (`skipProcessEnv: true`). This preserves
+schema normalization: an optional empty value stays absent instead of falling back
+to its raw environment string. Environment variables are still loaded and validated
+at boot.
+
+1. **Declare it** in the matching section (e.g. `storage.env.ts`) as a Zod field:
+   - a safe fallback → `.default(...)` (the app runs without the operator setting it);
+   - an optional feature credential → `optionalEnvString()` / `optionalEnvUrl()`;
+   - genuinely required (no safe default) → no `.default()`/`.optional()` — the app
+     refuses to boot without it.
+2. **Cross-field behavior**, if any, goes in `refinements/` — a value derived from
+   other fields in `derive-defaults.ts`; a "set one → set all" group or conditional
+   requirement in `provider-rules.ts` / `resource-rules.ts`. Keep each rule small and
+   single-domain.
+3. **Document it** in the root [`.env.example`](../../.env.example), in the matching
+   section: **active** (`KEY=value`) for required/common starter keys, **commented**
+   (`# KEY=default`) for optional/advanced knobs. This is enforced —
+   [`env-example-coverage.spec.ts`](../../apps/api/src/env/schema/env-example-coverage.spec.ts)
+   **fails CI** if a schema key is undocumented, or a documented key is not a schema
+   key (explicit Compose/web keys, including the web build identity
+   `NEXT_DEPLOYMENT_ID`, and dynamic `WEBHOOK_*_SECRET` keys are allow-listed).
+   API test caching includes the root `.env.example` as an input, so changing
+   the example invalidates the cached coverage result.
+4. **Pass it to containers** that need it at runtime via `x-app-env` in
+   [`docker-compose.yml`](../../docker-compose.yml).
+5. **Read it** type-safely through `EnvService.get('KEY')` — never `process.env`
+   directly (the only exceptions are the bootstrap-time flags read before
+   `ConfigModule`, documented in code where they occur).
+
+## Adding an external service / infra dependency
+
+A backing service (a third-party API client, an object store, a message broker)
+is wired as a small NestJS provider/module — same boundaries as a feature module,
+plus these seams:
+
+1. **Config, not literals.** Endpoints, credentials, and toggles come from the env
+   schema (above), read via `EnvService`. Never hardcode a host or key. Gate an
+   optional integration behind an "enabled" check so the app still boots without it.
+2. **Own a client, expose a service.** Construct the SDK/client once in a provider
+   (its lifetime tied to the module), and expose a thin service with the operations
+   your modules need — don't leak the raw client. Storage is the reference: a driver
+   interface (`s3` / `local` / `memory`) selected by config, with a stable service
+   surface.
+3. **Health.** If the app's readiness depends on it, contribute a health indicator
+   (see the storage health probe) — behind an opt-in flag when the check has a cost.
+   Don't fail liveness on a non-critical dependency.
+4. **Lifecycle.** Release sockets/handles on shutdown via `OnModuleDestroy`
+   (Nest already runs shutdown hooks — see `main.ts`), so tests don't leak handles.
+   That alone does **not** let work finish before the database goes away: Nest runs
+   every `onModuleDestroy` before `beforeApplicationShutdown`, the hooks of one
+   module run concurrently, and `PrismaService` disconnects in its own
+   `onModuleDestroy` — so nothing orders your hook before it. A process-role drain
+   that must record in-flight results first (the notification dispatcher is the
+   reference) registers a **shutdown barrier** with
+   `PrismaService.registerShutdownBarrier(fn)`. Prisma awaits all barriers at the
+   start of its teardown, so the ordering holds regardless of module distance or
+   provider order. A barrier must bound itself (the notification dispatcher closes,
+   waits at most ~15 s, then seals); Prisma caps barriers and observed-child cleanup together at 20 s
+   (`SHUTDOWN_BARRIER_MAX_MS`) only as a safety net — the cap neither cancels a
+   barrier nor makes it safe — and `$disconnect()` and `pool.end()` are always
+   attempted afterwards, even if a barrier or the disconnect fails. Registration is
+   rejected once teardown has started. AI runs also register their close/drain/seal barrier; none of this bounds Redis cleanup, other queues or the HTTP
+   server. The notification dispatcher uses its own shutdown latch
+   (`NotificationShutdownLatch.transaction`): its guarded client makes the next
+   query throw after the seal so the transaction rolls back whole. Other domains
+   implement their own bounded drain and transaction interruption mechanism;
+   registering a barrier does not require a dependency on notifications.
+5. **Process role.** Put the module in the right list (see step 5 of the module
+   recipe): a producer/shared client → `coreImports`; a consumer that only runs work
+   → a worker-only module.
+6. **Tests.** Unit-test the service against a faked client; prefer an in-process fake
+   or a `memory` driver for e2e over a network dependency. Reserve real-service e2e
+   for an env-gated, opt-in suite.
+
+## Cross-cutting decision points
+
+Apply these only when your module needs them:
+
+- **Caching — opt-in for measured hot reads, not a default.** Cache an authoritative
+  read only when it is actually hot; the cost is invalidation correctness. **Do not
+  cache** low-traffic data, anything you can't reliably invalidate, or values that
+  must always be fresh. Pattern (version-keyed cache-aside + stampede lock):
+  [`core/auth/permissions-cache.service.ts`](../../apps/api/src/core/auth/permissions-cache.service.ts).
+- **Background jobs** — use the [single registration contract](background-work.md)
+  and its typed producer/worker bindings. BullMQ owns scheduling; the declared
+  replay policy and business authority own retry safety and effect certainty.
+- **Idempotency** — for unsafe retried writes, use the HTTP idempotency primitive
+  ([`docs/operations/idempotency.md`](../operations/idempotency.md)).
+- **Auditing** — record security-relevant actions in the append-only audit log
+  ([`docs/operations/audit-log.md`](../operations/audit-log.md)).
+- **Stable domain errors** — throw the domain exceptions in `common/exceptions`; the
+  filter layers map them to a stable error contract
+  ([`apps/api/README.md` → Error Handling](../../apps/api/README.md#error-handling)).
+- **Concurrent mutation of external state (fencing).** If your feature publishes a
+  database pointer to _versioned external state_ and later sweeps superseded objects
+  (e.g. an upload-and-replace flow), a Redis lock alone is **not** a correctness
+  fence — it only serializes the common case. Keep a **monotonic generation in
+  Postgres**, publish with a **conditional update** (CAS), use versioned external
+  keys, sweep only generations strictly older than your own, and **fail closed** when
+  the lock or CAS is lost. This is the avatar pattern — read
+  [`docs/media/README.md` → Concurrency](../media/README.md#concurrency) and the code
+  ([`core/auth/avatar.service.ts`](../../apps/api/src/core/auth/avatar.service.ts),
+  [`infrastructure/redis/redis-lock.service.ts`](../../apps/api/src/infrastructure/redis/redis-lock.service.ts))
+  before designing your own. It is **not** required for every upload.
+- **Rate limiting — every route is protected for free; override through
+  `@RateLimit`/`@SkipRateLimit`.** `infrastructure/throttling/` owns the
+  entire mechanism (ADR-039/ADR-073): a GCRA (Generic Cell Rate Algorithm)
+  limiter, Redis-backed with an in-memory degrade path, its own guard —
+  there is no third-party rate-limit library at all, so there is nothing
+  to learn beyond this decorator pair.
+  - **Override a route** with `@RateLimit(policy)` — either a named policy
+    from `RATE_LIMIT_POLICIES` (`PRIVILEGED_MUTATION`, `EXPENSIVE_ACTION`)
+    or an inline `{ rate, per, burst? }` (see the Telegram webhook
+    controller for an inline example). This is a coarse per-visitor
+    volumetric backstop, not precise per-actor protection — that's what
+    dedicated limiters (`LoginRateLimiterService`, invite-accept, etc.)
+    are for.
+  - **Exempt probes** with `@SkipRateLimit()` (health/metrics only).
+    Background-work routes retain the pre-auth per-visitor backstop, including
+    its bounded held-memory fallback during Redis outages. Their authoritative
+    distributed request/read/target budgets use primary PG: command request cost
+    commits before replay or admission; PG failure refuses control. DB-owned
+    business mutation and receipt transactions do not depend on broker Redis.
+    The coarse HTTP backstop and browser session vault are separate boundaries.
+  - **Buckets are per-route-per-visitor, precisely.** One visitor calling
+    several _different_ routes doesn't share one budget — each route
+    tracks its own bucket independently, completely unaffected by that
+    visitor's traffic to any other route. One visitor calling the _same_
+    route many times rapidly shares that route's budget. This precision
+    only holds for real visitors once `TRUSTED_WEB_PEERS` +
+    `WEB_TRUSTED_CLIENT_IP_HEADER` are configured (ADR-072) — see
+    [`docs/frontend/api-consumption.md`](../frontend/api-consumption.md) →
+    "Client-IP relay to `apps/api`"; without them every BFF-proxied visitor
+    still shares one bucket.
+  - **A policy has a sustained `rate` and an instantaneous `burst`** (the
+    number of requests admitted immediately from idle, above the sustained
+    rate — defaults to `rate` when omitted). This is what makes normal
+    browsing safe by default: one real visitor's page firing several
+    parallel calls to the same route, or clicking through a filterable
+    list quickly across a few page visits, is absorbed by `burst` without
+    tripping the backstop — while a route called continuously well above
+    its sustained `rate` still gets throttled. `DEFAULT`'s `burst: 50`
+    means an idle visitor can fire up to 50 requests to one route
+    instantly and still be admitted; a fixed-window algorithm cannot
+    express this distinction at all (see "Why GCRA, not fixed-window"
+    below).
+  - **Classifying a new route** (stop at the first match):
+    1. Does it need per-actor/per-identity protection rather than a
+       per-visitor volumetric one (login, invite-accept, password reset)?
+       Use a dedicated limiter, not `@RateLimit`.
+    2. Is it fine under the global default? Add no decorator — that's the
+       common case.
+    3. Is it unusually expensive (heavy DB/CPU work) or privileged
+       (destructive/admin) but rarely called in bursts by a legitimate
+       user? Narrow it with `@RateLimit(RATE_LIMIT_POLICIES.EXPENSIVE_ACTION)`
+       or `.PRIVILEGED_MUTATION`, or an inline policy with cited evidence
+       for the chosen numbers (see the Telegram webhook controller).
+    4. Is it a public, unauthenticated ingress needing its own bounded rate
+       distinct from the global default (a webhook)? Inline `@RateLimit`
+       with a comment naming the source's documented rate, never
+       `@SkipRateLimit()`.
+    5. Does one legitimate user action _legitimately_ fan out into many
+       rapid calls to the _same_ route (e.g. a filterable list a user
+       clicks through quickly)? This is exactly what `burst` exists for —
+       size it to the real fan-out with cited evidence, don't widen `rate`
+       (the sustained ceiling) to paper over it.
+  - **Never widen the global `DEFAULT` policy** to work around a specific
+    route's fan-out — that weakens the backstop for every route to fix a
+    problem only one route has; narrow a specific route's policy instead.
+  - **Why GCRA, not fixed-window.** A fixed-window counter (what this
+    mechanism used before ADR-073) can only express one number — a limit
+    per window — so it cannot distinguish a one-time burst from an idle
+    visitor from the same request count arriving continuously, request
+    after request, from an attacker. No amount of `@RateLimit` tuning
+    fixes that; only a capacity-aware algorithm can. GCRA is that
+    algorithm — see ADR-073 for the full rationale, the default policy
+    table, and a measured before/after (the exact originally-reported
+    production symptom this mechanism exists to prevent: 28 of 60
+    requests refused under the old fixed-window defaults, 0 of 60 under
+    this one, for the identical traffic pattern — permanent regression
+    coverage in `apps/api/test/rate-limit-symptom-reproduction.e2e-spec.ts`).
+
+## Tests
+
+Reuse existing API fixtures and managed runner cleanup. Prefer assertions about
+observable state over elapsed wall-clock timing. For exact time boundaries, use
+an existing controlled-clock fixture at the layer that owns the clock.
+
+Concurrent HTTP requests do not arrive simultaneously at Redis. A replenishing
+rate limiter can accept another request while the batch is still arriving.
+Verify route burst configuration through a genuine idle request and its rate-limit
+headers, as in `apps/api/test/telegram-webhook.e2e-spec.ts`.
+Keep algorithm burst/refill boundaries in the dedicated GCRA tests.
+Do not add sleeps, retries or wider tolerances to conceal an incorrect timing assumption.
+
+Use existing cleanup helpers for shared Docker inspection/disposal responsibilities.
+A resource may disappear between inventory and inspection. Require exact-ID absence
+confirmation before accepting disappearance; permission, transport and incomplete
+inspection errors must remain failures. See the
+[managed image safety contract](../operations/local-stands.md#built-images-and-unresolved-builds).
+CI budgets and triggers for repeat measurements live in the
+[API E2E budget policy](../operations/ci-security.md#api-e2e-budget-policy).
+
+See [adding tests and CI ownership](../operations/adding-tests.md) for automatic
+discovery, extension inventories and local preparation.
+
+Cover the critical paths and the project-specific gates:
+
+- **Unit** — service logic in isolation.
+- **Shared contract** (Vitest, `packages/shared`) — a new or changed Zod
+  schema's own validation-boundary test lives beside it, per step 2 above.
+- **Real dependency integration** (Jest + SWC + Testcontainers, needs Docker) —
+  SQL constraints, transactions, locks and Redis/Lua. These tests may call services directly.
+- **HTTP E2E** — assembled request/response, guards, headers and persistence.
+  Both families use the existing API E2E runner; their names do not imply equal startup cost.
+- **OpenAPI inventory** — a new public handler **must** be added to the expected
+  inventory in [`apps/api/test/openapi.e2e-spec.ts`](../../apps/api/test/openapi.e2e-spec.ts).
+  The check runs both ways: a handler that ships without a typed `@SchemaResponse` (or
+  with the wrong status) **fails CI**.
+- **OpenAPI security/multipart guardrails** — API-key-capable handlers must match
+  the shared ADR-034 allowlist and document `apiKeyBearer`; upload handlers that
+  use `FileInterceptor('file', ...)` must document `multipart/form-data` with a
+  binary `file` request body. Both are asserted in
+  [`apps/api/test/openapi.e2e-spec.ts`](../../apps/api/test/openapi.e2e-spec.ts).
+- **Process-role gating** — if you added a processor or cron, assert it runs only in
+  the right role, as in
+  [`apps/api/test/process-role.e2e-spec.ts`](../../apps/api/test/process-role.e2e-spec.ts).
+
+Use the supervised [API Testcontainers contract](../operations/local-stands.md#api-testcontainers) for fresh-process execution and bounded cleanup.
+
+Commands are in [`CONTRIBUTING.md`](../../CONTRIBUTING.md#api-specific-test-commands).
+
+## See also
+
+- Auth, RBAC, OAuth, API keys, sessions — [`docs/auth/`](../auth/README.md)
+- Notifications — in-app feed, preferences, definition registry, transaction-aware producer, durable worker-driven email & Telegram channels, realtime SSE fan-out — [`docs/notifications/`](../notifications/README.md)
+- AI capability layer — assistants/agents, provider/model catalog, durable runs, tools/approvals, human takeover, multimodal artifacts, security posture — [`docs/ai/`](../ai/README.md)
+- Storage, uploads, signed URLs — [`docs/storage/`](../storage/README.md)
+- Media / image processing — [`docs/media/`](../media/README.md)
+- Deployment, migrations, process roles — [`docs/operations/deployment.md`](../operations/deployment.md)
+- Idempotency, webhooks, observability, audit log — [`docs/operations/`](../operations/)
+- Workflow, commit format, test commands — [`CONTRIBUTING.md`](../../CONTRIBUTING.md)
+- Code conventions — [`AGENTS.md`](../../AGENTS.md)
+
+## Privileged admission before authorization
+
+The global AuthenticationGuard authenticates, resolves current privilege, admits
+declared organization context, builds one CASL/TeamAccess context and runs policy guards. Every privileged JWT claim
+requires primary-role authority even on routes without SystemRoles metadata.
+Downstream handlers/services receive the effective request.user; original claims
+remain in API-only request-local admission evidence. Do not reread the claim to
+recover a platform bypass or build AbilityFactory inputs from an unverified token.
+AbilityFactory requires a PrivilegedAdmission result, not a raw RequestPrincipal.
+SystemRoles checks original claim and current role using that same evidence.
+API keys reuse the live owner role obtained by their existing authentication.
+FreshAuth's session/reason requirements remain separate. See [RBAC](../auth/rbac.md).
+
+Organization exchange uses TokenService.generateDerivedAccessToken with the verified
+parent expiry; ordinary login/refresh/step-up uses generateAccessToken. Do not use
+ordinary issuance for `/switch`: repeated exchanges must not extend residual access.
+
+## Physically bounded Prisma consumers
+
+`PrismaService.observedTransactions('ai-catalogue' | 'ai-diagnosis')` exposes two
+named private single-transaction capabilities on the existing pool. Their supported
+Prisma driver-adapter boundary observes acquisition/startup through acknowledged
+COMMIT/ROLLBACK and driver release; the public transaction promise alone cannot
+prove late cleanup after `maxWait`. A capability holds its one slot until physical
+and logical completion. Startup/cleanup/release failures with unknown disposition
+quarantine it until restart. Consumers cannot reset it or obtain an unrestricted
+child client. Uncertain sockets are destroyed with pg's supported `release(error)`.
+
+This seam is shared core and retained in every process role and Console topology.
+It is not a general replacement for the main Prisma client. Adding a named consumer
+requires explicit lifecycle, physical-completion and process-role proof. Shutdown
+closes starts before barriers, reserves 2 s for private-client disconnect within the
+20 s aggregate cap, then tears down the main client/pool. A wait cap is not evidence
+that a database operation ended; process supervision owns ultimate cleanup.
+
+### Test transformation and type checking
+
+API unit and E2E suites use `@swc/jest`. Shared settings preserve Nest legacy
+decorators, constructor metadata and source maps. Unit output is CommonJS;
+E2E output is ESM. The production API also emits ESM through Nest CLI + SWC.
+See [API build and ESM runtime](api-build.md) for imports, build order and restarts.
+SWC does not check types: run `pnpm --filter api typecheck` for source and tests.
+Email template integration tests retain Vitest and happy-dom.

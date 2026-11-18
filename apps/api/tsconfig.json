@@ -1,0 +1,16 @@
+{
+  "extends": "@amcore/typescript-config/nestjs.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "paths": {
+      "@/*": ["./src/*"]
+    },
+    "types": ["node", "jest"],
+    "jsx": "react-jsx",
+    "skipLibCheck": true,
+    "module": "Preserve",
+    "moduleResolution": "Bundler"
+  },
+  "include": ["src/**/*", "test/**/*", "prisma/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

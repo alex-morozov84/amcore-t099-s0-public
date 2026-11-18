@@ -1,0 +1,177 @@
+# Email Security
+
+Email is a common path for secrets: password resets, verification links, org
+invites, magic links, and product-specific token URLs. AMCore's contract is that
+secret-bearing email data is never serialized into shared infrastructure.
+
+## Invariants
+
+- Secret token URLs must never be persisted in BullMQ, Redis, Bull Board,
+  notification payloads, audit logs, metrics, or application logs.
+- `SendEmailJobData` is restricted to queueable templates at compile time.
+- `EmailService.queue()` rejects non-queueable templates at runtime.
+- The managed email host discards injected legacy or enveloped secret-bearing
+  jobs before version validation, rendering or provider admission.
+- Notification definitions reject `SECRET` content entirely.
+- Logs may include bounded metadata such as template, redacted recipient, job id, and
+  provider status, but never rendered bodies or raw payload objects.
+
+## Allowed Metadata
+
+Application logs may contain:
+
+- template name;
+- redacted recipient email address;
+- provider success/failure status;
+- bounded job or delivery identifiers;
+- retryability classification.
+
+Application logs must not contain:
+
+- rendered HTML;
+- plaintext email bodies;
+- raw template payload objects;
+- token URLs;
+- provider request bodies.
+
+Provider error names/messages are untrusted: they can echo a rendered token URL.
+The Resend adapter returns and logs only a finite safe failure category, never
+raw error messages, arbitrary error names or causes. The Resend SDK itself prints
+the raw parsed provider error to the console outside production; the adapter turns
+that off for its own instance (no global console patch), and a contract test against
+the real installed SDK fails if an SDK upgrade changes this. The notification
+dispatcher likewise logs only bounded event codes, delivery id and channel — never an
+error name or message. `sendNow()` also sanitizes
+render/custom-provider throws and failed results. Custom adapters must enforce
+the same rule inside their own logging; an outer catch cannot remove a log
+already emitted by a provider.
+
+## Caddy secret-link logs
+
+Before real token mail, configure and test the selected edge on a disposable or
+pre-traffic target. This recipe covers Caddy's default runtime/error logger. The
+bundled files do not enable access logs; custom access/CDN/exporter logs need
+their own filters and checks.
+
+1. Copy the Caddyfile selected by your routing overlay to
+   `/srv/amcore-secrets/Caddyfile`. Preserve its sites, headers and global block.
+   Add this **inside the existing global block**, not a second global block:
+
+   ```caddyfile
+   log {
+       format filter {
+           wrap json
+           fields {
+               request>uri delete
+               request>headers delete
+               resp_headers>Set-Cookie delete
+           }
+       }
+   }
+   ```
+
+2. Keep that file readable by the container. Save this as the private
+   `/srv/amcore-secrets/caddy-logging.override.yml` and append its path to the
+   **complete saved `COMPOSE_FILE`**, preserving every other overlay:
+
+   ```yaml
+   services:
+     caddy:
+       volumes:
+         - /srv/amcore-secrets/Caddyfile:/etc/caddy/Caddyfile:ro
+   ```
+
+   Validate before the [ordered startup](../operations/deployment.md#first-registry-startup):
+
+   ```sh
+   docker compose run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+   ```
+
+3. For the verification only, add this separate site block. Ports 9 and 18080
+   must be unused inside that Caddy container. Do not publish port 18080:
+
+   ```caddyfile
+   http://127.0.0.1:18080 {
+       bind 127.0.0.1
+       reverse_proxy 127.0.0.1:9
+   }
+   ```
+
+   Edit the mounted file in place. Compare its host/container `sha256sum` if your
+   editor replaces files: a single-file bind mount can retain the old inode.
+   Require matching mounted bytes before reloading; recreate only the verification
+   Caddy if the mount stays stale. Validate and reload the running verification Caddy:
+
+   ```sh
+   docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+   docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+   ```
+
+4. Run in Bash with Python 3. Use only the artificial values below. Stop unless
+   the response is 502 **and** the corresponding new error record passes:
+
+   ```sh
+   log_start=$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())')
+   if probe_output=$(docker compose exec -T caddy wget -T 5 -S -O /dev/null \
+     --header='Referer: http://example.invalid/obviously-fake-redaction-referer' \
+     --header='Cookie: probe=obviously-fake-redaction-cookie' \
+     --header='Authorization: Bearer obviously-fake-redaction-auth' \
+     'http://127.0.0.1:18080/__redaction_probe?token=obviously-fake-redaction-query' 2>&1); then
+     echo 'FAIL: expected HTTP 502' >&2; exit 1
+   fi
+   printf '%s\n' "$probe_output" | python3 -c 'import re, sys; assert re.search(r"HTTP/\S+ 502\b", sys.stdin.read()); print("PASS: HTTP 502")' || exit 1
+   docker compose logs --no-color --no-log-prefix --since "$log_start" caddy 2>&1 | python3 -c '
+   import json, sys
+   text = sys.stdin.read()
+   for suffix in ("query", "referer", "cookie", "auth"):
+       assert "obviously-fake-redaction-" + suffix not in text
+   rows = [json.loads(line) for line in text.splitlines() if line.lstrip().startswith("{")]
+   errors = [row for row in rows if row.get("logger") == "http.log.error"
+             and row.get("status") == 502
+             and row.get("request", {}).get("host") == "127.0.0.1:18080"]
+   assert errors, "No corresponding proxy error"
+   assert all("uri" not in row["request"] and "headers" not in row["request"] for row in errors)
+   print("PASS: proxy error recorded; artificial secrets absent")
+   ' || exit 1
+   ```
+
+   Keep any captured logs private. This failed-upstream probe does not exercise
+   response cookies; check the `Set-Cookie` filter in the adapted configuration.
+
+5. Remove the temporary site block, validate and reload again. Require port
+   18080 to be absent from `docker compose exec -T caddy netstat -ltn`; a generic
+   failed request alone is insufficient. Repeat normal HTTPS and
+   [deployment-version checks](../operations/deployment.md#web-container-readiness).
+   Stop on any validation, reload, log or cleanup failure before real token mail.
+
+See Caddy's [global logger](https://caddyserver.com/docs/caddyfile/options#log) and
+[log filters](https://caddyserver.com/docs/caddyfile/directives/log#filter).
+
+## Bull Board Implication
+
+Bull Board lists queued jobs for authorized operators. It is view-only and
+shows a closed list of fields (for a welcome email: template, locale and the
+user id; never the recipient, the name, a failure message or a stack trace), but
+that list is a second line of defence. The primary safety rule is stronger than
+"protect Bull Board" or "filter what it shows": secret-bearing templates must never
+be enqueued at all.
+
+## Extension Checklist
+
+- Classify the email: notification, queueable, direct, or secret-bearing.
+- Keep secret-bearing templates on `sendNow()` and out of queue schemas.
+- Add queue schema/tests for queueable templates.
+- Add subjects/messages for every shipped catalogue locale (`LOCALE_CATALOGUES`), including locales not enabled in this build.
+- Add HTML and plaintext render tests.
+- Verify provider/logging paths do not expose rendered bodies or payload values.
+
+Provisioning stores no raw invitation token/link or email body in its permanent result or mail-attempt projection. Late mail callbacks match the exact attempt and invitation generation; they cannot reopen completion or assign access. See [operator recovery](../product-admin/organization-provisioning.md).
+
+Privileged support-mail attempts persist only bounded identity, binding, state,
+clock and token-row identifiers. Audit projects a closed set of attempt/kind,
+provider, issuance and outcome facts. Neither surface stores the raw token,
+token hash, recipient copy, rendered body or destination URL. Admission and
+settlement audit share their database transaction. Submitted attempts remain
+for seven days; actor-bound receipt reads expire after 24 hours. The existing
+cleanup tick removes at most 1000 eligible attempts, with a two-second SQL limit.
+Expired never-submitted preparations become eligible after thirty minutes.

@@ -1,0 +1,48 @@
+import { useTranslations } from 'next-intl'
+
+import { OAuthSection } from '@/features/auth-oauth'
+import { RegisterForm } from '@/features/auth-register'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/shared/ui/card'
+import { RouteProgressLink } from '@/shared/ui/route-progress-link'
+
+interface RegisterPageProps {
+  oauthProviders: string[]
+  publicSignupEnabled?: boolean | null
+}
+
+export function RegisterPage({ oauthProviders, publicSignupEnabled = true }: RegisterPageProps) {
+  const t = useTranslations('auth')
+
+  return (
+    <Card className="w-full max-w-md">
+      <CardHeader className="text-center">
+        <CardTitle as="h1" className="text-2xl">
+          {t('register')}
+        </CardTitle>
+        <CardDescription>{t('registerSubtitle')}</CardDescription>
+      </CardHeader>
+      <CardContent>
+        {publicSignupEnabled === true ? (
+          <>
+            <OAuthSection providers={oauthProviders} />
+            <RegisterForm />
+          </>
+        ) : (
+          <p role="status" className="text-sm text-muted-foreground">
+            {t(publicSignupEnabled === false ? 'publicSignupClosed' : 'signupPolicyUnavailable')}
+          </p>
+        )}
+        <p className="mt-4 text-center text-sm text-muted-foreground">
+          {t('hasAccount')}{' '}
+          {/* `underline`, not `hover:underline`: a link inside body text needs
+          a non-color way to be told apart from plain text at rest, not only
+          on hover/focus (axe `link-in-text-block`) — this text/link pair is
+          also below the 3:1 contrast ratio the color-only cue would need. */}
+          <RouteProgressLink href="/login" className="text-primary underline">
+            {t('login')}
+          </RouteProgressLink>
+        </p>
+      </CardContent>
+    </Card>
+  )
+}

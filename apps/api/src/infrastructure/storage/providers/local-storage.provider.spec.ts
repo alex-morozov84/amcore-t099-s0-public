@@ -1,0 +1,143 @@
+import { createHash } from 'node:crypto'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { readFile, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+
+import { runStorageProviderContract } from '../storage.contract-spec'
+
+import { LocalStorageProvider } from './local-storage.provider'
+
+const roots: string[] = []
+
+function makeRoot(): string {
+  const root = mkdtempSync(path.join(tmpdir(), 'amcore-storage-'))
+  roots.push(root)
+  return root
+}
+
+afterAll(() => {
+  for (const root of roots) rmSync(root, { recursive: true, force: true })
+})
+
+describe('LocalStorageProvider', () => {
+  runStorageProviderContract('local', () => new LocalStorageProvider({ root: makeRoot() }), {
+    signedUrls: false,
+    publicUrls: false,
+  })
+
+  describe('filesystem behavior', () => {
+    it('uses a stable SHA-256 ETag for new uploads and preserves stored legacy ETags', async () => {
+      const root = makeRoot()
+      const provider = new LocalStorageProvider({ root })
+      const body = Buffer.from('version one')
+      const upload = await provider.upload({ key: 'docs/file.txt', body })
+      expect(upload.etag).toBe(createHash('sha256').update(body).digest('hex'))
+      expect((await provider.getMetadata(upload.key)).etag).toBe(upload.etag)
+      const sidecar = path.join(root, 'meta', 'docs', 'file.txt.json')
+      const legacy = '00000000000000000000000000000000'
+      await writeFile(sidecar, JSON.stringify({ etag: legacy }))
+      expect((await provider.getMetadata(upload.key)).etag).toBe(legacy)
+      await provider.copy({ source: upload.key, destination: 'docs/copy.txt' })
+      expect((await provider.getMetadata('docs/copy.txt')).etag).toBe(legacy)
+    })
+
+    it.each(['../outside.txt', '/outside.txt', 'docs/../../outside.txt'])(
+      'rejects traversal before metadata reads: %s',
+      async (key) => {
+        const provider = new LocalStorageProvider({ root: makeRoot() })
+        await expect(provider.getMetadata(key)).rejects.toThrow('Invalid object key')
+      }
+    )
+
+    it('creates nested directories on upload', async () => {
+      const provider = new LocalStorageProvider({ root: makeRoot() })
+      await provider.upload({ key: 'deep/nested/dir/file.bin', body: Buffer.from('data') })
+      expect((await provider.download('deep/nested/dir/file.bin')).toString()).toBe('data')
+    })
+
+    it('keeps a public copy only for keys under public/ and derives visibility from the key', async () => {
+      const root = makeRoot()
+      const provider = new LocalStorageProvider({ root })
+      await provider.upload({ key: 'public/a/p.txt', body: Buffer.from('x') })
+      await provider.upload({ key: 'a/q.txt', body: Buffer.from('y') })
+      expect((await readFile(path.join(root, 'public', 'public', 'a', 'p.txt'))).toString()).toBe(
+        'x'
+      )
+      await expect(readFile(path.join(root, 'public', 'a', 'q.txt'))).rejects.toThrow()
+      const raw = await readFile(path.join(root, 'meta', 'public', 'a', 'p.txt.json'), 'utf8')
+      expect(JSON.parse(raw)).not.toHaveProperty('visibility')
+      expect((await provider.getMetadata('public/a/p.txt')).visibility).toBe('public-read')
+      expect((await provider.getMetadata('a/q.txt')).visibility).toBe('private')
+    })
+
+    it('refreshes the public copy on copy and removes it on delete', async () => {
+      const root = makeRoot()
+      const provider = new LocalStorageProvider({ root })
+      await provider.upload({ key: 'public/a.txt', body: Buffer.from('x') })
+      await provider.copy({ source: 'public/a.txt', destination: 'public/b.txt' })
+      expect((await readFile(path.join(root, 'public', 'public', 'b.txt'))).toString()).toBe('x')
+      await provider.delete('public/b.txt')
+      await expect(readFile(path.join(root, 'public', 'public', 'b.txt'))).rejects.toThrow()
+    })
+
+    it('lists only object keys (metadata is stored out of the key namespace)', async () => {
+      const provider = new LocalStorageProvider({ root: makeRoot() })
+      await provider.upload({ key: 'docs/a.txt', body: Buffer.from('a') })
+      const { files } = await provider.list({ prefix: '' })
+      expect(files.map((f) => f.key)).toEqual(['docs/a.txt'])
+    })
+
+    it('treats a key ending in .meta.json as an ordinary object', async () => {
+      const provider = new LocalStorageProvider({ root: makeRoot() })
+      await provider.upload({ key: 'report', body: Buffer.from('R') })
+      await provider.upload({ key: 'report.meta.json', body: Buffer.from('M') })
+      expect((await provider.download('report')).toString()).toBe('R')
+      expect((await provider.download('report.meta.json')).toString()).toBe('M')
+      const { files } = await provider.list({ prefix: '' })
+      expect(files.map((f) => f.key).sort()).toEqual(['report', 'report.meta.json'])
+    })
+
+    it('returns an empty listing when the root does not exist yet', async () => {
+      const provider = new LocalStorageProvider({ root: path.join(makeRoot(), 'not-created') })
+      expect(await provider.list({ prefix: '' })).toEqual({ files: [], isTruncated: false })
+    })
+
+    it('exists rethrows real FS errors instead of reporting "absent"', async () => {
+      // Make the reserved objects/ path a FILE, so stat on objects/<key> hits
+      // ENOTDIR — a real fault that must not be swallowed as "not found".
+      const root = makeRoot()
+      await writeFile(path.join(root, 'objects'), 'not a directory')
+      const provider = new LocalStorageProvider({ root })
+      await expect(provider.exists('x.txt')).rejects.toThrow()
+    })
+  })
+
+  describe('public URLs', () => {
+    it('reports publicUrls=true and builds a clean url when a base is configured', () => {
+      // The public endpoint receives a safely encoded object-key query.
+      const provider = new LocalStorageProvider({
+        root: makeRoot(),
+        publicBaseUrl: 'https://cdn.example.com/assets/',
+      })
+      expect(provider.capabilities.publicUrls).toBe(true)
+      expect(provider.getPublicUrl('public/avatars/u1.webp')).toBe(
+        'https://cdn.example.com/assets?key=public%2Favatars%2Fu1.webp'
+      )
+    })
+
+    it('builds no public URL for a private key', () => {
+      const provider = new LocalStorageProvider({
+        root: makeRoot(),
+        publicBaseUrl: 'https://api.example.com/api/v1/storage/public',
+      })
+      expect(() => provider.getPublicUrl('avatars/u1/original')).toThrow('private')
+    })
+
+    it('throws on getPublicUrl when no base is configured', () => {
+      const provider = new LocalStorageProvider({ root: makeRoot() })
+      expect(provider.capabilities.publicUrls).toBe(false)
+      expect(() => provider.getPublicUrl('public/x.txt')).toThrow('STORAGE_PUBLIC_BASE_URL')
+    })
+  })
+})

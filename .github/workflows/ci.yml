@@ -1,0 +1,1319 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  API_E2E_CACHE_MODE: warm
+  API_E2E_PR_HEAD: ${{ github.event.pull_request.head.sha || '' }}
+
+jobs:
+  ci-required:
+    name: CI required
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ always() }}
+    needs:
+      - lint
+      - typecheck
+      - build
+      - test-unit-redis
+      - test-capability
+      - test-notification-ai
+      - test
+      - api-e2e-plan
+      - api-e2e-shards
+      - api-e2e
+      - script-contracts
+      - docker-image-smoke
+      - web-e2e-plan
+      - web-e2e-lanes
+      - web-e2e
+      - promtool
+      - observability-contract-live
+      - storybook
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Require every CI family
+        env:
+          CI_RESULTS: ${{ toJSON(needs) }}
+        run: node scripts/ci-required.mjs
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check installed Jest runtime
+        run: pnpm --filter api test --runInBand --runTestsByPath src/common/utils/anonymize-ip.spec.ts
+
+      - name: Run ESLint
+        run: |
+          node scripts/migrator-contract.mjs
+          pnpm lint
+          node scripts/lint.mjs --scope root docker/migrator
+
+      - name: Check formatting
+        run: pnpm format:check
+
+  typecheck:
+    name: Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run type check
+        run: pnpm typecheck
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      # Reads the web build above (same job, no second build); docs/frontend/bundle-budget.md.
+      - name: Check route budgets
+        run: pnpm check:route-budgets
+
+  test-unit-redis:
+    name: Test unit and Redis
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Docker Hub mirror
+        run: bash scripts/docker-registry-mirror.sh
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run unit tests
+        run: pnpm test
+      - name: Run web real-Redis integration
+        run: pnpm --filter web test:integration
+
+  test-capability:
+    name: Test capability extension
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Docker Hub mirror
+        run: bash scripts/docker-registry-mirror.sh
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run capability extension
+        run: pnpm test:capability-extension
+
+  test-notification-ai:
+    name: Test notification and AI extension
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Docker Hub mirror
+        run: bash scripts/docker-registry-mirror.sh
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run notification and AI extension
+        run: pnpm test:extension-contracts
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ always() }}
+    needs: [test-unit-redis, test-capability, test-notification-ai, api-e2e]
+    steps:
+      - name: Require every Test dependency
+        env:
+          TEST_RESULTS: ${{ toJSON(needs) }}
+        run: >-
+          node -e 'const expected=["test-unit-redis", "test-capability", "test-notification-ai", "api-e2e"]; const results=JSON.parse(process.env.TEST_RESULTS); if (!results || Array.isArray(results) || Object.keys(results).length !== expected.length || expected.some(key => results[key]?.result !== "success")) process.exit(1)'
+
+  # Diagnostic full coverage. Live required status is enabled only after Linux admission.
+  api-e2e-plan:
+    name: API E2E plan
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck]
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - name: Setup Node.js
+        id: node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: ${{ env.API_E2E_CACHE_MODE == 'warm' && 'pnpm' || '' }}
+      - name: Use isolated cold dependency store
+        if: env.API_E2E_CACHE_MODE == 'cold'
+        run: pnpm config set store-dir "$RUNNER_TEMP/api-e2e-cold-store"
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Record runner and cache measurement
+        env:
+          API_E2E_CACHE_HIT: ${{ steps.node.outputs.cache-hit }}
+        run: node scripts/api-e2e/measurement.mjs .amcore/api-e2e-results/measurement-before.json
+      - name: Prepare fresh job
+        run: node scripts/api-e2e-ci.mjs --prepare
+      - name: Discover complete inventory
+        id: plan
+        run: |
+          matrix="$(node scripts/api-e2e-ci.mjs --plan=3)"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+      - name: Retain canonical inventory
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: api-e2e-attempt-${{ github.run_attempt }}-plan
+          path: |
+            .amcore/api-e2e-results/plan.json
+            .amcore/api-e2e-results/measurement-before.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  api-e2e-shards:
+    name: API E2E shard (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    needs: [api-e2e-plan]
+    # Measurement headroom; this is not the admission target.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.api-e2e-plan.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Docker Hub mirror
+        run: bash scripts/docker-registry-mirror.sh
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - name: Setup Node.js
+        id: node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: ${{ env.API_E2E_CACHE_MODE == 'warm' && 'pnpm' || '' }}
+      - name: Use isolated cold dependency store
+        if: env.API_E2E_CACHE_MODE == 'cold'
+        run: pnpm config set store-dir "$RUNNER_TEMP/api-e2e-cold-store"
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Record runner and cache measurement
+        env:
+          API_E2E_CACHE_HIT: ${{ steps.node.outputs.cache-hit }}
+        run: node scripts/api-e2e/measurement.mjs .amcore/api-e2e-results/measurement-before.json
+      - name: Prepare fresh job
+        run: node scripts/api-e2e-ci.mjs --prepare
+      - name: Execute assigned suites once
+        env:
+          API_E2E_SHARD: ${{ matrix.shard }}
+        run: node scripts/api-e2e-ci.mjs "--shard=$API_E2E_SHARD"
+      - name: Record final resource measurement
+        if: always()
+        env:
+          API_E2E_CACHE_HIT: ${{ steps.node.outputs.cache-hit }}
+        run: node scripts/api-e2e/measurement.mjs .amcore/api-e2e-results/measurement-after.json
+      - name: Normalize artifact identity
+        id: artifact
+        if: always()
+        env:
+          API_E2E_SHARD: ${{ matrix.shard }}
+        run: echo "shard=${API_E2E_SHARD//\//-}" >> "$GITHUB_OUTPUT"
+      - name: Retain partial and final evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: api-e2e-attempt-${{ github.run_attempt }}-report-${{ steps.artifact.outputs.shard }}
+          path: .amcore/api-e2e-results/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  api-e2e:
+    name: API E2E
+    runs-on: ubuntu-latest
+    needs: [api-e2e-plan, api-e2e-shards]
+    if: ${{ always() }}
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Download current-attempt evidence
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: api-e2e-attempt-${{ github.run_attempt }}-*
+          path: api-e2e-evidence
+      - name: Require complete coverage and natural process exits
+        env:
+          API_E2E_OUTCOMES: '{"plan":"${{ needs.api-e2e-plan.result }}","shards":"${{ needs.api-e2e-shards.result }}"}'
+        run: node scripts/api-e2e/aggregate.mjs api-e2e-evidence
+
+  script-contracts:
+    name: Script contracts
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Docker Hub mirror
+        run: bash scripts/docker-registry-mirror.sh
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Preserve shared migration history
+        if: github.event_name == 'pull_request'
+        run: node scripts/check-migration-history.mjs
+
+      # Unit and contract tests of the repository's own tooling: the init:brand
+      # initializer with the engine, filesystem transaction and AST core it uses, product-admin
+      # placement, lint, Lighthouse, migrator, API E2E and deployment contracts. They read the
+      # real working tree and need no Docker. This is the same command as the root
+      # `test:scripts` script (a test compares them). Does NOT cover the private-path ratchet --
+      # that is the separate "promtool" job, display name "Observability contract (static)".
+      - name: Run script contract tests
+        run: pnpm test:scripts
+
+  docker-image-smoke:
+    name: Docker production image smoke
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck]
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    env:
+      AMCORE_API_IMAGE: amcore-api:smoke
+      AMCORE_API_MIGRATOR_IMAGE: amcore-api-migrator:smoke
+      COMPOSE_FILE: docker-compose.yml:.github/compose.boot-smoke.override.yml
+      COMPOSE_PROFILES: local-infra
+      COMPOSE_PROJECT_NAME: amcore-smoke
+      WEB_FRONTEND_CONTEXT_KEY: ci-fake-frontend-context-key-never-a-real-secret
+      FRONTEND_URL: http://127.0.0.1:3000
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Docker Hub mirror
+        run: bash scripts/docker-registry-mirror.sh
+
+      - name: Free unused SDK disk space
+        timeout-minutes: 10
+        run: bash scripts/free-runner-disk.sh
+
+      - name: Setup Node.js for report validation
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Setup pnpm for migration verification
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Install migration verification dependencies
+        run: pnpm --filter api --fail-if-no-match install --frozen-lockfile --ignore-scripts
+
+      - name: Install Trivy
+        env:
+          TRIVY_VERSION: 0.76.2
+          TRIVY_LINUX_64BIT_SHA256: bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          asset="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -fsSLo "$RUNNER_TEMP/$asset" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${asset}"
+          printf '%s  %s\n' "$TRIVY_LINUX_64BIT_SHA256" "$RUNNER_TEMP/$asset" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/bin" trivy
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Build production runner image
+        run: docker build --build-arg BUILD_SOURCE_COMMIT="${{ github.event.pull_request.head.sha || github.sha }}" -f apps/api/Dockerfile -t "$AMCORE_API_IMAGE" .
+
+      - name: Build production migrator image
+        run: docker build --build-arg BUILD_SOURCE_COMMIT="${{ github.event.pull_request.head.sha || github.sha }}" -f apps/api/Dockerfile --target migrator -t "$AMCORE_API_MIGRATOR_IMAGE" .
+
+      - name: Smoke-test the migrator image
+        run: |
+          docker run --rm "$AMCORE_API_MIGRATOR_IMAGE" sh -lc '
+            ./node_modules/.bin/prisma --version
+            test -x ./node_modules/.bin/prisma
+          '
+
+      - name: Verify native migration cancellation
+        env:
+          AMCORE_MIGRATOR_LIFECYCLE_JOURNAL: ${{ runner.temp }}/migrator-lifecycle.json
+        run: node scripts/verify-migrator-lifecycle.mjs "$AMCORE_API_MIGRATOR_IMAGE"
+
+      - name: Recover migration verification resources
+        if: always()
+        env:
+          AMCORE_MIGRATOR_LIFECYCLE_JOURNAL: ${{ runner.temp }}/migrator-lifecycle.json
+        run: node scripts/cleanup-migrator-lifecycle.mjs "$AMCORE_MIGRATOR_LIFECYCLE_JOURNAL"
+
+      - name: Verify native migration operations
+        env:
+          AMCORE_MIGRATOR_LIFECYCLE_JOURNAL: ${{ runner.temp }}/migrator-operations.json
+        run: node scripts/verify-migrator-operations.mjs "$AMCORE_API_MIGRATOR_IMAGE"
+
+      - name: Verify database and local-file archive recovery
+        env:
+          AMCORE_MIGRATOR_LIFECYCLE_JOURNAL: ${{ runner.temp }}/archive-recovery.json
+        run: |
+          node scripts/verify-recovery.mjs
+          node scripts/verify-load-test-compose.mjs
+
+      - name: Verify load entry recovery and Linux model ownership
+        run: node --test --test-concurrency=1 scripts/load-test/test/recover-ownership.live.mjs scripts/load-test/test/recover.live.mjs
+
+      - name: Verify load migration TLS trust and configuration
+        env:
+          AMCORE_MIGRATOR_LIFECYCLE_JOURNAL: ${{ runner.temp }}/recovery-tls.json
+        run: node scripts/verify-recovery-tls.mjs "$AMCORE_API_MIGRATOR_IMAGE"
+
+      - name: Verify migration isolation and cleanup failure
+        env:
+          AMCORE_MIGRATOR_LIFECYCLE_JOURNAL: ${{ runner.temp }}/migrator-network.json
+        run: node scripts/verify-migrator-controls.mjs "$AMCORE_API_MIGRATOR_IMAGE" network
+
+      - name: Verify interrupted migration harness recovery
+        env:
+          AMCORE_MIGRATOR_LIFECYCLE_JOURNAL: ${{ runner.temp }}/migrator-interrupt.json
+        run: node scripts/verify-migrator-controls.mjs "$AMCORE_API_MIGRATOR_IMAGE" interrupt
+
+      - name: Verify migration negative lifecycle controls
+        env:
+          AMCORE_MIGRATOR_LIFECYCLE_JOURNAL: ${{ runner.temp }}/migrator-negative.json
+        run: node scripts/verify-migrator-controls.mjs "$AMCORE_API_MIGRATOR_IMAGE" negative
+
+      - name: Verify migration advisory-lock cancellation
+        env:
+          AMCORE_MIGRATOR_LIFECYCLE_JOURNAL: ${{ runner.temp }}/migrator-advisory.json
+        run: node scripts/verify-migrator-controls.mjs "$AMCORE_API_MIGRATOR_IMAGE" advisory
+
+      - name: Recover migration operations and control resources
+        if: always()
+        run: |
+          cleanup_status=0
+          for journal in migrator-operations archive-recovery recovery-tls migrator-network migrator-negative migrator-advisory \
+            migrator-interrupt.json.sigterm migrator-interrupt.json.sigint migrator-interrupt.json.sigkill; do
+            case "$journal" in
+              *.json.*) path="$RUNNER_TEMP/$journal" ;;
+              *) path="$RUNNER_TEMP/$journal.json" ;;
+            esac
+            node scripts/cleanup-migrator-lifecycle.mjs "$path" || cleanup_status=1
+          done
+          exit "$cleanup_status"
+
+      - name: Verify npm/npx are absent from the runner image
+        run: |
+          docker run --rm "$AMCORE_API_IMAGE" sh -lc '
+            node --version
+            if command -v npm >/dev/null 2>&1; then
+              echo "npm unexpectedly present in runner image"
+              exit 1
+            fi
+            if command -v npx >/dev/null 2>&1; then
+              echo "npx unexpectedly present in runner image"
+              exit 1
+            fi
+            echo "npm/npx absent, node OK"
+          '
+
+      # The runner ships only compiled output. `files` in apps/api/package.json is the
+      # allowlist; this step is the contract test for it. It also checks the paths the
+      # app reads at runtime, so over-trimming fails here rather than at first boot.
+      - name: Verify the runner image holds only runtime files
+        run: |
+          docker run --rm "$AMCORE_API_IMAGE" sh -c '
+            cd /app
+            for required in package.json dist/main.js dist/build-identity.json dist/cli; do
+              test -e "$required" || { echo "missing from runner image: $required"; exit 1; }
+            done
+            for forbidden in src test prisma recipes scripts .amcore Dockerfile .swcrc tsconfig.json; do
+              test ! -e "$forbidden" || { echo "unexpected in runner image: $forbidden"; exit 1; }
+            done
+            stray="$(find . -path ./node_modules -prune -o -type f \( \
+              -name "*.spec.*" -o -name "*.e2e-spec.*" -o -name "*.test.*" -o -name "*.testkit.*" \
+              -o -name "*.map" -o -name "*.ts" -o -name "*.tsbuildinfo" \) -print)"
+            if [ -n "$stray" ]; then
+              echo "test, source or map files in runner image:"
+              echo "$stray" | head -20
+              exit 1
+            fi
+            echo "runner image holds only runtime files"
+          '
+
+      - name: Scan the built runner image with Trivy
+        run: |
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --format sarif \
+            --output trivy-results.sarif \
+            "$AMCORE_API_IMAGE"
+
+      - name: Upload Trivy SARIF
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-image
+
+      - name: Scan the built migrator image with Trivy
+        run: node scripts/scan-migrator-image.mjs "$AMCORE_API_MIGRATOR_IMAGE"
+
+      - name: Upload migrator vulnerability inventory
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: migrator-vulnerability-inventory
+          path: migrator-vuln-inventory.json
+          if-no-files-found: error
+
+      - name: Upload migrator Trivy SARIF
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: migrator-trivy-results.sarif
+          category: trivy-image-migrator
+
+      # Verify the self-contained production app image (pnpm deploy bundle):
+      # 1. native sharp/libvips loads AND encodes (not just require) — catches a
+      #    missing/wrong native binary or broken codec the host platform hides;
+      # 2. critical runtime deps resolve from the bundle's flat node_modules —
+      #    proves the pnpm-workspace packaging is self-contained;
+      # 3. the compiled generated Prisma client is present while the Prisma CLI is absent;
+      # 4. React email templates render from the production SWC output and
+      #    pnpm deploy bundle (catches missing react/jsx-runtime/react-dom deps).
+      # Runs as the image's non-root user from the production WORKDIR.
+      - name: Smoke-test the built runner image
+        run: |
+          docker run --rm "$AMCORE_API_IMAGE" node -e "
+            const sharp = require('sharp');
+            sharp({ create: { width: 8, height: 8, channels: 3, background: '#000' } })
+              .webp()
+              .toBuffer()
+              .then((b) => {
+                if (!b || b.length === 0) throw new Error('empty WebP buffer');
+                console.log('sharp WebP encode OK:', b.length, 'bytes');
+                for (const m of ['@nestjs/core', '@prisma/client/runtime/client', 'argon2', 'bullmq', 'nestjs-pino']) {
+                  require.resolve(m);
+                }
+                console.log('runtime module resolution OK');
+                if (typeof require('./dist/generated/prisma/client.js').PrismaClient !== 'function') {
+                  throw new Error('Prisma client not generated');
+                }
+                try {
+                  require.resolve('prisma');
+                  throw new Error('Prisma CLI unexpectedly present in app image');
+                } catch (err) {
+                  if (err.code !== 'MODULE_NOT_FOUND') throw err;
+                }
+                console.log('Prisma client present OK');
+                const { render } = require('@react-email/render');
+                const { default: WelcomeEmail } = require('./dist/infrastructure/email/templates/welcome.js');
+                return render(WelcomeEmail({ name: 'CI', appName: 'AMCore' }));
+              })
+              .then((html) => {
+                if (!html.includes('CI')) throw new Error('email render output missing expected name');
+                console.log('React email render OK:', html.length, 'bytes');
+              })
+              .catch((err) => {
+                console.error('image smoke failed:', err);
+                process.exit(1);
+              });
+          "
+
+      - name: Render compose config for boot smoke
+        run: |
+          docker compose config > "$RUNNER_TEMP/boot-smoke-compose.yml"
+          ruby -e '
+            require "yaml"
+            config = YAML.load_file(ARGV[0])
+            %w[api worker].each do |name|
+              service = config.fetch("services").fetch(name)
+              raise "#{name} build unexpectedly present" if service.key?("build")
+              raise "#{name} image mismatch: #{service["image"]}" unless service["image"] == ENV.fetch("AMCORE_API_IMAGE")
+            end
+            migrate = config.fetch("services").fetch("migrate")
+            raise "migrate build unexpectedly present" if migrate.key?("build")
+            raise "migrate image mismatch: #{migrate["image"]}" unless migrate["image"] == ENV.fetch("AMCORE_API_MIGRATOR_IMAGE")
+            puts "compose image override OK"
+          ' "$RUNNER_TEMP/boot-smoke-compose.yml"
+
+      - name: Boot the scanned image via docker compose
+        run: docker compose up -d --build
+
+      - name: Verify migrate, api, web, and worker
+        run: |
+          migrate_cid=""
+          for attempt in $(seq 1 60); do
+            migrate_cid="$(docker compose ps -aq migrate)"
+            if [ -n "$migrate_cid" ]; then
+              status="$(docker inspect -f '{{.State.Status}}' "$migrate_cid")"
+              if [ "$status" = "exited" ]; then
+                code="$(docker inspect -f '{{.State.ExitCode}}' "$migrate_cid")"
+                if [ "$code" -ne 0 ]; then
+                  echo "migrate exited with $code"
+                  exit 1
+                fi
+                echo "migrate exit 0"
+                break
+              fi
+            fi
+            sleep 2
+          done
+          if [ -z "$migrate_cid" ]; then
+            echo "migrate container not created"
+            exit 1
+          fi
+          if [ "$(docker inspect -f '{{.State.Status}}' "$migrate_cid")" != "exited" ]; then
+            echo "migrate did not finish in time"
+            exit 1
+          fi
+
+          for attempt in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:5002/api/v1/health/ready > /dev/null; then
+              echo "api ready 200"
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              echo "api readiness check timed out"
+              exit 1
+            fi
+            sleep 2
+          done
+
+          for attempt in $(seq 1 60); do
+            # -L follows the locale redirect: `/` now 307s to the default
+            # locale (`/en`) because `localePrefix` is `always`. Following it
+            # also keeps this a real readiness check — it proves a localized
+            # page actually renders, not merely that a redirect header is
+            # emitted.
+            status="$(curl -fsSL -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/ || true)"
+            if [ "$status" = "200" ]; then
+              echo "web 200"
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              echo "web readiness check timed out"
+              exit 1
+            fi
+            sleep 2
+          done
+
+          worker_cid=""
+          for attempt in $(seq 1 60); do
+            worker_cid="$(docker compose ps -q worker)"
+            if [ -n "$worker_cid" ]; then
+              health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$worker_cid")"
+              if [ "$health" = "healthy" ]; then
+                echo "worker healthy"
+                exit 0
+              fi
+            fi
+            sleep 2
+          done
+          echo "worker did not become healthy"
+          exit 1
+
+      - name: Dump compose logs on failure
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs --no-color
+
+      - name: Tear down boot smoke stack
+        if: always()
+        run: docker compose down -v
+
+  web-e2e-plan:
+    name: Web E2E plan
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck]
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      audit-plan: ${{ steps.plan.outputs.audit-plan }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Select all applicable E2E lanes
+        id: plan
+        run: node scripts/e2e-ci.mjs --plan-ci
+
+  web-e2e-lanes:
+    name: Web E2E (${{ matrix.lane }})
+    runs-on: ubuntu-24.04
+    needs: [web-e2e-plan]
+    timeout-minutes: ${{ matrix.timeout }}
+    env:
+      E2E_CI_LANE: ${{ matrix.lane }}
+      AMCORE_AUDIT_JOB_OWNER: ${{ matrix.timeout == 40 }}
+      AMCORE_EXPECTED_AUDIT_PLAN: ${{ needs.web-e2e-plan.outputs.audit-plan }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.web-e2e-plan.outputs.matrix) }}
+    steps:
+      - name: Record enclosing job epoch
+        run: echo "AMCORE_CI_EPOCH=$(($(date +%s) * 1000))" >> "$GITHUB_ENV"
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+        timeout-minutes: 1
+
+      - name: Docker Hub mirror
+        run: bash scripts/docker-registry-mirror.sh
+
+      - name: Free unused SDK disk space for Docker lanes
+        if: matrix.lane != 'mocked'
+        timeout-minutes: 10
+        run: |
+          case "$E2E_CI_LANE" in
+            path-standard|path-disruptive|staff-path-oauth|staff-oauth|staff-console-path|staff-host|host|setup-cli|setup-console|staff-invitation|support-mail-path|support-mail-host)
+              bash scripts/free-runner-disk.sh --lane "$E2E_CI_LANE"
+              ;;
+            *) bash scripts/free-runner-disk.sh ;;
+          esac
+
+      - name: Preparation budget
+        id: preparation
+        run: node scripts/lighthouse/ci-budget.mjs 20
+      - name: Setup pnpm
+        timeout-minutes: ${{ fromJSON(steps.preparation.outputs.minutes) }}
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Remaining preparation budget
+        id: pnpm
+        run: node scripts/lighthouse/ci-budget.mjs 20
+
+      - name: Setup Node.js
+        timeout-minutes: ${{ fromJSON(steps.pnpm.outputs.minutes) }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Remaining preparation budget
+        id: node
+        run: node scripts/lighthouse/ci-budget.mjs 20
+
+      - name: Install dependencies
+        timeout-minutes: ${{ fromJSON(steps.node.outputs.minutes) }}
+        run: pnpm install --frozen-lockfile
+
+      # Transport policy checks use the installed web Playwright dependency.
+      - name: Remaining preparation budget
+        id: install
+        run: node scripts/lighthouse/ci-budget.mjs 20
+
+      - name: Build @amcore/shared
+        timeout-minutes: ${{ fromJSON(steps.install.outputs.minutes) }}
+        run: pnpm --filter @amcore/shared build
+
+      # A reachable but slow Azure mirror does not trigger APT's failure fallback.
+      - name: Remaining preparation budget
+        id: shared
+        run: node scripts/lighthouse/ci-budget.mjs 20
+
+      - name: Prefer Ubuntu archive for browser dependencies
+        timeout-minutes: ${{ fromJSON(steps.shared.outputs.minutes) }}
+        run: |
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i -E \
+              -e '\#^https?://azure\.archive\.ubuntu\.com/ubuntu/[[:space:]]#s/priority:[0-9]+/priority:2/' \
+              -e '\#^https://archive\.ubuntu\.com/ubuntu/[[:space:]]#s/priority:[0-9]+/priority:1/' \
+              /etc/apt/apt-mirrors.txt
+          fi
+
+      # Apt must not wait for interactive service-restart prompts.
+      - name: Remaining preparation budget
+        id: mirror
+        run: node scripts/lighthouse/ci-budget.mjs 20
+
+      - name: Install Playwright Chromium
+        timeout-minutes: ${{ fromJSON(steps.mirror.outputs.minutes) }}
+        working-directory: apps/web
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          NEEDRESTART_MODE: a
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Remaining preparation budget
+        id: playwright
+        run: node scripts/lighthouse/ci-budget.mjs 20
+
+      - name: Prepare pinned audit browser
+        if: matrix.timeout == 40
+        timeout-minutes: ${{ fromJSON(steps.playwright.outputs.minutes) }}
+        run: |
+          pnpm audit:web:browser
+          node scripts/lighthouse/ci-browser.mjs
+
+      - name: Require preparation reserve
+        run: node scripts/lighthouse/ci-budget.mjs 20
+
+      - name: Run isolated E2E lane
+        env:
+          E2E_CI_LANE: ${{ matrix.lane }}
+        run: node scripts/e2e-ci.mjs "$E2E_CI_LANE"
+
+      - name: Admit bounded transfer slot
+        if: always()
+        id: transfer
+        run: node scripts/lighthouse/ci-transfer-budget.mjs
+
+      - name: Upload E2E reports, inventories and test results
+        id: original-upload
+        env:
+          NODE_OPTIONS: --import=${{ github.workspace }}/scripts/lighthouse/action-deadline.mjs
+          AMCORE_ACTION_DEADLINE: ${{ env.AMCORE_E2E_TRANSFER_END }}
+        if: always() && steps.transfer.outcome == 'success'
+        timeout-minutes: 1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: playwright-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.lane }}
+          path: |
+            .amcore/stands/*/report/
+            .amcore/stands/*/test-results/
+            .amcore/stands/*/inventory.json
+          include-hidden-files: true
+          retention-days: 7
+
+      - name: Prepare safe Lighthouse viewing files
+        id: view
+        if: always() && matrix.timeout == 40 && steps.transfer.outcome == 'success'
+        env:
+          NODE_OPTIONS: --import=${{ github.workspace }}/scripts/lighthouse/action-deadline.mjs
+          AMCORE_ACTION_DEADLINE: ${{ env.AMCORE_BUNDLE_TRANSFER_END }}
+        run: node scripts/lighthouse/ci-prepare-view.mjs
+
+      - name: Upload safe Lighthouse bundle
+        if: always() && matrix.timeout == 40 && steps.transfer.outcome == 'success' && steps.view.outcome == 'success'
+        id: audit-upload
+        env:
+          NODE_OPTIONS: --import=${{ github.workspace }}/scripts/lighthouse/action-deadline.mjs
+          AMCORE_ACTION_DEADLINE: ${{ env.AMCORE_BUNDLE_TRANSFER_END }}
+        timeout-minutes: 1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-lighthouse-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.lane }}
+          path: .amcore/lighthouse-results/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.lane }}/view/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Write explicit lane evidence
+        if: always() && steps.transfer.outcome == 'success'
+        env:
+          NODE_OPTIONS: --import=${{ github.workspace }}/scripts/lighthouse/action-deadline.mjs
+          AMCORE_ACTION_DEADLINE: ${{ env.AMCORE_STATUS_TRANSFER_END }}
+          ORIGINAL_UPLOAD: ${{ steps.original-upload.outcome }}
+          AUDIT_UPLOAD: ${{ steps.audit-upload.outcome }}
+          AUDIT_ARTIFACT_ID: ${{ steps.audit-upload.outputs.artifact-id }}
+          AUDIT_ARTIFACT_URL: ${{ steps.audit-upload.outputs.artifact-url }}
+        run: node scripts/lighthouse/ci-status.mjs
+
+      - name: Upload lane evidence envelope
+        env:
+          NODE_OPTIONS: --import=${{ github.workspace }}/scripts/lighthouse/action-deadline.mjs
+          AMCORE_ACTION_DEADLINE: ${{ env.AMCORE_STATUS_TRANSFER_END }}
+        if: always() && steps.transfer.outcome == 'success'
+        timeout-minutes: 1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-e2e-lane-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.lane }}
+          path: .amcore/lighthouse-results/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.lane }}/status.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  web-e2e:
+    name: Web E2E
+    runs-on: ubuntu-latest
+    needs: [web-e2e-plan, web-e2e-lanes]
+    if: ${{ always() }}
+    timeout-minutes: 5
+    env:
+      AMCORE_EXPECTED_AUDIT_PLAN: ${{ needs.web-e2e-plan.outputs.audit-plan }}
+      E2E_RESULTS: ${{ toJSON(needs) }}
+    steps:
+      - name: Record aggregate phase deadlines
+        run: |
+          epoch=$(($(date +%s) * 1000))
+          printf '%s\n' \
+            "AMCORE_AGG_ADMISSION_END=$((epoch + 30000))" \
+            "AMCORE_AGG_RETRIEVAL_END=$((epoch + 210000))" \
+            "AMCORE_AGG_VALIDATION_END=$((epoch + 270000))" >> "$GITHUB_ENV"
+          cat > "$RUNNER_TEMP/amcore-action-deadline.mjs" <<'JS'
+          const remaining = Number(process.env.AMCORE_ACTION_DEADLINE) - Date.now()
+          if (!Number.isSafeInteger(remaining) || remaining <= 0) process.exit(1)
+          setTimeout(() => process.exit(1), remaining).unref()
+          JS
+      - name: Require every planned E2E lane to succeed
+        env:
+          E2E_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          node -e '
+            const results = JSON.parse(process.env.E2E_RESULTS);
+            let validPlan = false;
+            try {
+              const {digest, ...plan} = JSON.parse(process.env.AMCORE_EXPECTED_AUDIT_PLAN);
+              validPlan = results["web-e2e-plan"]?.result === "success" &&
+                plan.version === 1 && plan.run === process.env.GITHUB_RUN_ID &&
+                plan.attempt === process.env.GITHUB_RUN_ATTEMPT && plan.source === process.env.GITHUB_SHA &&
+                Array.isArray(plan.pages) && plan.pages.length > 0 && plan.pages.length <= 3 &&
+                require("node:crypto").createHash("sha256").update(JSON.stringify(plan)).digest("hex") === digest;
+            } catch { /* No validated inventory is available. */ }
+            if (!validPlan) {
+              require("node:fs").appendFileSync(process.env.GITHUB_STEP_SUMMARY,
+                "### Lighthouse — coverage unavailable\n\nExpected inventory was not produced for this run and attempt. Inspect Web E2E plan.\n");
+              console.error("Expected inventory unavailable");
+              process.exit(1);
+            }
+            if (["web-e2e-plan", "web-e2e-lanes"].some(name => results[name]?.result !== "success")) {
+              console.error("Every planned E2E lane must succeed", results);
+              process.exit(1);
+            }
+          '
+
+      # Checkout also has a post action. A phase preload would expire before that
+      # cleanup runs and turn a fully validated job red. Enforce admission below.
+      - name: Checkout exact evidence policy
+        timeout-minutes: 1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require checkout within admission phase
+        env:
+          AMCORE_ACTION_DEADLINE: ${{ env.AMCORE_AGG_ADMISSION_END }}
+        run: node --import "$RUNNER_TEMP/amcore-action-deadline.mjs" -e ""
+      - name: Retrieve all expected lane envelopes
+        env:
+          NODE_OPTIONS: --import=${{ github.workspace }}/scripts/lighthouse/action-deadline.mjs
+          AMCORE_ACTION_DEADLINE: ${{ env.AMCORE_AGG_RETRIEVAL_END }}
+        timeout-minutes: 1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: web-e2e-lane-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: .amcore/lighthouse-downloads/status
+      - name: Validate owners and select exact bundle IDs
+        env:
+          NODE_OPTIONS: --import=${{ github.workspace }}/scripts/lighthouse/action-deadline.mjs
+          AMCORE_ACTION_DEADLINE: ${{ env.AMCORE_AGG_RETRIEVAL_END }}
+        id: owners
+        run: node scripts/lighthouse/ci-aggregate.mjs --envelopes
+      - name: Retrieve exact owner bundles
+        env:
+          NODE_OPTIONS: --import=${{ github.workspace }}/scripts/lighthouse/action-deadline.mjs
+          AMCORE_ACTION_DEADLINE: ${{ env.AMCORE_AGG_RETRIEVAL_END }}
+        timeout-minutes: 2
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ steps.owners.outputs.ids }}
+          path: .amcore/lighthouse-downloads/bundles
+      - name: Require validated coverage, provenance and reports
+        env:
+          NODE_OPTIONS: --import=${{ github.workspace }}/scripts/lighthouse/action-deadline.mjs
+          AMCORE_ACTION_DEADLINE: ${{ env.AMCORE_AGG_VALIDATION_END }}
+        timeout-minutes: 1
+        run: node scripts/lighthouse/ci-aggregate.mjs
+
+  promtool:
+    name: Observability contract (static)
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck]
+    env:
+      PROMETHEUS_IMAGE: prom/prometheus:v3.14.0@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
+      ALERTMANAGER_IMAGE: prom/alertmanager:v0.34.0@sha256:690c7b525f4367aa91f73e2f91c632206d32e97c6384bdbf2fb7a861b420340d
+      LOKI_IMAGE: grafana/loki:3.7.8@sha256:1107dd5274e0ada47e42472b7a7e71f3b2a2fe878878108f3e2f9e51528f0193
+      ALLOY_IMAGE: grafana/alloy:v1.20.1@sha256:2aa2099af76c0098d4af7a4d6e48f86cb66dc1a000222ad927a1c67c6542d13f
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Docker Hub mirror
+        run: bash scripts/docker-registry-mirror.sh
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Static observability-contract checks: metric-reference extraction,
+      # runbook links/anchors/panel citations, the public/private-boundary
+      # ratchet, and compose-vs-CI image consistency. Pure Node checks
+      # against the real repository — no containers. See
+      # docs/operations/observability.md -> "Observability Contract
+      # Verification".
+      - name: Observability contract (static checks)
+        run: pnpm test:observability-contract
+
+      # A fake, non-secret value standing in for the real METRICS_AUTH_TOKEN
+      # docker-compose.yml sources from a Compose secret at runtime (never
+      # committed) — docker/monitoring/prometheus/prometheus.yml's
+      # `credentials_file` reference needs some file to exist for
+      # `promtool check config` to validate the whole file, not just its
+      # syntax in isolation.
+      - name: Write a fake scrape-token file for config validation
+        run: |
+          mkdir -p "$RUNNER_TEMP/fake-secrets"
+          printf '%s' 'ci-fake-token-never-a-real-secret' > "$RUNNER_TEMP/fake-secrets/metrics_auth_token"
+
+      - name: promtool check config (the real shipped prometheus.yml + rule_files)
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/docker/monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
+            -v "$PWD/docs/operations/prometheus:/etc/prometheus/rules:ro" \
+            -v "$RUNNER_TEMP/fake-secrets/metrics_auth_token:/run/secrets/metrics_auth_token:ro" \
+            "$PROMETHEUS_IMAGE" \
+            check config /etc/prometheus/prometheus.yml
+
+      - name: promtool check rules (shipped alerts + optional burn-rate)
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/docs/operations/prometheus:/rules" \
+            "$PROMETHEUS_IMAGE" \
+            check rules /rules/amcore-alerts.yml /rules/optional/amcore-slo-burn-rate.yml /rules/optional/amcore-log-shipping.yml
+
+      - name: promtool test rules
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/docs/operations/prometheus:/rules" \
+            "$PROMETHEUS_IMAGE" \
+            test rules /rules/tests/amcore-alerts_test.yml /rules/optional/tests/amcore-slo-burn-rate_test.yml /rules/optional/tests/amcore-log-shipping_test.yml
+
+      - name: Loki and Alloy configuration (the log-search reference overlay)
+        run: |
+          docker run --rm \
+            -v "$PWD/docker/log-search/loki/loki.yml:/etc/loki/loki.yml:ro" \
+            "$LOKI_IMAGE" \
+            -config.file=/etc/loki/loki.yml -config.expand-env=true -verify-config
+          docker run --rm -e LOGS_COMPOSE_PROJECT=ci \
+            -v "$PWD/docker/log-search/alloy/config.alloy:/etc/alloy/config.alloy:ro" \
+            "$ALLOY_IMAGE" \
+            validate /etc/alloy/config.alloy
+
+      # The overlay is applied on top of the production overlay; the image variables are fake
+      # because `config` only renders and never pulls.
+      - name: Compose log-search overlay renders
+        env:
+          COMPOSE_API_IMAGE: example.invalid/api@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          COMPOSE_API_MIGRATOR_IMAGE: example.invalid/api-migrator@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          COMPOSE_WEB_IMAGE: example.invalid/web@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          LOGS_GRAFANA_ADMIN_PASSWORD: ci-fake-password-never-a-real-secret
+        run: |
+          docker compose -f docker-compose.yml -f docker/compose/prod.yml -f docker/compose/logs.yml config --quiet
+
+      - name: amtool check-config (alertmanager)
+        run: |
+          docker run --rm --entrypoint amtool \
+            -v "$PWD/docker/monitoring/alertmanager:/cfg" \
+            "$ALERTMANAGER_IMAGE" \
+            check-config /cfg/alertmanager.yml
+
+      - name: amtool check-config (the canonical email/Telegram receiver example)
+        run: |
+          docker run --rm --entrypoint amtool \
+            -v "$PWD/docker/monitoring/alertmanager:/cfg" \
+            "$ALERTMANAGER_IMAGE" \
+            check-config /cfg/tests/alertmanager.example-full.yml
+
+  observability-contract-live:
+    name: Observability contract (live)
+    runs-on: ubuntu-latest
+    needs: [promtool]
+    # Builds 3 app images from scratch, boots the full local-infra +
+    # monitoring Compose profiles, runs every live check, then a second
+    # isolated old-volume Grafana migration smoke — a reasoned bound, not a
+    # measured one (no cached layers on a fresh runner).
+    timeout-minutes: 25
+    env:
+      METRICS_AUTH_TOKEN: ci-fake-token-never-a-real-secret
+      GF_SECURITY_ADMIN_PASSWORD: ci-fake-password-never-a-real-secret
+      # Fixed, job-scoped project names (not the scripts' own PID-based
+      # defaults) so the always()-cleanup step below can name the exact
+      # projects to tear down, independent of the shell traps.
+      COMPOSE_PROJECT_NAME: obs-contract-live-${{ github.run_id }}
+      OLD_VOLUME_PROJECT_NAME: obs-contract-oldvol-${{ github.run_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Docker Hub mirror
+        run: bash scripts/docker-registry-mirror.sh
+
+      - name: Free unused SDK disk space
+        timeout-minutes: 10
+        run: bash scripts/free-runner-disk.sh
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Owns its own Compose lifecycle end to end: boots local-infra +
+      # monitoring under COMPOSE_PROJECT_NAME above, waits for real scrape
+      # targets AND at least one rule evaluation, runs every live check
+      # (targets/rules/alertmanager/metric-reference/query-evaluability/
+      # Grafana), then the isolated old-volume migration smoke under
+      # OLD_VOLUME_PROJECT_NAME — and tears both stacks down via their own
+      # shell traps.
+      - name: Observability contract (live checks + old-volume smoke)
+        run: pnpm test:observability-contract:live
+
+      # Second, independent cleanup layer: the shell traps above already
+      # tear down on every path (including this job's own failure), but a
+      # runner-level kill or an unforeseen trap bug must not leave either
+      # stack running — an `if: always()` step naming both fixed project
+      # names, not only a job timeout (which stops the job but does not run
+      # `docker compose down` itself).
+      - name: Ensure both Compose stacks are torn down
+        if: always()
+        run: |
+          docker compose -p "$COMPOSE_PROJECT_NAME" down -v --remove-orphans || true
+          docker compose -p "$OLD_VOLUME_PROJECT_NAME" down -v --remove-orphans || true
+
+  storybook:
+    name: Storybook
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck]
+    # No job in this file previously set this; added here after a real
+    # incident (2026-08-18, PR #329's first run) where `apt-get install`
+    # (invoked internally by `playwright install --with-deps`) hung on an
+    # unanswered interactive prompt — a known needrestart/Ubuntu-runner issue
+    # that ignores DEBIAN_FRONTEND on its own apt post-invoke hook — and ran
+    # until GitHub's default 6-hour job timeout killed it instead of failing
+    # fast. `web-e2e` runs the identical install command and shared this
+    # exposure until it got the same fix (timeout-minutes + env vars on its
+    # own install step).
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Stories import @amcore/shared directly (AuthErrorCode, DEFAULT_LOCALE);
+      # apps/web resolves it through its built dist, same reasoning as
+      # web-e2e's own "Build @amcore/shared" step.
+      - name: Build @amcore/shared
+        run: pnpm --filter @amcore/shared build
+
+      # A reachable but slow Azure mirror does not trigger APT's failure fallback.
+      - name: Prefer Ubuntu archive for browser dependencies
+        run: |
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i -E \
+              -e '\#^https?://azure\.archive\.ubuntu\.com/ubuntu/[[:space:]]#s/priority:[0-9]+/priority:2/' \
+              -e '\#^https://archive\.ubuntu\.com/ubuntu/[[:space:]]#s/priority:[0-9]+/priority:1/' \
+              /etc/apt/apt-mirrors.txt
+          fi
+
+      # No Docker/real-stack needed here — every story's API surface is
+      # mocked via msw-storybook-addon, not a real apps/api. Much lighter
+      # than web-e2e for that reason.
+      #
+      # DEBIAN_FRONTEND/NEEDRESTART_MODE: `--with-deps` runs `sudo apt-get
+      # install` for Chromium's system libraries. Without these, an
+      # interactive prompt (commonly needrestart's "which services to
+      # restart" dialog, which has its own known history of ignoring
+      # DEBIAN_FRONTEND=noninteractive in its apt post-invoke hook) can hang
+      # indefinitely with no TTY to answer it — confirmed live, not
+      # theoretical (see this job's timeout-minutes comment above).
+      - name: Install Playwright Chromium
+        working-directory: apps/web
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          NEEDRESTART_MODE: a
+        run: npx playwright install --with-deps chromium
+
+      # Cheap compile/broken-story smoke first — catches a decorator or
+      # import error fast, before paying for the full browser test run.
+      - name: Build Storybook
+        working-directory: apps/web
+        run: pnpm build-storybook
+
+      # The actual gate: every story as a Vitest test (smoke render + any
+      # play function), with addon-a11y's checks running inside the same
+      # run via parameters.a11y.test: 'error' (.storybook/preview.tsx).
+      - name: Run Storybook a11y/interaction tests
+        working-directory: apps/web
+        run: pnpm test:storybook

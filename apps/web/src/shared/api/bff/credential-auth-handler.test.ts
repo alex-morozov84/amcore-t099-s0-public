@@ -1,0 +1,302 @@
+// @vitest-environment node
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { z } from 'zod'
+
+import { revokeBackendSession } from './backend-session-revocation'
+import { handleCredentialAuth } from './credential-auth-handler'
+import { SessionVaultUnavailableError } from './errors'
+import { retireFlowsForOrdinaryAuth } from './invitation-auth-lifecycle'
+import { mintSession } from './mint-session'
+import { isTrustedOrigin } from './origin-guard'
+import { redisVaultStore } from './session-vault-store'
+import type * as UpstreamAuthModule from './upstream-auth'
+import { callUpstreamAuth, callUpstreamRegister, UpstreamAuthError } from './upstream-auth'
+
+vi.mock('server-only', () => ({}))
+vi.mock('./backend-session-revocation', () => ({ revokeBackendSession: vi.fn() }))
+vi.mock('./origin-guard', () => ({ isTrustedOrigin: vi.fn() }))
+vi.mock('./upstream-auth', async () => {
+  const actual = await vi.importActual<typeof UpstreamAuthModule>('./upstream-auth')
+  return { ...actual, callUpstreamAuth: vi.fn(), callUpstreamRegister: vi.fn() }
+})
+vi.mock('./invitation-auth-lifecycle', () => ({ retireFlowsForOrdinaryAuth: vi.fn() }))
+vi.mock('./session-vault-store', () => ({
+  redisVaultStore: { delete: vi.fn().mockResolvedValue(undefined) },
+}))
+vi.mock('./mint-session', () => ({ mintSession: vi.fn() }))
+
+const schema = z.object({ email: z.string(), password: z.string() })
+
+function jsonRequest(body: unknown): Request {
+  return new Request('http://next.internal/api/auth/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+describe('handleCredentialAuth', () => {
+  beforeEach(() => {
+    vi.mocked(isTrustedOrigin).mockReturnValue(true)
+  })
+
+  it('rejects an untrusted origin with 403 and an ApiErrorResponse-shaped body', async () => {
+    vi.mocked(isTrustedOrigin).mockReturnValue(false)
+
+    const response = await handleCredentialAuth(jsonRequest({ email: 'a', password: 'b' }), {
+      schema,
+      backendPath: '/auth/login',
+      successStatus: 200,
+    })
+
+    expect(response.status).toBe(403)
+    expect(callUpstreamAuth).not.toHaveBeenCalled()
+    await expect(response.json()).resolves.toMatchObject({
+      statusCode: 403,
+      errorCode: 'AUTH_ORIGIN_REJECTED',
+      path: '/api/auth/login',
+      method: 'POST',
+    })
+  })
+
+  it('rejects a body that fails schema validation with 400 and field-level errors', async () => {
+    const response = await handleCredentialAuth(jsonRequest({ email: 'a' }), {
+      schema,
+      backendPath: '/auth/login',
+      successStatus: 200,
+    })
+
+    expect(response.status).toBe(400)
+    expect(callUpstreamAuth).not.toHaveBeenCalled()
+    const body = await response.json()
+    expect(body.statusCode).toBe(400)
+    expect(body.errorCode).toBeUndefined()
+    expect(body.errors).toEqual(
+      expect.arrayContaining([expect.objectContaining({ field: 'password' })])
+    )
+  })
+
+  it('forwards the upstream error status and body verbatim', async () => {
+    const errorBody = { errorCode: 'AUTH_INVALID_CREDENTIALS', message: 'bad creds' }
+    vi.mocked(callUpstreamAuth).mockRejectedValue(new UpstreamAuthError(401, errorBody))
+
+    const response = await handleCredentialAuth(jsonRequest({ email: 'a', password: 'b' }), {
+      schema,
+      backendPath: '/auth/login',
+      successStatus: 200,
+    })
+
+    expect(response.status).toBe(401)
+    await expect(response.json()).resolves.toEqual(errorBody)
+  })
+
+  it('returns controlled503 when the upstream transport rejects a redirect', async () => {
+    vi.mocked(callUpstreamAuth).mockRejectedValueOnce(new TypeError('fetch failed'))
+    const response = await handleCredentialAuth(jsonRequest({ email: 'a', password: 'b' }), {
+      schema,
+      backendPath: '/auth/login',
+      successStatus: 200,
+    })
+    expect(response.status).toBe(503)
+    expect((await response.json()).message).toBe('Backend temporarily unavailable')
+  })
+  it('revokes with original request headers when mint fails, preserving the failure', async () => {
+    const request = jsonRequest({ email: 'a', password: 'b' })
+    request.headers.set('x-real-ip', '203.0.113.75')
+    vi.mocked(callUpstreamAuth).mockResolvedValue({
+      user: { id: 'u1' },
+      accessToken: 'at',
+      refreshToken: 'rt',
+    } as never)
+    const failure = new Error('vault unavailable')
+    vi.mocked(mintSession).mockRejectedValueOnce(failure)
+    await expect(
+      handleCredentialAuth(request, { schema, backendPath: '/auth/login', successStatus: 200 })
+    ).rejects.toBe(failure)
+    expect(revokeBackendSession).toHaveBeenCalledWith('rt', request.headers)
+  })
+  it('revokes with the same source and cleans the minted vault if invitation retirement fails', async () => {
+    const request = jsonRequest({ email: 'a', password: 'b' })
+    vi.mocked(callUpstreamAuth).mockResolvedValue({
+      user: { id: 'u1' },
+      accessToken: 'at',
+      refreshToken: 'rt',
+    } as never)
+    vi.mocked(mintSession).mockResolvedValue({ sessionId: 'session', user: { id: 'u1' } } as never)
+    const failure = new Error('retirement unavailable')
+    vi.mocked(retireFlowsForOrdinaryAuth).mockRejectedValueOnce(failure)
+    await expect(
+      handleCredentialAuth(request, { schema, backendPath: '/auth/login', successStatus: 200 })
+    ).rejects.toBe(failure)
+    expect(redisVaultStore.delete).toHaveBeenCalledWith('session')
+    expect(revokeBackendSession).toHaveBeenCalledWith('rt', request.headers)
+  })
+  it('on success, mints a session, sets the cookie, and returns only the user', async () => {
+    vi.mocked(callUpstreamAuth).mockResolvedValue({
+      user: { id: 'u1' },
+      accessToken: 'at-1',
+      refreshToken: 'rt-1',
+    } as never)
+    vi.mocked(mintSession).mockResolvedValue({ sessionId: 'sess-1', user: { id: 'u1' } } as never)
+
+    const response = await handleCredentialAuth(jsonRequest({ email: 'a', password: 'b' }), {
+      schema,
+      backendPath: '/auth/login',
+      successStatus: 200,
+    })
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({ user: { id: 'u1' } })
+    const cookie = response.cookies.get('amcore_session')
+    expect(cookie?.value).toBe('sess-1')
+    expect(cookie?.httpOnly).toBe(true)
+  })
+})
+
+describe('handleCredentialAuth — registration outcome', () => {
+  const user = { id: 'u1' }
+  const options = {
+    schema,
+    backendPath: '/auth/register',
+    successStatus: 201,
+    registration: true,
+  } as const
+  const register = (request = jsonRequest({ email: 'a', password: 'b' })) =>
+    handleCredentialAuth(request, options)
+
+  beforeEach(() => {
+    vi.resetAllMocks()
+    vi.mocked(isTrustedOrigin).mockReturnValue(true)
+    vi.mocked(redisVaultStore.delete).mockResolvedValue(undefined)
+    vi.mocked(callUpstreamRegister).mockResolvedValue({
+      outcome: 'created',
+      user,
+      accessToken: 'at',
+      refreshToken: 'rt',
+    } as never)
+  })
+
+  async function expectCreatedButNotSignedIn(response: Response) {
+    expect(response.status).toBe(503)
+    expect(response.headers.get('set-cookie')).toBeNull()
+    expect(response.headers.get('retry-after')).toBeNull()
+    const body = await response.json()
+    expect(body).toMatchObject({ statusCode: 503, errorCode: 'REGISTRATION_SIGN_IN_REQUIRED' })
+    expect(body.user).toBeUndefined()
+    expect(JSON.stringify(body)).not.toContain('rt')
+    expect(JSON.stringify(body)).not.toContain('"at"')
+  }
+
+  it('reports a created account when the vault refuses the session, revoking once', async () => {
+    const request = jsonRequest({ email: 'a', password: 'b' })
+    vi.mocked(mintSession).mockRejectedValue(new SessionVaultUnavailableError(new Error('OOM')))
+
+    await expectCreatedButNotSignedIn(await register(request))
+
+    expect(revokeBackendSession).toHaveBeenCalledTimes(1)
+    expect(revokeBackendSession).toHaveBeenCalledWith('rt', request.headers)
+    expect(retireFlowsForOrdinaryAuth).not.toHaveBeenCalled()
+  })
+
+  it('reports a created account when flow retirement fails, cleaning the minted entry', async () => {
+    vi.mocked(mintSession).mockResolvedValue({ sessionId: 'session', user } as never)
+    vi.mocked(retireFlowsForOrdinaryAuth).mockRejectedValue(new Error('retirement unavailable'))
+
+    await expectCreatedButNotSignedIn(await register())
+
+    expect(redisVaultStore.delete).toHaveBeenCalledWith('session')
+    expect(revokeBackendSession).toHaveBeenCalledTimes(1)
+  })
+
+  it('classifies an unexpected publication bug as created too, logging only a category', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    vi.mocked(mintSession).mockRejectedValue(new TypeError('cannot read properties of undefined'))
+
+    await expectCreatedButNotSignedIn(await register())
+
+    expect(JSON.stringify(log.mock.calls)).toContain('unexpected')
+    expect(JSON.stringify(log.mock.calls)).not.toContain('rt')
+    log.mockRestore()
+  })
+
+  it('reports a created account without calling revoke when there is no session cookie to revoke', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    vi.mocked(callUpstreamRegister).mockResolvedValue({
+      outcome: 'created',
+      user,
+      accessToken: 'at',
+      refreshToken: null,
+    } as never)
+
+    await expectCreatedButNotSignedIn(await register())
+
+    expect(mintSession).not.toHaveBeenCalled()
+    expect(revokeBackendSession).not.toHaveBeenCalled()
+    log.mockRestore()
+  })
+
+  it('keeps the generic failure for an unconfirmed success, revoking the cookie once', async () => {
+    const request = jsonRequest({ email: 'a', password: 'b' })
+    vi.mocked(callUpstreamRegister).mockResolvedValue({
+      outcome: 'unknown',
+      refreshToken: 'rt',
+    })
+
+    await expect(register(request)).rejects.toThrow('did not confirm creation')
+
+    expect(revokeBackendSession).toHaveBeenCalledTimes(1)
+    expect(revokeBackendSession).toHaveBeenCalledWith('rt', request.headers)
+    expect(mintSession).not.toHaveBeenCalled()
+  })
+
+  it('keeps the generic failure for an unconfirmed success with no cookie, revoking nothing', async () => {
+    vi.mocked(callUpstreamRegister).mockResolvedValue({ outcome: 'unknown', refreshToken: null })
+
+    await expect(register()).rejects.toThrow('did not confirm creation')
+
+    expect(revokeBackendSession).not.toHaveBeenCalled()
+  })
+
+  it('forwards a conflict and keeps the transport failure message', async () => {
+    vi.mocked(callUpstreamRegister).mockRejectedValueOnce(
+      new UpstreamAuthError(409, { errorCode: 'EMAIL_ALREADY_EXISTS' })
+    )
+    const conflict = await register()
+    expect(conflict.status).toBe(409)
+    await expect(conflict.json()).resolves.toEqual({ errorCode: 'EMAIL_ALREADY_EXISTS' })
+
+    vi.mocked(callUpstreamRegister).mockRejectedValueOnce(new TypeError('fetch failed'))
+    const unavailable = await register()
+    expect(unavailable.status).toBe(503)
+    expect((await unavailable.json()).message).toBe('Backend temporarily unavailable')
+  })
+
+  it('publishes a session and returns the user on success', async () => {
+    vi.mocked(mintSession).mockResolvedValue({ sessionId: 'sess-1', user } as never)
+
+    const response = await register()
+
+    expect(response.status).toBe(201)
+    await expect(response.json()).resolves.toEqual({ user })
+    expect(response.cookies.get('amcore_session')?.value).toBe('sess-1')
+  })
+
+  it('never uses the registration classification for login', async () => {
+    vi.mocked(callUpstreamAuth).mockResolvedValue({
+      user,
+      accessToken: 'at',
+      refreshToken: 'rt',
+    } as never)
+    const failure = new SessionVaultUnavailableError(new Error('OOM'))
+    vi.mocked(mintSession).mockRejectedValue(failure)
+
+    await expect(
+      handleCredentialAuth(jsonRequest({ email: 'a', password: 'b' }), {
+        schema,
+        backendPath: '/auth/login',
+        successStatus: 200,
+      })
+    ).rejects.toBe(failure)
+    expect(callUpstreamRegister).not.toHaveBeenCalled()
+  })
+})

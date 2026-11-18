@@ -1,0 +1,61 @@
+import { z } from 'zod'
+
+import { LOCALE_CATALOGUES } from '@amcore/shared'
+
+import type { WelcomeEmailData } from './email.types.js'
+import { EmailTemplate } from './email.types.js'
+
+/**
+ * Runtime validation for queued email jobs (EQS-07).
+ *
+ * BullMQ deserializes job data from Redis as untyped JSON, so the
+ * `SendEmailJobData` compile-time type is not a runtime guarantee. The
+ * The shared managed execution entry validates these schemas before rendering; a job that
+ * fails is treated as a deterministic (`UnrecoverableError`) failure and is not
+ * retried (EQS-03).
+ *
+ * Only non-secret, queueable templates are modelled — secret-bearing
+ * templates are sent directly via `EmailService.sendNow` and must never be
+ * enqueued (EQS-02). The discriminated union therefore also rejects a secret
+ * template, but the managed host's EQS-02 discard runs first by design so such a
+ * job is dropped (completed), not failed-and-retained.
+ *
+ * Kept in `apps/api` (not `packages/shared`): this is an internal worker
+ * contract, not a frontend wire contract.
+ */
+
+// A queued job is stored data: it was written under the settings of an earlier build and may
+// name a locale this build no longer serves. Accept every shipped catalogue here; the email
+// service maps a not-served locale to the default before it renders anything. Request input
+// is different and is checked against the served list (`SERVED_LOCALES`).
+const localeSchema = z.enum(LOCALE_CATALOGUES)
+
+export const welcomeEmailDataSchema = z.object({
+  name: z.string(),
+  email: z.email(),
+  locale: localeSchema.optional(),
+}) satisfies z.ZodType<WelcomeEmailData>
+
+/**
+ * Discriminated union on `template`. `z.literal(EmailTemplate.X)` keeps the
+ * inferred `template` as the enum member, so `SendEmailJobData['template']`
+ * equals `QueueableEmailTemplate`. `WELCOME` is the only queueable template today
+ * (the password-changed alert moved to the durable notifications subsystem); the
+ * union shape stays so a future queueable template is a one-line addition.
+ */
+export const sendEmailJobDataSchema = z.discriminatedUnion('template', [
+  z.object({
+    template: z.literal(EmailTemplate.WELCOME),
+    to: z.email(),
+    // Stable pseudonymous identifier: logged alongside the redacted `to` so
+    // "who missed their email" stays answerable after the job's own retention
+    // window, without a raw address in rotated logs. Optional — deserialized
+    // Redis JSON may predate this field or a future queueable template may
+    // omit it.
+    userId: z.string().optional(),
+    data: welcomeEmailDataSchema,
+  }),
+])
+
+/** BullMQ job data for sending a (non-secret) queued email. Single source of truth. */
+export type SendEmailJobData = z.infer<typeof sendEmailJobDataSchema>

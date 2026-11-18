@@ -1,0 +1,315 @@
+import { METRIC_NAMES } from './metrics.constants'
+import { MetricsService } from './metrics.service'
+
+import { EnvService } from '@/env/env.service'
+
+describe('MetricsService', () => {
+  const services: MetricsService[] = []
+
+  function makeService(): MetricsService {
+    const env = {
+      get: jest.fn((key: string) => {
+        const values: Record<string, unknown> = {
+          PROCESS_ROLE: 'web',
+          NODE_ENV: 'test',
+          METRICS_ENABLED: true,
+          APP_VERSION: '0.0.0-test',
+          APP_COMMIT: 'deadbeef',
+        }
+        return values[key]
+      }),
+    } as unknown as EnvService
+    const service = new MetricsService(env)
+    services.push(service)
+    return service
+  }
+
+  afterEach(() => {
+    jest.useRealTimers()
+    for (const service of services.splice(0)) {
+      service.onModuleDestroy()
+    }
+  })
+
+  it('uses a private registry per service instance', async () => {
+    const first = makeService()
+    const second = makeService()
+
+    first.observeHttpRequest({ method: 'GET', route: '/api/v1/health', status_code: '200' }, 0.01)
+
+    const firstMetrics = await first.metrics()
+    const secondMetrics = await second.metrics()
+
+    expect(firstMetrics).toContain(METRIC_NAMES.httpRequestsTotal)
+    expect(firstMetrics).toContain('route="/api/v1/health"')
+    expect(secondMetrics).not.toContain('route="/api/v1/health"')
+  })
+
+  it('exposes a static build_info gauge set once at construction (N6)', async () => {
+    const service = makeService()
+
+    const output = await service.metrics()
+    const line = output.split('\n').find((l) => l.startsWith(`${METRIC_NAMES.buildInfo}{`))
+    expect(line).toContain('version="0.0.0-test"')
+    expect(line).toContain('commit="deadbeef"')
+    expect(line).toContain(`node_version="${process.version}"`)
+    expect(line).toContain('role="web"')
+    expect(line?.endsWith(' 1')).toBe(true)
+  })
+
+  it('does not label the in-flight gauge by route (N1 — the route has not resolved yet)', async () => {
+    const service = makeService()
+
+    service.incHttpInFlight(service.inFlightLabels('GET'))
+
+    const output = await service.metrics()
+    const line = output
+      .split('\n')
+      .find((l) => l.startsWith(`${METRIC_NAMES.httpRequestsInFlight}{`))
+    expect(line).toContain('method="GET"')
+    expect(line).toContain('role="web"')
+    expect(line).not.toContain('route=')
+  })
+
+  it('can construct two instances in one process without duplicate registration', () => {
+    expect(() => {
+      makeService()
+      makeService()
+    }).not.toThrow()
+  })
+
+  it('increments collector errors', async () => {
+    const service = makeService()
+
+    service.incCollectorError('queue_depth')
+
+    const output = await service.metrics()
+    const line = output
+      .split('\n')
+      .find((metricLine) => metricLine.startsWith(METRIC_NAMES.metricsCollectorErrorsTotal))
+
+    expect(line).toContain('collector="queue_depth"')
+    expect(line).toContain('node_env="test"')
+    expect(line).toContain('role="web"')
+    expect(line).toContain('service="amcore-api"')
+    expect(line?.endsWith(' 1')).toBe(true)
+  })
+
+  it('registers a scrape-time gauge without exposing the registry', async () => {
+    const service = makeService()
+    let value = 3
+
+    service.registerGauge<'state'>({
+      name: 'amcore_test_connections',
+      help: 'Test connections.',
+      labelNames: ['state'],
+      collect: (gauge) => {
+        gauge.reset()
+        gauge.set({ state: 'active' }, value)
+      },
+    })
+
+    expect(await service.metrics()).toMatch(/amcore_test_connections\{[^}]*state="active"[^}]*} 3/)
+
+    value = 7
+    expect(await service.metrics()).toMatch(/amcore_test_connections\{[^}]*state="active"[^}]*} 7/)
+  })
+
+  it('returns collector fallback and counts errors', async () => {
+    const service = makeService()
+
+    const result = await service.withCollectorTimeout(
+      'queue_depth',
+      Promise.reject(new Error('redis down')),
+      []
+    )
+
+    expect(result).toEqual([])
+    expect(await service.metrics()).toContain(
+      `${METRIC_NAMES.metricsCollectorErrorsTotal}{collector="queue_depth"`
+    )
+  })
+
+  it('bounds a stalled collector with a timeout', async () => {
+    jest.useFakeTimers()
+    const service = makeService()
+
+    const pending = service.withCollectorTimeout(
+      'queue_depth',
+      new Promise<number>(() => undefined),
+      0
+    )
+    await jest.advanceTimersByTimeAsync(150)
+
+    await expect(pending).resolves.toBe(0)
+  })
+
+  it('increments bounded DB and Redis event counters', async () => {
+    const service = makeService()
+
+    service.incDbSlowQuery()
+    service.incRedisClientEvent('shared', 'error')
+    service.incRedisClientEvent('throttler', 'degraded')
+    service.incQueueEvent('email', 'job_added')
+
+    const output = await service.metrics()
+    expect(output).toContain(`${METRIC_NAMES.dbSlowQueriesTotal}{role="web"`)
+    expect(output).toContain('client="shared",event="error",role="web"')
+    expect(output).toContain('client="throttler",event="degraded",role="web"')
+    expect(output).toContain('queue="email",event="job_added",role="web"')
+  })
+
+  it('records realtime notification publish outcomes with bounded labels', async () => {
+    const service = makeService()
+
+    service.incNotificationRealtimePublish('published')
+    service.incNotificationRealtimePublish('failed')
+    service.incNotificationRealtimePublish('dropped')
+
+    const output = await service.metrics()
+    expect(output).toContain(
+      `${METRIC_NAMES.notificationRealtimePublishTotal}{outcome="published",role="web"`
+    )
+    expect(output).toContain('outcome="failed",role="web"')
+    expect(output).toContain('outcome="dropped",role="web"')
+  })
+
+  it('tracks the realtime connections gauge and bounded stream events', async () => {
+    const service = makeService()
+
+    service.incNotificationRealtimeConnections()
+    service.incNotificationRealtimeConnections()
+    service.decNotificationRealtimeConnections()
+    service.incNotificationRealtimeEvent('rejected_user')
+
+    const output = await service.metrics()
+    // 2 opened − 1 closed → gauge at 1 for this role.
+    expect(output).toContain(`${METRIC_NAMES.notificationRealtimeConnections}{role="web"`)
+    expect(output).toMatch(
+      new RegExp(`${METRIC_NAMES.notificationRealtimeConnections}\\{role="web"[^}]*\\} 1`)
+    )
+    expect(output).toContain(
+      `${METRIC_NAMES.notificationRealtimeEventsTotal}{event="rejected_user",role="web"`
+    )
+  })
+
+  it('records AI guardrail checks with only bounded stage/verdict/role labels', async () => {
+    const service = makeService()
+
+    service.incAiGuardrailCheck('input', 'flag')
+    service.incAiGuardrailCheck('input', 'block')
+    service.incAiGuardrailCheck('output', 'allow')
+
+    const output = await service.metrics()
+    expect(output).toContain(
+      `${METRIC_NAMES.aiGuardrailChecksTotal}{stage="input",verdict="flag",role="web"`
+    )
+    expect(output).toContain('stage="input",verdict="block",role="web"')
+    expect(output).toContain('stage="output",verdict="allow",role="web"')
+    // Only the three bounded labels — no category/reason/marker label ever appears.
+    const line = output
+      .split('\n')
+      .find((l) => l.startsWith(`${METRIC_NAMES.aiGuardrailChecksTotal}{stage="input"`))
+    expect(line).not.toMatch(/category=|reason=|marker=/)
+  })
+
+  it('records AI artifact uploads with only bounded kind/result/role labels', async () => {
+    const service = makeService()
+
+    service.incAiArtifactUpload('image', 'success')
+    service.incAiArtifactUpload('pdf', 'rejected')
+
+    const output = await service.metrics()
+    expect(output).toContain(
+      `${METRIC_NAMES.aiArtifactUploadsTotal}{kind="image",result="success",role="web"`
+    )
+    const line = output
+      .split('\n')
+      .find((l) => l.startsWith(`${METRIC_NAMES.aiArtifactUploadsTotal}{kind="pdf"`))
+    expect(line).toContain('result="rejected"')
+    expect(line).not.toMatch(/conversationId=|artifactId=|filename=|contentType=/)
+  })
+
+  it('records AI artifact byte resolution with only a bounded result/role label', async () => {
+    const service = makeService()
+
+    service.incAiArtifactResolution('success')
+    service.incAiArtifactResolution('storage_error')
+
+    const output = await service.metrics()
+    expect(output).toContain(
+      `${METRIC_NAMES.aiArtifactResolutionTotal}{result="success",role="web"`
+    )
+    const line = output
+      .split('\n')
+      .find((l) => l.startsWith(`${METRIC_NAMES.aiArtifactResolutionTotal}{result="storage_error"`))
+    expect(line).toBeDefined()
+    expect(line).not.toMatch(/conversationId=|artifactId=|storageKey=|contentType=/)
+  })
+
+  it('records AI tool-invocation, approval, and loop-step metrics with only bounded labels', async () => {
+    const service = makeService()
+
+    service.incAiToolInvocation('current_time', 'safe', 'succeeded')
+    service.incAiApproval('tool_invocation', 'pending')
+    service.observeAiToolLoopSteps('completed', 3)
+
+    const output = await service.metrics()
+    expect(output).toContain(
+      `${METRIC_NAMES.aiToolInvocationsTotal}{tool_id="current_time",risk_class="safe",outcome="succeeded",role="web"`
+    )
+    expect(output).toContain(
+      `${METRIC_NAMES.aiApprovalsTotal}{kind="tool_invocation",state="pending",role="web"`
+    )
+    // Histograms render default labels before observe-time labels, so match by content, not order.
+    const countLine = output
+      .split('\n')
+      .find((l) => l.startsWith(`${METRIC_NAMES.aiToolLoopSteps}_count`))
+    expect(countLine).toContain('outcome="completed"')
+    expect(countLine).toContain('role="web"')
+    expect(countLine?.endsWith(' 1')).toBe(true)
+    // No args/result/prompt or run/user id ever appears as a label.
+    const line = output
+      .split('\n')
+      .find((l) => l.startsWith(`${METRIC_NAMES.aiToolInvocationsTotal}{`))
+    expect(line).not.toMatch(/args=|result=|prompt=|run_id=|user_id=/)
+  })
+
+  it('coerces an out-of-grammar tool id to a bounded fallback label', async () => {
+    const service = makeService()
+
+    service.incAiToolInvocation('Bad-Tool-Id', 'safe', 'failed')
+
+    const output = await service.metrics()
+    expect(output).toContain('tool_id="unknown",risk_class="safe",outcome="failed",role="web"')
+    expect(output).not.toContain('tool_id="Bad-Tool-Id"')
+  })
+
+  it('records bounded cache, storage, media, and email metrics', async () => {
+    const service = makeService()
+
+    service.incCacheOperation('permissions', 'negative_hit')
+    service.observeStorageOperation('s3', 'upload', 'success', 0.25)
+    service.observeMediaOperation('avatar', 'process', 'error', 0.5)
+    service.observeEmailOperation(
+      {
+        template: 'welcome',
+        operation: 'send',
+        mode: 'worker',
+        result: 'error',
+        retryable: 'true',
+      },
+      0.75
+    )
+    service.incEmailDeadLetter('welcome', false)
+
+    const output = await service.metrics()
+    expect(output).toContain('cache="permissions",result="negative_hit",role="web"')
+    expect(output).toContain('driver="s3",operation="upload",result="success",role="web"')
+    expect(output).toContain('preset="avatar",operation="process",result="error",role="web"')
+    expect(output).toContain(
+      'template="welcome",operation="send",mode="worker",result="error",retryable="true",role="web"'
+    )
+    expect(output).toContain('template="welcome",unrecoverable="false",role="web"')
+  })
+})

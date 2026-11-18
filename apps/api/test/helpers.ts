@@ -1,0 +1,457 @@
+import type { WorkerHost } from '@nestjs/bullmq'
+import { type INestApplication, Module } from '@nestjs/common'
+import { JwtService } from '@nestjs/jwt'
+import type { NestFastifyApplication } from '@nestjs/platform-fastify'
+import type { TestingModule, TestingModuleBuilder } from '@nestjs/testing'
+import { Test } from '@nestjs/testing'
+import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql'
+import { RedisContainer, type StartedRedisContainer } from '@testcontainers/redis'
+import { execSync } from 'child_process'
+import { PinoLogger } from 'nestjs-pino'
+import { Client } from 'pg'
+
+import { createSchemaValidationPipe } from '../src/common/schemas/schema-validation'
+import { seedOrgRoles } from '../src/core/system-seed/seed-org-roles'
+import {
+  MANAGED_WORKERS,
+  type ManagedWorkerBinding,
+} from '../src/infrastructure/background-work/work-coordinator'
+import type { WorkRegistration } from '../src/infrastructure/background-work/work-definition'
+import { GcraRedisLimiter } from '../src/infrastructure/throttling'
+import { PrismaService } from '../src/prisma'
+
+import { createHttpTestApp } from './create-http-test-app'
+import { boundedPhase, cleanupE2E } from './e2e-cleanup'
+import { e2eContainerLabels } from './e2e-owned-containers'
+import { cleanupFailedE2ESetup, prepareE2EAuthEnvironment } from './e2e-setup'
+import { closeE2EWorkers } from './e2e-workers'
+import { TestRedis } from './test-redis'
+
+/**
+ * Suite-local PinoLogger stub for E2E. The original Jest ESM harness stalled
+ * during TestingModule compilation with the real logger and email/invite graph.
+ * Retain the stub while changing the test compiler; logger integration is a
+ * separate behavior. Production logging is unchanged.
+ */
+export const noopPinoLogger = {
+  setContext: () => undefined,
+  trace: () => undefined,
+  debug: () => undefined,
+  info: () => undefined,
+  warn: () => undefined,
+  error: () => undefined,
+  fatal: () => undefined,
+  assign: () => undefined,
+} as unknown as PinoLogger
+
+/**
+ * Global test context with PostgreSQL and Redis containers
+ */
+export interface E2ETestContext {
+  app: INestApplication
+  prisma: PrismaService
+  /**
+   * The context's own connection to its isolated Redis container, used for per-test
+   * cleanup and for seeding or inspecting keys. The name is historical (the application
+   * no longer has a cache layer); it is kept so the many suites that pass
+   * `context.cache` to `cleanDatabase` do not change.
+   */
+  cache: TestRedis
+  throttlerStorage: GcraRedisLimiter
+  postgresContainer: StartedPostgreSqlContainer
+  redisContainer: StartedRedisContainer
+}
+
+/**
+ * Create the extra schemas and deploy every migration to a fresh test database BEFORE the application
+ * bootstraps. The AI run migrations refuse to run while an `amcore-web|worker|all` connection exists
+ * (their maintenance-stop guard), and an application started first would be exactly that connection — so a
+ * harness must migrate first, on its own short-lived client, and only then start the app. Testcontainers
+ * databases are disposable, so there is no data-conversion race to protect here.
+ */
+export async function migrateTestDatabase(databaseUrl: string): Promise<void> {
+  const client = new Client({
+    connectionString: databaseUrl,
+    application_name: 'amcore-e2e-migrator',
+  })
+  await client.connect()
+  try {
+    for (const schema of ['core', 'fitness', 'finance', 'subscriptions']) {
+      await client.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`)
+    }
+  } finally {
+    await client.end()
+  }
+  // We pass `env` explicitly because Jest's jest-environment-node sandboxes `process.env` and child
+  // processes spawned via execSync's default inheritance do NOT see mutations made by the test.
+  // `E2E_DATABASE_URL` lets `prisma.config.ts` pick the testcontainer URL instead of the `.env` one.
+  execSync('pnpm prisma migrate deploy', {
+    stdio: 'inherit',
+    env: { ...process.env, E2E_DATABASE_URL: databaseUrl },
+  })
+}
+
+export async function setupE2ETestInfrastructure(): Promise<
+  Pick<E2ETestContext, 'postgresContainer' | 'redisContainer'>
+> {
+  prepareE2EAuthEnvironment()
+  const postgresContainer = await new PostgreSqlContainer('postgres:18-alpine')
+    .withLabels(e2eContainerLabels())
+    .withDatabase('amcore_test')
+    .withUsername('test')
+    .withPassword('test')
+    .start()
+  try {
+    const redisContainer = await new RedisContainer('redis:7-alpine')
+      .withLabels(e2eContainerLabels())
+      .start()
+    return { postgresContainer, redisContainer }
+  } catch (error) {
+    try {
+      await cleanupFailedE2ESetup([() => postgresContainer.stop({ timeout: 10_000 })])
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], 'E2E infrastructure and cleanup failed')
+    }
+    throw error
+  }
+}
+
+/**
+ * Setup E2E test environment with TestContainers
+ * - Starts PostgreSQL and Redis containers
+ * - Initializes NestJS app
+ * - Runs migrations
+ */
+/**
+ * @param configure optional hook to apply extra `.overrideProvider(...)` etc. to the testing-module
+ * builder BEFORE compile — used to inject a **test-only** provider (e.g. a SENSITIVE demo tool via the
+ * `AI_TOOLS` token) that must never exist in production DI. Production code paths are untouched.
+ */
+export interface E2ESetupOptions {
+  /** Test registrations enter the same production composition, never a parallel inventory/controller. */
+  registrations?: readonly WorkRegistration[]
+  /**
+   * Register the HTTP pieces in the order, and with the global prefix, `main.ts` uses (board guard,
+   * body parser, cookies, Helmet, CORS, `api/v1`) instead of the prefix-less default.
+   */
+  productionOrder?: boolean
+  /**
+   * Take the queue board's mount decision as a production process WITHOUT `ENABLE_BULL_BOARD` in its
+   * real environment (it is taken when its module first loads), then restore the test environment and
+   * set the flag the way a later `.env` load would, before the application itself loads.
+   */
+  productionAtImport?: { lateEnableBullBoard: string }
+}
+
+export async function setupE2ETest(
+  configure?: (builder: TestingModuleBuilder) => TestingModuleBuilder,
+  options: E2ESetupOptions = {}
+): Promise<E2ETestContext> {
+  const { postgresContainer, redisContainer } = await setupE2ETestInfrastructure()
+
+  let app: NestFastifyApplication | undefined
+  let moduleFixture: TestingModule | undefined
+  let testRedis: TestRedis | undefined
+  try {
+    // Set environment variables
+    const databaseUrl = postgresContainer.getConnectionUri()
+    const redisUrl = redisContainer.getConnectionUrl()
+
+    process.env.DATABASE_URL = databaseUrl
+    process.env.REDIS_URL = redisUrl
+    // Keep readiness e2e deterministic on developer machines where the root
+    // APFS volume may legitimately report >90% used.
+    process.env.HEALTH_DISK_THRESHOLD_PERCENT = '0.99'
+    // A single `jest --runInBand` process holds every prior suite's heap, so by the time the
+    // health suite runs the process heap can exceed the production 1–1.5GB ceiling and flake the
+    // memory_heap probe to 503. Raise the ceiling well above any e2e process — a test artifact,
+    // not a production signal (the production defaults are unchanged when this is unset).
+    process.env.HEALTH_MEMORY_HEAP_BYTES = String(8 * 1024 * 1024 * 1024)
+    // E2E_DATABASE_URL: escape hatch consumed by prisma.config.ts to defeat
+    // Prisma CLI's `.env` auto-load (which otherwise overrides DATABASE_URL back
+    // to whatever sits in .env). Not used by application code.
+    process.env.E2E_DATABASE_URL = databaseUrl
+
+    // Log test environment (suppress ESLint in tests)
+    // oxlint-disable-next-line no-console
+    console.log('🔧 Test Environment:', { databaseUrl, redisUrl })
+
+    // Dynamic import AFTER process.env is set — otherwise AppModule's
+    // ConfigModule.forRoot() evaluates at static-import time with the .env file
+    // values and ignores our testcontainer URLs. See @nestjs/config issue #245.
+    if (options.productionAtImport) {
+      // The mount decision is taken the first time its module loads. Load it as a production process
+      // without the flag would, then restore the test environment (the application's own production
+      // environment rules, TLS to the database among them, are not what this proves) and set the flag
+      // the way a later `.env` load would.
+      const previousNodeEnv = process.env.NODE_ENV
+      process.env.NODE_ENV = 'production'
+      delete process.env.ENABLE_BULL_BOARD
+      await import('../src/infrastructure/queue/dashboard/bull-board-mount-state')
+      process.env.NODE_ENV = previousNodeEnv
+      process.env.ENABLE_BULL_BOARD = options.productionAtImport.lateEnableBullBoard
+    }
+    let root
+    if (options.registrations) {
+      const { appProviders, coreImports, webImports, workerImports } =
+        await import('../src/app-imports')
+      @Module({
+        imports: [...coreImports('all', options.registrations), ...webImports, ...workerImports()],
+        providers: appProviders,
+      })
+      class ConformanceRoot {}
+      root = ConformanceRoot
+    } else root = (await import('../src/app.module')).AppModule
+
+    // Create testing module with real AppModule (no mocks!). Only PinoLogger is
+    // overridden to avoid the Jest/ESM logger bootstrap hang described above.
+    const baseBuilder = Test.createTestingModule({ imports: [root] })
+      .overrideProvider(PinoLogger)
+      .useValue(noopPinoLogger)
+    moduleFixture = await (configure ? configure(baseBuilder) : baseBuilder).compile()
+
+    // Create app instance. `rawBody: true` matches production (main.ts) so the
+    // e2e bootstrap shares one parser contract with prod, not a divergent one.
+    const prefix = options.productionOrder ? '/api/v1' : ''
+    app = await createHttpTestApp(moduleFixture, prefix, options.productionOrder)
+    if (options.productionOrder) {
+      app.enableCors({ origin: ['https://app.example.test'], credentials: true })
+      app.setGlobalPrefix('api/v1')
+    }
+    app.useGlobalPipes(createSchemaValidationPipe())
+
+    // Migrate BEFORE the app (and its database connections) exists: see `migrateTestDatabase`.
+    await migrateTestDatabase(databaseUrl)
+    await app.init()
+
+    // Get Prisma service and the context's own connection to its isolated Redis
+    const prisma = app.get(PrismaService)
+    const cache = (testRedis = await TestRedis.connect(redisContainer))
+    // GcraRedisLimiter is a plain injectable (no custom-token indirection like
+    // the old @nestjs/throttler storage needed) — the guard resolves the exact
+    // same instance via its own constructor injection.
+    const throttlerStorage = app.get(GcraRedisLimiter)
+
+    // Match supertest's IPv4 destination and keep one listener for the fixture.
+    // Its implicit listen/close cycle can deliver responses outside this server.
+    await app.listen(0, '127.0.0.1')
+
+    return { app, prisma, cache, throttlerStorage, postgresContainer, redisContainer }
+  } catch (error) {
+    try {
+      await cleanupFailedE2ESetup([
+        async () => {
+          if (app) await closeBullWorkers(app)
+        },
+        async () => {
+          if (app) await app.close()
+          else await moduleFixture?.close()
+        },
+        async () => {
+          await testRedis?.quit()
+        },
+        () => redisContainer.stop({ timeout: 10_000 }),
+        () => postgresContainer.stop({ timeout: 10_000 }),
+      ])
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], 'E2E bootstrap and cleanup failed')
+    }
+    throw error
+  }
+}
+
+/**
+ * Cleanup E2E test environment
+ * - Closes app
+ * - Disconnects Prisma
+ * - Stops containers
+ */
+export async function teardownE2ETest(context: E2ETestContext): Promise<void> {
+  await cleanupE2E([
+    { name: 'workers', run: () => closeBullWorkers(context.app), milliseconds: 10_000 },
+    { name: 'app', run: () => context.app.close(), milliseconds: 10_000 },
+    { name: 'test-redis', run: () => context.cache.quit(), milliseconds: 5_000 },
+    {
+      name: 'redis',
+      run: () => context.redisContainer.stop({ timeout: 10_000 }),
+      milliseconds: 10_000,
+    },
+    {
+      name: 'postgres',
+      run: () => context.postgresContainer.stop({ timeout: 10_000 }),
+      milliseconds: 10_000,
+    },
+    {
+      name: 'sockets',
+      run: () => new Promise((resolve) => setTimeout(resolve, 5000)),
+      milliseconds: 6000,
+    },
+  ])
+}
+
+async function closeBullWorkers(app: INestApplication): Promise<void> {
+  await closeE2EWorkers(
+    () => app.get<readonly ManagedWorkerBinding[]>(MANAGED_WORKERS, { strict: false }),
+    ({ host }) => {
+      const worker = app.get<WorkerHost>(host, { strict: false }).worker
+      return { close: () => worker.close(true) }
+    },
+    boundedPhase
+  )
+}
+
+/**
+ * Clean all tables in test database and reset Redis cache
+ */
+export async function cleanDatabase(
+  prisma: PrismaService,
+  cache: TestRedis,
+  throttlerStorage?: GcraRedisLimiter
+): Promise<void> {
+  // Delete in correct order (respecting foreign keys)
+  await prisma.supportMailAttempt.deleteMany()
+  await prisma.passwordResetToken.deleteMany()
+  await prisma.emailVerificationToken.deleteMany()
+  await prisma.session.deleteMany()
+  await prisma.oAuthAccount.deleteMany()
+  await prisma.userSettings.deleteMany()
+  // Notifications schema (children → parents; recipient FK cascades from user, but
+  // delete explicitly to match this helper's FK-order convention).
+  await prisma.notificationDeliveryAttempt.deleteMany()
+  await prisma.notificationDelivery.deleteMany()
+  await prisma.notification.deleteMany()
+  await prisma.notificationPreference.deleteMany()
+  // AI schema (Track C — ADR-054): children → parents. Usage ledger is FK-less (snapshot);
+  // conversation/run/etc cascade from user, but delete explicitly to match this helper's
+  // FK-order convention. Catalog (assistant/model/provider) is user-independent.
+  await prisma.aiUsageLedger.deleteMany()
+  await prisma.aiToolInvocation.deleteMany()
+  await prisma.aiRunStep.deleteMany()
+  await prisma.aiArtifact.deleteMany()
+  await prisma.aiApproval.deleteMany()
+  await prisma.aiMessage.deleteMany()
+  await prisma.aiRun.deleteMany({ where: { retryOfRunId: { not: null } } })
+  await prisma.aiRun.deleteMany()
+  await prisma.aiConversation.deleteMany()
+  await prisma.aiAssistant.deleteMany()
+  await prisma.aiModelPolicy.deleteMany()
+  await prisma.aiModel.deleteMany()
+  await prisma.aiProvider.deleteMany()
+  await prisma.user.deleteMany()
+
+  // Empty the context's own isolated Testcontainers Redis. This is test setup only: it
+  // goes through the connection built from that container, never through the
+  // application's Redis provider, so it cannot reach application or other suites' Redis.
+  await cache.flush()
+
+  // Scoped rate-limiter cleanup: delete only `ratelimit:v1:*` keys (never FLUSHDB).
+  if (throttlerStorage) {
+    await throttlerStorage.reset()
+  }
+}
+
+/**
+ * Clean org-related data between tests.
+ * Preserves system roles/permissions (organizationId = null).
+ * Call before cleanDatabase to respect foreign key order.
+ */
+export async function cleanOrgData(prisma: PrismaService): Promise<void> {
+  // Disposable fixtures explicitly erase completion history between independent tests.
+  await prisma.organizationProvisioning.deleteMany()
+  await prisma.organizationCreationResult.deleteMany()
+  await prisma.organizationBootstrapResult.deleteMany()
+  await prisma.permission.deleteMany({ where: { organizationId: { not: null } } })
+  await prisma.role.deleteMany({ where: { organizationId: { not: null } } })
+  await prisma.organization.deleteMany()
+}
+
+/**
+ * Attach an existing user to an existing organization with a specific role,
+ * bypassing the HTTP invite/accept flow.
+ *
+ * Tests that exercise post-membership behaviour (RBAC freshness, role
+ * removal, cross-org boundary checks, etc.) used to chain through the
+ * legacy `POST /organizations/:orgId/members/invite` endpoint, which
+ * created the membership synchronously. After OB-02 Stage C the invite
+ * route no longer auto-creates a membership — it issues a pending
+ * `OrgInvite` row that is materialized only via `POST /auth/invites/accept`.
+ * Going through that flow in setup just to attach a known user to a
+ * known org is wasteful and obscures the test intent.
+ *
+ * This helper writes `OrgMember` + `MemberRole` rows directly and bumps
+ * the org's `aclVersion`. It does NOT invalidate any permissions cache —
+ * tests that care about cache freshness should warm the cache after
+ * calling this helper (see the OA-04/OA-12 regression for the pattern).
+ */
+export async function seedOrgMember(
+  prisma: PrismaService,
+  { orgId, userId, roleId }: { orgId: string; userId: string; roleId: string }
+): Promise<{ memberId: string }> {
+  return prisma.$transaction(async (tx) => {
+    const member = await tx.orgMember.create({
+      data: { userId, organizationId: orgId },
+      select: { id: true },
+    })
+    await tx.memberRole.create({ data: { memberId: member.id, roleId } })
+    await tx.organization.update({
+      where: { id: orgId },
+      data: { aclVersion: { increment: 1 } },
+    })
+    return { memberId: member.id }
+  })
+}
+
+/**
+ * Seed system roles and permissions required for RBAC tests.
+ * Idempotent — safe to call multiple times.
+ */
+export async function seedSystemRoles(prisma: PrismaService): Promise<void> {
+  await seedOrgRoles(prisma)
+}
+
+/**
+ * Sign an access token with an arbitrary payload using the app's configured
+ * JwtService (same secret/expiry as production minting). Used by OB-06b e2e to
+ * craft a legacy token WITHOUT a `sid` claim, or a token for a password-less
+ * (OAuth-only) user, which the normal login flow cannot produce.
+ */
+export function signAccessToken(app: INestApplication, payload: Record<string, unknown>): string {
+  return app.get(JwtService, { strict: false }).sign(payload)
+}
+
+/**
+ * Boot a second WEB-role app on the SAME testcontainers as an existing E2E context,
+ * listening on an ephemeral loopback port. Real SSE needs a real socket — supertest's
+ * in-memory agent does not deliver incremental `text/event-stream` chunks (ADR-053
+ * Arc C gate). The caller must already have set DATABASE_URL/REDIS_URL (e.g. via
+ * `setupE2ETest`) so WebModule's dynamic import reads the testcontainer URLs
+ * (Gotcha #1). Tear down with `closeWebAppContext` BEFORE stopping the shared
+ * containers. Bound to 127.0.0.1 to avoid IPv6 `[::1]` fetch quirks.
+ */
+export async function startWebAppContext(
+  options: Pick<E2ESetupOptions, 'registrations'> = {}
+): Promise<{
+  app: NestFastifyApplication
+  baseUrl: string
+}> {
+  let root
+  if (options.registrations) {
+    const { appProviders, coreImports, webImports } = await import('../src/app-imports')
+    @Module({
+      imports: [...coreImports('web', options.registrations), ...webImports],
+      providers: appProviders,
+    })
+    class ConformanceWebRoot {}
+    root = ConformanceWebRoot
+  } else root = (await import('../src/web.module')).WebModule
+  const moduleFixture: TestingModule = await Test.createTestingModule({ imports: [root] })
+    .overrideProvider(PinoLogger)
+    .useValue(noopPinoLogger)
+    .compile()
+  const app = await createHttpTestApp(moduleFixture, '')
+  app.useGlobalPipes(createSchemaValidationPipe())
+  await app.init()
+  await app.listen(0, '127.0.0.1')
+  const address = app.getHttpServer().address() as { port: number }
+  return { app, baseUrl: `http://127.0.0.1:${address.port}` }
+}

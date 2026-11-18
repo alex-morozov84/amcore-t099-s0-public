@@ -1,0 +1,30 @@
+import { defineConfig, devices } from '@playwright/test'
+
+import { activeTarget, outputPaths, testOptions } from './e2e/support/managed-target.mjs'
+
+export default defineConfig({
+  ...outputPaths(),
+  testDir:
+    activeTarget().fixtureProfile === 'organization-provisioning'
+      ? './e2e/organization-provisioning'
+      : activeTarget().fixtureProfile === 'organization-setup'
+        ? './e2e/organization-setup'
+        : './e2e/console-real-stack',
+  ...(activeTarget().fixtureProfile === 'organization-setup'
+    ? { testMatch: '**/console-organization-setup.spec.ts' }
+    : {}),
+  fullyParallel: false,
+  // Fixture writes include live ownership/marker checks; browser assertions keep their own limits.
+  timeout: 120_000,
+  forbidOnly: !!process.env.CI,
+  // Initial setup commits once; a retry requires a fresh managed database and Redis.
+  retries: activeTarget().fixtureProfile === 'organization-setup' ? 0 : process.env.CI ? 1 : 0,
+  workers: 1,
+  use: {
+    ...testOptions(),
+    trace: 'off',
+    screenshot: 'off',
+    serviceWorkers: 'block',
+  },
+  projects: [{ name: 'console-real-stack', use: { ...devices['Desktop Chrome'] } }],
+})

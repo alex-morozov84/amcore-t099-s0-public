@@ -1,0 +1,121 @@
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { test } from 'node:test'
+import { parse } from 'yaml'
+import { admitSource } from '../stand/snapshot.mjs'
+
+const ci = parse(readFileSync('.github/workflows/ci.yml', 'utf8'))
+const steps = ci.jobs['docker-image-smoke'].steps
+
+test('runner scan remains unchanged while migrator gets independent coverage', () => {
+  const runner = steps.find((step) => step.name === 'Scan the built runner image with Trivy')
+  assert.equal(
+    runner.run,
+    'trivy image \\\n  --severity HIGH,CRITICAL \\\n  --ignore-unfixed \\\n  --format sarif \\\n  --output trivy-results.sarif \\\n  "$AMCORE_API_IMAGE"\n'
+  )
+  assert.equal(
+    steps.find((step) => step.name === 'Upload Trivy SARIF').with.category,
+    'trivy-image'
+  )
+  const migrator = steps.find((step) => step.name === 'Scan the built migrator image with Trivy')
+  assert.match(migrator.run, /scan-migrator-image\.mjs/)
+  assert.equal(migrator['continue-on-error'], undefined)
+  const runnerUpload = steps.findIndex((step) => step.name === 'Upload Trivy SARIF')
+  assert.equal(runnerUpload, steps.indexOf(runner) + 1)
+  assert.ok(runnerUpload < steps.indexOf(migrator))
+  assert.equal(steps[runnerUpload]['continue-on-error'], undefined)
+  assert.equal(
+    steps.find((step) => step.name === 'Upload migrator Trivy SARIF').with.category,
+    'trivy-image-migrator'
+  )
+  assert.ok(ci.jobs['docker-image-smoke'].needs.includes('lint'))
+  assert.match(
+    ci.jobs.lint.steps.find((step) => step.name === 'Run ESLint').run,
+    /migrator-contract\.mjs/
+  )
+})
+
+test('the shared root updater covers the migrator without a second npm entry', () => {
+  const updates = parse(readFileSync('.github/dependabot.yml', 'utf8')).updates
+  const npm = updates.filter((item) => item['package-ecosystem'] === 'npm')
+  assert.deepEqual(
+    npm.map((item) => item.directory),
+    ['/']
+  )
+  assert.equal(npm[0].schedule.interval, 'cron')
+  assert.equal(npm[0].schedule.cronjob, '0 6 * * 1,4')
+  assert.equal(npm[0].cooldown['default-days'], 3)
+  assert.ok(
+    npm[0].ignore.some((item) => item['update-types']?.includes('version-update:semver-major'))
+  )
+  const workspace = parse(readFileSync('pnpm-workspace.yaml', 'utf8'))
+  assert.ok(workspace.packages.includes('docker/migrator'))
+})
+
+test('migrator files survive managed snapshots', () => {
+  for (const path of [
+    'docker/migrator/package.json',
+    'pnpm-lock.yaml',
+    'pnpm-workspace.yaml',
+    'docker/migrator/prisma.config.mjs',
+    'docker/migrator/connection-options.mjs',
+    'docker/migrator/check-connection.sql',
+  ]) {
+    assert.equal(admitSource(path), true, path)
+  }
+})
+
+test('native hosted image admission runs the cancellation harness without authoring hooks', () => {
+  const setup = steps.find((step) => step.name === 'Install migration verification dependencies')
+  assert.match(setup.run, /--filter api .*--frozen-lockfile --ignore-scripts/)
+  const admission = steps.find((step) => step.name === 'Verify native migration cancellation')
+  assert.match(admission.run, /verify-migrator-lifecycle\.mjs/)
+  assert.equal(admission['continue-on-error'], undefined)
+  const cleanup = steps.find((step) => step.name === 'Recover migration verification resources')
+  assert.equal(cleanup.if, 'always()')
+  assert.match(cleanup.run, /cleanup-migrator-lifecycle\.mjs "\$AMCORE_MIGRATOR_LIFECYCLE_JOURNAL"/)
+  assert.equal(cleanup['continue-on-error'], undefined)
+  assert.equal(
+    admission.env.AMCORE_MIGRATOR_LIFECYCLE_JOURNAL,
+    '${{ runner.temp }}/migrator-lifecycle.json'
+  )
+  assert.equal(
+    cleanup.env.AMCORE_MIGRATOR_LIFECYCLE_JOURNAL,
+    admission.env.AMCORE_MIGRATOR_LIFECYCLE_JOURNAL
+  )
+  assert.equal(ci.jobs['docker-image-smoke'].env.AMCORE_MIGRATOR_LIFECYCLE_JOURNAL, undefined)
+  assert.equal(ci.jobs['docker-image-smoke']['runs-on'], 'ubuntu-latest')
+})
+
+test('hosted operations and failure controls preserve independent recovery', () => {
+  const operations = steps.find((s) => s.name === 'Verify native migration operations')
+  assert.match(operations.run, /verify-migrator-operations\.mjs/)
+  assert.equal(operations['continue-on-error'], undefined)
+  const cleanup = steps.find((s) => s.name === 'Recover migration operations and control resources')
+  assert.equal(cleanup.if, 'always()')
+  assert.equal(cleanup['continue-on-error'], undefined)
+  for (const mode of ['network', 'interrupt', 'negative', 'advisory']) {
+    const control = steps.find((s) => s.run?.endsWith(` ${mode}`))
+    assert.match(control.run, /verify-migrator-controls\.mjs/)
+    assert.equal(control['continue-on-error'], undefined)
+    const journal = control.env.AMCORE_MIGRATOR_LIFECYCLE_JOURNAL.split('/').at(-1)
+    if (mode === 'interrupt') {
+      for (const signal of ['sigterm', 'sigint', 'sigkill'])
+        assert.ok(cleanup.run.includes(`${journal}.${signal}`))
+    } else assert.ok(cleanup.run.includes(journal.replace(/\.json$/, '')))
+  }
+  for (const name of [
+    'Verify database and local-file archive recovery',
+    'Verify load migration TLS trust and configuration',
+  ]) {
+    const step = steps.find((s) => s.name === name)
+    assert.ok(step)
+    assert.equal(step['continue-on-error'], undefined)
+    const journal = step.env.AMCORE_MIGRATOR_LIFECYCLE_JOURNAL.split('/')
+      .at(-1)
+      .replace(/\.json$/, '')
+    assert.ok(cleanup.run.includes(journal))
+  }
+  assert.match(cleanup.run, /\|\| cleanup_status=1/)
+  assert.match(cleanup.run, /exit "\$cleanup_status"/)
+})

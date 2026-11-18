@@ -1,0 +1,25 @@
+packages:
+  - 'apps/*'
+  - 'packages/*'
+  - 'docker/migrator'
+minimumReleaseAge: 1440
+minimumReleaseAgeStrict: true
+minimumReleaseAgeIgnoreMissingTime: false
+allowBuilds:
+  '@nestjs/core': true
+  '@parcel/watcher': true
+  '@prisma/engines': true
+  '@scarf/scarf': true
+  '@swc/core': true
+  argon2: true
+  cpu-features: true
+  esbuild: true
+  msgpackr-extract: true
+  msw: true
+  prisma: true
+  protobufjs: true
+  sharp: true
+  ssh2: true
+  unrs-resolver: true
+patchedDependencies:
+  next@16.4.5: patches/next@16.4.5.patch

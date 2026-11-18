@@ -1,0 +1,287 @@
+import { admitInvocation, endInvocation } from './invocation.mjs'
+import { previewLabels } from './preview-labels.mjs'
+import { createRequire } from 'node:module'
+import { join } from 'node:path'
+import { mkdir } from 'node:fs/promises'
+import { cleanEnvironment } from './process.mjs'
+import { sql } from './ownership.mjs'
+import { relay } from './relay.mjs'
+import { save } from './state.mjs'
+import { fixtureAccounts } from './fixture-accounts.mjs'
+import { operatorSignIn, prepareOperatorMfa } from './operator-mfa.mjs'
+import {
+  organizationRolesAddresses,
+  organizationRolesFixture,
+} from './organization-roles-fixture.mjs'
+
+export async function preview(m, profile = 'default') {
+  const profiles = [
+    'default',
+    'client-ip',
+    'account-mfa-ui',
+    'user',
+    'organization',
+    'organization-roles',
+    'organization-creation',
+    'member-api-keys',
+    'product-admin-three-host',
+    'product-admin-console-path',
+  ]
+  if (profile === 'account-mfa-ui' && (m.purpose !== 'preview' || m.fixtureProfile !== profile))
+    throw new Error('Account MFA UI needs its own managed preview profile')
+  profiles.push('notification-work')
+  if (profile === 'notification-work' && m.fixtureProfile !== profile)
+    throw new Error('Notification work preview needs a fresh stand created with this profile')
+  profiles.push(
+    'ai-run-control',
+    'scheduled-jobs',
+    'integrations',
+    'login-diagnostics',
+    'support-mail'
+  )
+  if (
+    ['login-diagnostics', 'support-mail'].includes(profile) &&
+    (!m.consoleEnabled || m.purpose !== 'preview' || m.fixtureProfile !== profile)
+  )
+    throw new Error('Login diagnostics needs a fresh enabled-Console stand with this profile')
+  profiles.push('organization-establishment')
+  if (
+    profile === 'organization-establishment' &&
+    (!m.consoleEnabled || m.fixtureProfile !== profile || m.purpose !== 'preview')
+  )
+    throw new Error('Initial setup preview needs a fresh enabled-Console stand with this profile')
+  if (!profiles.includes(profile)) throw new Error('Unknown fixture profile')
+  await admitInvocation(m)
+  const labels = await previewLabels(m)
+  const require = createRequire(join(m.worktree, 'apps/web/package.json'))
+  const { chromium, request } = require('@playwright/test')
+  const { SERVED_LOCALES } = require('@amcore/shared')
+  const tmp = `${m.worktree}/.amcore/stands/${m.id}/tmp`
+  await mkdir(tmp, { recursive: true, mode: 0o700 })
+  const proxy = await relay(
+    Object.values(m.origins),
+    profile === 'client-ip' ? { origin: m.origins.product, visitorIp: '203.0.113.75' } : undefined
+  )
+  let api, browser
+  try {
+    api = await request.newContext({
+      baseURL: m.origins.api,
+      proxy: { server: proxy.url },
+      ignoreHTTPSErrors: m.topology === 'host',
+    })
+    browser = await chromium.launch({
+      proxy: { server: proxy.url },
+      env: cleanEnvironment({ TMPDIR: tmp }),
+      args: ['--proxy-bypass-list=<-loopback>'],
+    })
+    // The disposable database gets the operator MFA protocol before any account signs in.
+    await prepareOperatorMfa(m)
+    // UI simulation needs only USER; prepared protocol must refuse operator login.
+    await fixtureAccounts(m, api, profile === 'account-mfa-ui' ? 'user' : profile)
+    const accounts = m.accounts.filter(
+      (account) => profile !== 'account-mfa-ui' || account.role === 'USER'
+    )
+    if (profile === 'organization-establishment') {
+      const { executeSetupCommand } = await import('./setup-command.mjs')
+      const probes = await executeSetupCommand(m, { command: 'diagnostics' })
+      if (
+        probes.invalid.exit !== 2 ||
+        probes.invalid.output.status !== 'invalid_input' ||
+        probes.unavailable.exit !== 4 ||
+        probes.unavailable.output.status !== 'SETUP_UNCONFIRMED'
+      )
+        throw new Error('Compiled runner recovery diagnostics failed')
+      const recipient = m.accounts.find((account) => account.role === 'USER')
+      if (!recipient) throw new Error('Initial setup preview recipient missing')
+      if (m.establishmentPreviewRecipient && m.establishmentPreviewRecipient !== recipient.id)
+        throw new Error('Initial setup preview recipient changed')
+      if (!m.establishmentPreviewRecipient) {
+        // Demo-only mailbox substitute. Real rendered-mail proof belongs to the isolated E2E fixture.
+        await sql(
+          m,
+          'UPDATE core.users SET "emailVerified" = true WHERE id = :\'id\' AND "emailCanonical" = :\'email\';',
+          { id: recipient.id, email: recipient.email }
+        )
+        m.establishmentPreviewRecipient = recipient.id
+        await save(m)
+      }
+    }
+    if (profile === 'organization') {
+      const { organizationFixture } = await import('./organization-fixture.mjs')
+      await organizationFixture(m, api)
+    }
+    if (
+      ['organization-roles', 'product-admin-three-host', 'product-admin-console-path'].includes(
+        profile
+      )
+    )
+      await organizationRolesFixture(m, api)
+    if (profile === 'member-api-keys') {
+      const { memberApiKeysFixture } = await import('./member-api-keys-fixture.mjs')
+      await memberApiKeysFixture(m, api)
+    }
+    if (profile === 'notification-work') {
+      const { notificationWorkFixture } = await import('./notification-work-fixture.mjs')
+      await notificationWorkFixture(m)
+    }
+    if (profile === 'ai-run-control') {
+      const { aiRunControlFixture } = await import('./ai-run-control-fixture.mjs')
+      await aiRunControlFixture(m, api)
+    }
+    if (profile === 'scheduled-jobs') {
+      const { scheduledJobsFixture } = await import('./scheduled-jobs-fixture.mjs')
+      await scheduledJobsFixture(m)
+    }
+    if (profile === 'integrations') {
+      const { integrationsFixture } = await import('./integrations-fixture.mjs')
+      await integrationsFixture(m)
+    }
+    if (profile === 'login-diagnostics') {
+      const { loginDiagnosticsFixture } = await import('./login-diagnostics-fixture.mjs')
+      await loginDiagnosticsFixture(m)
+    }
+    if (profile === 'support-mail') {
+      const { supportMailFixture, supportMailFeedbackFixture } =
+        await import('./support-mail-fixture.mjs')
+      await supportMailFixture(m)
+      await supportMailFeedbackFixture(m)
+    }
+    if (profile === 'client-ip') {
+      const { clientIpPreview } = await import('./client-ip-fixture.mjs')
+      const context = await browser.newContext({ baseURL: m.origins.product })
+      try {
+        await clientIpPreview(await context.newPage(), m, m.accounts[0], labels)
+      } finally {
+        await context.close()
+      }
+    }
+    for (const account of accounts) {
+      const existing = await sql(
+        m,
+        `SELECT id || ':' || "systemRole" FROM core.users WHERE "emailCanonical" = :'email';`,
+        { email: account.email }
+      )
+      if (existing.trim() !== `${account.id}:${account.role}`)
+        throw new Error('Preview account changed; refusing silent reset')
+      const context = await browser.newContext({
+        baseURL: m.origins.product,
+        ignoreHTTPSErrors: m.topology === 'host',
+      })
+      try {
+        const page = await context.newPage()
+        if (m.operatorMfa && account.role === 'SUPER_ADMIN')
+          await operatorSignIn(page, m, account, labels)
+        else {
+          await page.goto(`${m.localePrefix}/login`)
+          await page.getByLabel(labels.product.email, { exact: true }).fill(account.email)
+          await page.getByLabel(labels.product.password, { exact: true }).fill(account.password)
+          await page.getByRole('button', { name: labels.product.submit, exact: true }).click()
+          await page.waitForURL(
+            (url) =>
+              url.origin === m.origins.product &&
+              (m.localePrefix
+                ? SERVED_LOCALES.some((locale) => url.pathname === `/${locale}`)
+                : url.pathname === '/')
+          )
+        }
+        if (profile === 'organization-creation' && account.role === 'USER') {
+          await page.goto(`${m.localePrefix}/organizations?view=list`)
+          await page
+            .getByRole('heading', { name: labels.product.creationTitle, exact: true })
+            .waitFor()
+          await page.getByRole('button', { name: labels.product.create, exact: true }).click()
+          await page.getByLabel(labels.product.organizationName, { exact: true }).waitFor()
+          await page.screenshot({
+            path: `${m.worktree}/.amcore/stands/${m.id}/preview-create-form.png`,
+          })
+          await page
+            .getByRole('button', { name: labels.product.cancelCreation, exact: true })
+            .click()
+        }
+        if (account.role === 'SUPER_ADMIN') {
+          await page.goto(
+            m.origins.console
+              ? `${m.origins.console}${m.localePrefix}`
+              : `${m.localePrefix}/${m.consoleSlug}`
+          )
+          // Host-mode needs its own login cookie; product auth is not Console auth.
+          if (page.url().includes('/login')) {
+            await page.getByLabel(labels.console.email, { exact: true }).fill(account.email)
+            await page.getByLabel(labels.console.password, { exact: true }).fill(account.password)
+            await page.getByRole('button', { name: labels.console.submit, exact: true }).click()
+            await page.waitForURL(`${m.origins.console}${m.localePrefix}`)
+          }
+          if (page.url().includes('/login')) throw new Error('Admin preview access not proved')
+          if (profile === 'organization-establishment') {
+            const base = m.origins.console
+              ? `${m.origins.console}${m.localePrefix}`
+              : `${m.localePrefix}/${m.consoleSlug}`
+            await page.goto(`${base}/organizations`)
+            await page
+              .getByRole('heading', { name: labels.console.setupTitle, exact: true })
+              .waitFor()
+            const states = labels.console.setupStates.map((text) =>
+              text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            )
+            await page
+              .getByRole('status')
+              .filter({ hasText: new RegExp(`^(?:${states.join('|')})$`) })
+              .or(page.getByRole('heading', { name: labels.console.setupFirstStep, exact: true }))
+              .or(page.getByRole('heading', { name: new RegExp(`^(?:${states.join('|')})$`) }))
+              .waitFor()
+          }
+          if (profile === 'notification-work') {
+            const { notificationWorkPreview } = await import('./notification-work-fixture.mjs')
+            await notificationWorkPreview(page, m, SERVED_LOCALES)
+          }
+          if (profile === 'support-mail') {
+            const { supportMailPreview } = await import('./support-mail-preview.mjs')
+            await supportMailPreview(page, m, SERVED_LOCALES)
+          }
+          if (profile === 'ai-run-control') {
+            const { aiRunControlPreview } = await import('./ai-run-control-fixture.mjs')
+            await aiRunControlPreview(page, m)
+          }
+        }
+        if (profile === 'account-mfa-ui' && account.role === 'USER') {
+          const { accountMfaPreview } = await import('./account-mfa-preview.mjs')
+          await accountMfaPreview(page, m)
+        }
+        await page.screenshot({
+          path: `${m.worktree}/.amcore/stands/${m.id}/preview-${account.role}.png`,
+        })
+      } finally {
+        await context.close()
+      }
+    }
+    m.state = 'preview-verified'
+    await save(m)
+    console.log(
+      `Stand: ${m.id}\nBranch: ${m.branch}\nSource: ${m.sourceHash}\nURL: ${m.origins.product}${m.localePrefix}`
+    )
+    for (const a of accounts) console.log(`${a.role}: ${a.email}\nPassword: ${a.password}`)
+    if (
+      ['organization-roles', 'product-admin-three-host', 'product-admin-console-path'].includes(
+        profile
+      )
+    )
+      for (const line of organizationRolesAddresses(
+        m,
+        m.localePrefix,
+        m.origins.staff ?? m.origins.product
+      ))
+        console.log(line)
+    if (profile === 'member-api-keys')
+      console.log(
+        `Members: ${m.origins.product}${m.localePrefix}/organizations/${m.organization.id}/members`
+      )
+    let scenario = 'login, inspect current changes'
+    if (profile !== 'account-mfa-ui') scenario += ' and Console access'
+    console.log(`Scenario: ${scenario}. Stop: pnpm stand down --id ${m.id}`)
+  } finally {
+    endInvocation(m)
+    if (browser) await browser.close()
+    if (api) await api.dispose()
+    await proxy.close()
+  }
+}

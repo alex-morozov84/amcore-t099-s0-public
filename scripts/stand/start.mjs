@@ -1,0 +1,94 @@
+import { assertSettings } from './settings-policy.mjs'
+import { isOrganizationMailFixture } from './organization-setup-fixture.mjs'
+import { initializeMarker } from './bootstrap-marker.mjs'
+import { writeFile } from 'node:fs/promises'
+import { compose, docker, inspect } from './docker.mjs'
+import { configuration, builtServices } from './config.mjs'
+import { dataAdmission, cleanup } from './ownership.mjs'
+import { runBuild } from './build-intent.mjs'
+import { save } from './state.mjs'
+import { pullWithRetry } from './registry-pull.mjs'
+
+// The stand purges itself after a failed start, which removes the containers and
+// their logs. Print a bounded tail first so an unhealthy service can be diagnosed.
+async function reportUnhealthyServices(m, services) {
+  try {
+    const logs = await compose(m, ['logs', '--no-color', '--tail', '80', ...services], {
+      capture: true,
+    })
+    process.stderr.write(`Application services did not become healthy. Last log lines:\n${logs}\n`)
+  } catch (error) {
+    process.stderr.write(`Could not read service logs: ${error.message}\n`)
+  }
+}
+
+export async function start(m) {
+  await assertSettings(m)
+  // A changed source rebuild must not admit previous application image IDs.
+  // Preserve only the already-owned volumes, then recreate the local services.
+  if (!m.images && m.resources?.container?.length) await cleanup(m, false)
+  await configuration(m)
+  m.state = 'configured'
+  await save(m)
+  await pullWithRetry(() => compose(m, ['pull', '--quiet', 'postgres', 'redis'], { capture: true }))
+  await compose(m, ['up', '-d', '--wait', '--no-deps', 'postgres', 'redis'])
+  if (m.fixtureProfile === 'client-ip') {
+    const { clientIpPeer } = await import('./client-ip-fixture.mjs')
+    await clientIpPeer(m)
+    await configuration(m)
+  }
+  await initializeMarker(m)
+  m.markerInitialized = true
+  m.state = 'infrastructure-ready'
+  await save(m)
+  if (!m.images) {
+    // Intent is persisted before the build; only a successful return of `compose build`
+    // settles it, and an unresolved earlier attempt blocks starting another.
+    await runBuild(m, () => compose(m, ['build', ...builtServices]))
+    m.images = {}
+    for (const service of builtServices) {
+      m.images[service] = JSON.parse(
+        await docker(m, ['image', 'inspect', `${m.project}-${service}`], { capture: true })
+      )[0].Id
+    }
+    await save(m)
+  }
+  await dataAdmission(m)
+  await compose(m, ['up', '--no-deps', '--exit-code-from', 'migrate', 'migrate'])
+  await dataAdmission(m)
+  if (!m.catalogInitialized) await compose(m, ['run', '--rm', '--no-deps', 'seed'])
+  m.catalogInitialized = true
+  await save(m)
+  await dataAdmission(m)
+  m.state = 'migrated'
+  await save(m)
+  if (m.fixtureProfile === 'notification-work')
+    await compose(m, ['up', '-d', '--wait', '--no-deps', 'notification-provider'])
+  if (isOrganizationMailFixture(m))
+    await compose(m, ['up', '-d', '--wait', '--no-deps', 'mail-capture'])
+  if (m.fixtureProfile === 'console-summary')
+    await compose(m, ['up', '-d', '--no-deps', 'summary-source', 'summary-grafana'])
+  const applicationServices = ['api', 'worker', 'web', ...(m.topology === 'host' ? ['caddy'] : [])]
+  try {
+    await compose(m, ['up', '-d', '--wait', '--no-deps', ...applicationServices])
+  } catch (error) {
+    await reportUnhealthyServices(m, applicationServices)
+    throw error
+  }
+  await dataAdmission(m)
+  if (m.topology === 'host') {
+    for (const id of m.resources.container) {
+      const c = await inspect(m, 'container', id)
+      if (c.Config.Labels['com.docker.compose.service'] !== 'caddy') continue
+      m.caFile = `${m.worktree}/.amcore/stands/${m.id}/root.crt`
+      const cert = await docker(
+        m,
+        ['exec', id, 'cat', '/data/caddy/pki/authorities/local/root.crt'],
+        { capture: true }
+      )
+      await writeFile(m.caFile, cert, { mode: 0o600 })
+    }
+  }
+  m.state = 'app-ready'
+  await save(m)
+}

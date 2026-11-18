@@ -1,0 +1,354 @@
+# Persistent Audit Log
+
+AMCore persists a durable audit trail for privileged actions in
+`core.audit_log`.
+
+This is an application-level semantic audit log. It records "who did what" at
+service boundaries such as admin role changes, invite flows, API key changes,
+and privileged session step-up.
+
+## Captured Actions
+
+Actions are a **closed, code-owned taxonomy**. Every action is a dotted
+`area.event` string in the `AUDIT_ACTIONS` tuple, which is the single source of
+truth and the `AuditAction` type — the recorder only accepts values from it:
+
+- source: [`shared/constants/audit-actions.ts`](../../packages/shared/src/constants/audit-actions.ts)
+- per-action metadata allowlist: [`core/audit/audit-log.metadata.ts`](../../apps/api/src/core/audit/audit-log.metadata.ts)
+
+The current areas are `admin.*` (privileged maintenance and user administration),
+`auth.*` (session step-up), `api_key.*`, `org.*` (invite lifecycle), `ai.*`
+(approval, tool, assistant-registry, and conversation-control events), and
+`telegram.*` (connection linking), and `background_work.*` (administrative
+work control and uncertainty disposition). Read the source file for the exact set rather
+than relying on a list here — see [Add an audited action](#add-an-audited-action)
+to extend it.
+
+The originating runtime Pino event name is preserved separately as
+`metadata.pinoEvent`.
+
+## Row Shape
+
+Each row stores:
+
+- `id`, `createdAt`
+- `cursorKey` (internal random UUID used only to resume private browsing cursors)
+- `actorType`, `actorId`
+- `action`
+- `targetType`, `targetId`
+- `organizationId`
+- `requestId`, `ip`
+- `category`
+- `metadata`
+
+Important data-model choices:
+
+- `actorId`, `targetId`, and `organizationId` have no foreign keys.
+- This is intentional so the audit trail survives hard-delete flows (a deleted
+  user or org must not cascade away its audit history).
+- `metadata` is allowlist-driven per action, not arbitrary caller JSON.
+- AI tool/approval targets use `AI_TOOL_INVOCATION` and `AI_APPROVAL`.
+
+Runtime setting changes use `admin.runtime_setting.changed` and target
+`RUNTIME_SETTING` / `storage_probe`. The setting revision and safe before/after
+interval projection commit atomically with the setting. A matching no-op adds no
+change event; a stale revision still conflicts. Reset is recorded as a null
+interval projection and a new revision. No arbitrary setting values or secrets
+are logged. The bounded read summary exposes interval and revision changes.
+
+Background-work requests record a bounded operator reason (up to250 characters
+and1024 UTF-8 bytes), command/work IDs, operation and target count. Each outcome
+records task identity and administrative result; newly written outcomes also
+retain the operator reason. These writes use the existing strict control
+transaction. The read API exposes a closed `commandDetails` projection for these
+events, never the entire metadata object. Missing historical fields stay absent.
+Do not enter secrets or personal task content in the reason.
+
+## Sensitive Data Rules
+
+Audit rows must not contain:
+
+- raw email addresses
+- passwords
+- reset or invite tokens
+- API key secrets, hashes, or salts
+- prompt text, provider bodies, tool arguments, tool results, or approval reason
+  text
+- other credential material
+
+Recipient identifiers use `emailHash` when email identity is needed.
+
+AI tool/approval metadata is content-free and limited to bounded identifiers or
+codes such as `toolId`, `riskClass`, `invocationId`, `approvalId`, `runId`,
+`decision`, `reasonCode`, and `outcome`.
+
+## Write Modes
+
+AMCore writes audit rows one of three ways:
+
+- **In-transaction** (`{ tx }`) for privileged DB mutations. If the audit insert
+  fails, the main mutation rolls back too.
+- **Best-effort** (the non-transactional default) for post-commit or side-effect
+  events. If the audit insert fails, the completed action still succeeds and the
+  failure is logged.
+- **Strict fail-closed** (`{ failOpen: false }`, non-transactional) when the row
+  must be durable _before_ the caller proceeds — privileged-read accountability,
+  where a failed write propagates so the caller aborts rather than serving the
+  resource un-audited.
+
+Current examples:
+
+- In-transaction: admin system-role change, invite create/accept/revoke, API key
+  create/revoke, AI approval lifecycle events (`ai.approval.requested`,
+  `ai.approval.approved`, `ai.approval.rejected`, `ai.approval.expired`).
+- Best-effort: admin cleanup, admin session revocation, step-up
+  success/failure, AI tool execution events (`ai.tool.invoked`,
+  `ai.tool.execution_failed`).
+
+## Background-work control
+
+The common backend control API records `background_work.command_intent`,
+`command_outcome`, `command_denied`, `command_resolution` and
+`evidence_resolution`. Intent and reservations commit with strict audit before a
+broker command can run. Outcome finalization records the observed administrative
+result; an unknown result never authorizes redispatch. Database-owned adapters
+commit business mutation, receipt and strict outcome audit in the same transaction.
+
+An ordinary idempotent handler may replay its business operation before an
+administrative receipt finalizes. Its business deduplication authority remains
+responsible for returning the same result; the audit receipt is not execution
+proof. Provider-window work keeps independent safety evidence and uncertainty
+rather than treating queue history or operator acknowledgement as success.
+
+Control metadata permits bounded identities, revisions, outcome codes, counts,
+snapshot digests and up to three evidence-reference IDs. Operator reasons are a
+closed exception to the usual content-free metadata rule: at most250 characters,
+for an operational explanation only. Never put addresses, credentials, payloads,
+provider responses or other sensitive data in a reason or evidence-reference ID.
+Repeated denied actions share a finite actor/work audit-suppression slot for60
+seconds. Known receipt history can expire after30 days; audit history has its own
+retention policy. Protected unknown rows are retained, including after disposition.
+See [registration and retained uncertainty](../backend/background-work.md) for the
+transaction contract, numerical quotas and recovery limits.
+
+## Add an audited action
+
+Recording a new privileged action is three steps plus a write-mode choice.
+
+**1. Add the action** to `AUDIT_ACTIONS` in
+[`shared/constants/audit-actions.ts`](../../packages/shared/src/constants/audit-actions.ts) as a
+dotted `area.event` string. It joins the closed `AuditAction` union, so every
+call site is type-checked against it.
+
+**2. Declare its metadata allowlist** in the `specs` map in
+[`audit-log.metadata.ts`](../../apps/api/src/core/audit/audit-log.metadata.ts).
+Metadata is **allowlist-driven, not arbitrary caller JSON** — any field not in
+the spec is dropped before the row is written. Each field is one of: `true`
+(pass a primitive through), `'string[]'` / `'number[]'`, a nested spec, or a
+**bounded-value function** (e.g. the `boundedString(maxLength, pattern)` builder in
+that file) that accepts only in-grammar values and drops the rest. Keep every
+field **bounded and content-free** — a coded id, count, or classification, never
+free text outside an explicitly approved bounded operational reason, and never
+anything from [Sensitive Data Rules](#sensitive-data-rules).
+`emailHash` and `pinoEvent` are allowed for every action by the common metadata
+spec, so add them at the call site only when that action actually has those
+bounded values.
+
+```ts
+// in specs — reuse a bounded builder for id/code shapes, `true` for a plain primitive:
+const code = boundedString(64, /^[a-z][a-z0-9_]*$/)
+'billing.refund_issued': { invoiceId: true, amountCents: true, reasonCode: code },
+```
+
+**3. Record it** by injecting `AuditLogService` and calling `record(entry, opts)`.
+`actorId`, `ip`, and `requestId` are resolved from the request context (CLS) when
+omitted. `actorType` and `targetType` are the `AuditActorType` / `AuditTargetType`
+Prisma enums — if your target isn't an existing value (`USER`, `ORGANIZATION`,
+`API_KEY`, …), extend the enum in a migration first. `category` defaults to
+`SECURITY`; set `AuditCategory.BUSINESS` for non-security events:
+
+```ts
+await this.audit.record(
+  {
+    action: 'billing.refund_issued',
+    actorType: AuditActorType.USER,
+    targetType: AuditTargetType.ORGANIZATION,
+    targetId: org.id,
+    organizationId: org.id,
+    category: AuditCategory.BUSINESS,
+    metadata: { invoiceId: invoice.id, amountCents: refund.amount, reasonCode: 'duplicate' },
+  },
+  { tx } // ← write mode; see below
+)
+```
+
+**Choose the write mode** to match the action's durability need
+([Write Modes](#write-modes)):
+
+- **`{ tx }`** — in-transaction: the audit row commits atomically with the
+  mutation, and a failed insert rolls the mutation back. Use for privileged state
+  changes that must not exist un-audited.
+- **default (`{}`)** — best-effort: a failed insert is logged and the completed
+  action still succeeds. Use for post-commit or side-effect events.
+- **`{ failOpen: false }`** — strict, non-transactional: the row must be durable
+  **before** the caller proceeds and a failure propagates so the caller fails
+  closed. Use for privileged-read accountability (serve the resource only after
+  the access is recorded).
+
+The metadata sanitizer and per-action specs are covered by the audit unit specs
+alongside the module — extend those when you add an action so the allowlist stays
+proven, not just declared.
+
+## Append-Only Enforcement
+
+`core.audit_log` is append-only at the database level.
+
+AMCore enforces this with Postgres triggers that reject:
+
+- `UPDATE`
+- `DELETE`
+- `TRUNCATE`
+
+Why trigger-based:
+
+- the current app DB role is effectively powerful enough that `REVOKE` alone is
+  not a strong boundary;
+- the trigger blocks ordinary mutations even for the owner role;
+- the migration is shadow-database safe with Prisma.
+
+Residual caveat:
+
+- a sufficiently privileged owner or superuser can still bypass append-only via
+  DDL such as disabling or dropping the trigger.
+- External WORM storage is out of scope for the current audit-log baseline.
+
+## Retention And Export
+
+There is currently no automatic retention job or export pipeline for
+`core.audit_log`.
+
+Current policy:
+
+- audit rows are intended to be durable records;
+- hard-delete flows must not delete audit rows indirectly;
+- retention automation and external export are future work.
+
+## Read Access
+
+`GET /admin/audit-logs` serves the Operations Console's Audit panel. It
+requires a bearer session whose user is **currently** a `SUPER_ADMIN` in the
+database; API keys and organization roles do not grant access. Each successful
+read, including an empty result, awaits one `admin.audit_logs.viewed` write
+with `failOpen: false` before returning rows. If that write fails, no rows
+are served. Read events are hidden from the default browse result; the
+`includeReadEvents=true` query option reveals them. An explicit
+`action=admin.audit_logs.viewed` filter, or an `actions` selection containing
+that code, also returns them. This affects display, not recording or retention,
+and the option is bound into the cursor scope.
+
+The response is a deliberately small projection: time, action, safe IDs and
+types, category, selected coded outcome fields, and bounded **current**
+user/organization names plus user email or organization slug. Current identity
+may differ from the identity at event time. A missing present-day record leaves
+only its ID; this does not prove when or why the record disappeared. The `requestId` is returned only when it is a well-formed correlation ID (the bounded search
+key of the [log-search guide](log-search.md)); any other stored value is left out. Raw
+`metadata`, `ip` and credential material are never returned. Explicit allowlists
+project selected coded summaries and background-work command details, including
+the bounded operator reason. A `SESSION` event can show its safe session
+identifier in `targetId`; session IDs stored only in metadata are not projected.
+An unsafe old ID is displayed as unavailable, but its event stays in
+chronological order.
+
+Filters are exact actor, action, target and organization values in a UTC
+`[from,to)` interval. The first request defaults to the last seven days;
+the maximum span is 31 days and the upper bound cannot be in the future.
+`actions` accepts 1–10 distinct comma-separated action codes with OR
+semantics and cannot be combined with the single `action` parameter.
+Results are newest first, at most 50 per request (25 by default), with no
+exact count or arbitrary sort. Follow the sealed cursor for older events
+within the same fixed interval, or select an earlier interval. The cursor
+contains only an encrypted internal random UUID anchor, fixed interval and
+filter digest; it is bound to the operator and capped at 512 URL characters.
+An invalid or stale cursor returns 400 and the panel offers to restart the
+same filters. Responses use `Cache-Control: private, no-store`.
+
+Audit filter IDs and the cursor are removed from both the API's structured
+request query and raw URL logs.
+
+With the optional Console, filter IDs and the cursor still appear in the
+operator's browser history. Deployments that retain reverse-proxy access logs
+must omit or truncate Console query strings there as well; see [Console
+configuration](../operations-console/configuration.md#console-urls-in-browser-history-and-logs).
+
+The `cursorKey` migration adds a volatile UUID default and unique index to
+every existing audit row. It can rewrite and lock a large table. Rehearse
+`prisma migrate deploy` against a production-sized copy and schedule a
+maintenance window if necessary; do not disable the append-only trigger.
+The local PostgreSQL 18 rehearsal on 100,001 rows took 227 ms, preserved
+the trigger and yielded query probes below the 2-second statement timeout.
+That fixture does not predict a production table's lock time or workload.
+
+## API-key lifecycle events
+
+`api_key.revoked` is recorded once per actual irreversible transition, in the
+same transaction as verifier destruction. `admin.api_keys.revocation_requested`
+records requestedCount/affectedCount and platform_revoked reason, including
+known no-op requests. Unknown targets roll back the batch and have no successful
+summary. First revocation actor/time/reason is preserved.
+
+`admin.api_keys.viewed` is a mandatory fail-closed read event. It contains only
+filter-presence booleans and resultCount, not search/name/returned IDs/verifiers.
+The Console Audit read-event opt-in includes it; transition/request summaries
+are visible by default. HTTP query redaction covers search, userId,
+organizationId and id in URL and structured query. Cleanup metadata names
+`staleTerminalApiKeys`. Audit retention is independent of key metadata retention.
+
+## Organization role definition events
+
+`org.role_created`, `org.role_updated` and `org.role_deleted` are written
+transactionally with the role-definition change, from the
+[role definitions API](../product-admin/role-definitions.md) (`source: "editor"`)
+and from every legacy role/permission route (`source: "legacy"`). The target is the
+organization; metadata holds `roleId`, `revisionBefore`/`revisionAfter`, preset or rule
+counts, `fullControl` (`added`, `removed` or `none`: the editor compares the configured grant before
+and after, while a legacy per-rule call reports the shape of the one rule it linked or
+unlinked, so `removed` does not prove the role lost every full-control grant — neither value
+is effective authority), measured `holderCount` and
+`liveInvitationCount` where the command computed them, `nameChanged`,
+`descriptionChanged` and `actorCredentialType` (`jwt` or `api_key`). Names, descriptions,
+conditions, emails and holder lists are never recorded. A locked no-op writes nothing; an
+audit insert failure rolls the whole change back, and a lost commit acknowledgment can leave
+a persisted event with an unconfirmed client outcome, so clients read state before another
+deliberate write.
+
+## Organization role assignment events
+
+`org.member_roles_changed` is written transactionally for actual assignment
+transitions from atomic replacement and legacy per-role assign/remove. The USER
+actor is the credential owner; `actorCredentialType` distinguishes JWT/API key
+without using a key ID as a user identity. Metadata contains `memberId`,
+`addedCount`, `removedCount` and `source` (`replace`, `assign`, `remove`), without
+role names or complete sets. A locked replacement no-op emits no event. An audit
+insert failure rolls the assignment/revision transaction back. A lost commit
+acknowledgment can leave a persisted event and an unconfirmed client outcome;
+clients must read state before another deliberate write, rather than replay.
+
+## Platform organization administrator actions
+
+The `org.administrator_invitation_created`, `org.administrator_invitation_reissued`,
+`org.administrator_invitation_replaced`, `org.administrator_invitation_cancelled`
+and `org.administrator_assigned` actions use the existing strict SECURITY audit.
+The transaction commits the grant/lifecycle, receipt and sanitized audit together.
+Audit failure rolls back the privileged change. Exact replay adds no event.
+
+These actions have a closed operational-reason exception:1–500 trimmed characters,
+at most2000UTF-8bytes, no control characters. Enter a ticket reference or operational
+justification, never secrets or personal information. Validation does not redact
+sensitive content automatically. These reasons remain in stored audit metadata,
+accessible to authorized database/backup administrators under deployment policy.
+The current live-SUPER_ADMIN Console audit projection does not expose these raw
+organization-administrator reasons, and there is no built-in raw export endpoint.
+The existing audit retention policy applies; invitation cleanup does not erase audit. Status, attention, receipts,
+application logs, mail and notifications exclude it. Receipt/intent fingerprints do
+not store plaintext reasons. Recipient completion uses
+`org.administrator_invitation_completed` with bounded grant/membership IDs.

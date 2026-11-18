@@ -1,0 +1,565 @@
+// ===========================================
+// Core Module: Users & Authentication
+// ===========================================
+
+// -----------------------------
+// Enums
+// -----------------------------
+
+enum OAuthProvider {
+  GOOGLE
+  GITHUB
+  APPLE
+  TELEGRAM
+
+  @@schema("core")
+}
+
+enum Theme {
+  LIGHT
+  DARK
+  SYSTEM
+
+  @@schema("core")
+}
+
+enum SystemRole {
+  USER
+  SUPER_ADMIN
+
+  @@schema("core")
+}
+
+enum AuditActorType {
+  USER
+  API_KEY
+  SYSTEM
+
+  @@schema("core")
+}
+
+enum AuditTargetType {
+  USER
+  API_KEY
+  ORG_INVITE
+  ORGANIZATION
+  SESSION
+  CLEANUP
+  TELEGRAM_CONNECTION
+  AI_RUN
+  AI_TOOL_INVOCATION
+  AI_APPROVAL
+  AI_ASSISTANT
+  AI_CONVERSATION
+  RUNTIME_SETTING
+  BACKGROUND_WORK
+
+  @@schema("core")
+}
+
+enum AuditCategory {
+  SECURITY
+  BUSINESS
+
+  @@schema("core")
+}
+
+// -----------------------------
+// Models
+// -----------------------------
+
+model User {
+  id               String  @id @default(cuid())
+  email            String
+  emailCanonical   String  @unique
+  emailVerified    Boolean @default(false)
+  passwordHash     String?
+  name             String?
+  // Object key of the primary public avatar derivative. The API computes `avatarUrl` from it,
+  // so changing the public base never needs a data migration. Never a URL.
+  avatarKey        String?
+  // Monotonic fence for avatar mutations: a conditional CAS update (only when the
+  // stored value is older) makes a stale lock holder unable to publish over, or
+  // sweep, a newer concurrent version. See ADR-049.
+  avatarGeneration Int     @default(0)
+  phone            String? @unique
+  // Neutral starter defaults for a new row only. Mirrors `DEFAULT_LOCALE` in
+  // `packages/shared` — keep the two in sync. Existing rows are deliberately
+  // never backfilled when these defaults change: a stored value cannot be told
+  // apart from a preference the user actually chose.
+  locale           String  @default("en")
+  timezone         String  @default("UTC")
+
+  // Timestamps
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  lastLoginAt DateTime?
+
+  // RBAC
+  systemRole SystemRole @default(USER)
+
+  // Relations
+  mfaAccount              MfaAccount?
+  mfaFactor               MfaFactor?
+  mfaRecoveryTicket       MfaRecoveryTicket?
+  mfaRecoveryCodes        MfaRecoveryCode[]
+  authFamilies            AuthSessionFamily[]
+  mfaFlows                MfaFlow[]
+  mfaBudget               MfaAttemptBudget?
+  mfaSettingsStarts       MfaSettingsStartReceipt[]
+  browserLogoutReceipts   BrowserLogoutReceipt[]
+  accounts                OAuthAccount[]
+  sessions                Session[]
+  settings                UserSettings?
+  passwordResetTokens     PasswordResetToken[]
+  emailVerificationTokens EmailVerificationToken[]
+  memberships             OrgMember[]
+  apiKeys                 ApiKey[]
+  invitesSent             OrgInvite[]              @relation("InvitesSent")
+  invitesAccepted         OrgInvite[]              @relation("InvitesAccepted")
+  invitesRevoked          OrgInvite[]              @relation("InvitesRevoked")
+  notifications           Notification[]
+  notificationPreferences NotificationPreference[]
+  telegramConnection      TelegramConnection?
+  telegramLinkTokens      TelegramLinkToken[]
+  aiConversations         AiConversation[]
+  aiApprovalsDecided      AiApproval[]
+  invitationOperations   InvitationOperation[]
+  invitationAuthHandoffs  InvitationAuthHandoff[]
+
+  // Admin discovery (Operations Console search/sort). Composite indexes
+  // serve `ORDER BY <field>, id` for each allowlisted sort field with a
+  // deterministic id tie-break in the same direction as the primary sort
+  // (see `AdminService.resolveUserOrderBy`) — mirrors the existing
+  // `AuditLog`'s `@@index([createdAt, id])` idiom in this schema. The GIN
+  // trigram indexes back the `pg_trgm`-backed literal-contains search over
+  // `name`/`email` (`AdminService.buildUserSearchWhere`); `pg_trgm` itself
+  // is installed by a migration, not by this schema file.
+  //
+  // `lastLoginAt`'s default sort is `DESC NULLS LAST`
+  // (`AdminService.resolveUserOrderBy`). This schema declaration
+  // (`sort: Desc`) exists so Prisma's own migration-history drift
+  // detection recognizes the index the migration actually creates —
+  // omitting it entirely made Prisma consider the index unowned and
+  // propose dropping it on the next `migrate dev`/`migrate diff` (verified
+  // empirically). It does **not** control NULLS placement: Prisma's schema
+  // DSL has no `nulls:` index modifier that survives to the generated SQL
+  // (a `nulls:` field-index argument parses without error but is silently
+  // dropped — verified empirically, not assumed). The actual
+  // `DESC NULLS LAST` clause is hand-written raw SQL in the migration file
+  // itself, matching this declaration's column list/sort direction exactly
+  // so `prisma migrate diff` reports no drift (also verified empirically:
+  // an empty diff after this exact pairing). A plain ascending index would
+  // only give `DESC NULLS FIRST` on a backward scan — EXPLAIN showed the
+  // planner correctly refusing to use it at all for the real default query,
+  // falling back to a full Seq Scan + Sort.
+  @@index([name, id])
+  @@index([email, id])
+  @@index([lastLoginAt(sort: Desc), id(sort: Desc)])
+  @@index([createdAt, id])
+  @@index([updatedAt, id])
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([email(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@map("users")
+  @@schema("core")
+}
+
+model OAuthAccount {
+  id                String        @id @default(cuid())
+  userId            String
+  provider          OAuthProvider
+  providerAccountId String
+  accessToken       String?
+  refreshToken      String?
+  expiresAt         DateTime?
+
+  createdAt DateTime @default(now())
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("oauth_accounts")
+  @@schema("core")
+}
+
+model Session {
+  id               String    @id @default(cuid())
+  userId           String
+  familyId         String
+  refreshToken     String    @unique // Hashed
+  userAgent        String?
+  ipAddress        String?
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  revocationReason String?
+  // OB-06b / ADR-037: server-side recent-auth timestamp for step-up.
+  // Nullable: pre-migration rows are NULL and fail closed on @RequireFreshAuth.
+  // Set to now() at fresh authentication (login/register/OAuth); carried
+  // forward (never renewed) on refresh rotation; bumped by POST /auth/step-up.
+  lastAuthAt       DateTime?
+
+  createdAt DateTime @default(now())
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  invitationAuthHandoff InvitationAuthHandoff?
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
+  @@map("sessions")
+  @@schema("core")
+}
+
+model UserSettings {
+  id                   String  @id @default(cuid())
+  userId               String  @unique
+  theme                Theme   @default(SYSTEM)
+  notificationsEnabled Boolean @default(true)
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_settings")
+  @@schema("core")
+}
+
+// -----------------------------
+// Password Reset & Email Verification Tokens
+// -----------------------------
+
+model PasswordResetToken {
+  frontendDestination String @default("site")
+  placementFingerprint String?
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique // SHA-256 hash of a 64-char hex token
+  expiresAt DateTime // createdAt + 15 minutes
+  used      Boolean   @default(false)
+  usedAt    DateTime?
+
+  createdAt DateTime @default(now())
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Indexes for performance
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("password_reset_tokens")
+  @@schema("core")
+}
+
+model EmailVerificationToken {
+  frontendDestination String @default("site")
+  placementFingerprint String?
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique // SHA-256 hash of a 64-char hex token
+  expiresAt DateTime // createdAt + 48 hours
+  used      Boolean   @default(false)
+  usedAt    DateTime?
+
+  createdAt DateTime @default(now())
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Indexes for performance
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("email_verification_tokens")
+  @@schema("core")
+}
+
+// ===========================================
+// API Keys
+// ===========================================
+
+model ApiKey {
+  id             String    @id @default(cuid())
+  name           String
+  shortToken     String    @unique
+  keyHash        String?
+  salt           String?
+  revokedAt      DateTime?
+  revokedByUserId String?
+  revocationReason String?
+  scopes         String[]  @default([])
+  expiresAt      DateTime?
+  lastUsedAt     DateTime?
+  createdAt      DateTime  @default(now())
+  userId         String
+  organizationId String
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([organizationId])
+  @@index([expiresAt])
+  @@index([revokedAt])
+  @@index([organizationId, userId, revokedAt, id])
+  @@index([createdAt(sort: Desc), id(sort: Desc)])
+  @@map("api_keys")
+  @@schema("core")
+}
+
+// ===========================================
+// RBAC: Organizations, Roles & Permissions
+// ===========================================
+
+model Organization {
+  id         String   @id @default(cuid())
+  name       String
+  slug       String   @unique
+  aclVersion Int      @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  members         OrgMember[]
+  roles           Role[]
+  permissions     Permission[]
+  apiKeys         ApiKey[]
+  invites         OrgInvite[]
+  administratorInvitations OrganizationAdministratorInvitation[]
+  invitationOperations InvitationOperation[]
+  notifications   Notification[]
+  aiConversations AiConversation[]
+
+  // Admin discovery — same contract as `User` above. `slug` still needs its
+  // own trigram index for the contains *search* (the existing unique B-tree
+  // on `slug` alone cannot serve `ILIKE '%term%'`), but deliberately gets NO
+  // extra `(slug, id)` composite: `slug` is `@unique`, so no two rows can
+  // ever tie on it, which makes an `id` tie-breaker structurally impossible
+  // to need. Verified empirically (`EXPLAIN`): the existing unique index
+  // alone already serves `ORDER BY slug, id` in both directions via a cheap
+  // Incremental Sort with one presorted group — adding the composite index
+  // was pure write-overhead with no read benefit.
+  @@index([name, id])
+  @@index([createdAt, id])
+  @@index([updatedAt, id])
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([slug(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@map("organizations")
+  @@schema("core")
+}
+
+model OrgMember {
+  id             String   @id @default(cuid())
+  userId         String
+  organizationId String
+  createdAt      DateTime @default(now())
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  roles        MemberRole[]
+
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+  @@map("org_members")
+  @@schema("core")
+}
+
+model MemberRole {
+  id       String @id @default(cuid())
+  memberId String
+  roleId   String
+
+  member OrgMember @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  role   Role      @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@unique([memberId, roleId])
+  // Role-leading lookup: holder counts/samples and role-deletion joins read by role, not by member.
+  @@index([roleId, memberId])
+  @@map("member_roles")
+  @@schema("core")
+}
+
+model Role {
+  id             String  @id @default(cuid())
+  name           String
+  description    String?
+  isSystem       Boolean @default(false) // system roles cannot be deleted
+  organizationId String? // null = system template; non-null = org-specific
+
+  organization Organization?    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  permissions  RolePermission[]
+  members      MemberRole[]
+  inviteIntents OrgInviteRoleIntent[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+  @@map("roles")
+  @@schema("core")
+}
+
+model Permission {
+  id             String   @id @default(cuid())
+  action         String // 'create' | 'read' | 'update' | 'delete' | 'manage'
+  subject        String // Registered User/Organization/Role/Permission models, TeamAccess, or DENY-only all
+  conditions     Json? // CASL conditions: { "assignedToId": "${user.sub}" }
+  fields         String[] @default([]) // field-level: [] = all fields
+  inverted       Boolean  @default(false) // explicit DENY (use sparingly)
+  organizationId String? // null = system permission
+
+  organization Organization?    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  roles        RolePermission[]
+
+  @@index([organizationId, subject, action])
+  @@map("permissions")
+  @@schema("core")
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+  @@schema("core")
+}
+
+// ===========================================
+// Organization invitations
+// ===========================================
+// Immutable requested role IDs survive role deletion. Generation fences reissue;
+// a receipt fences retries independently of the lifetime of an invitation.
+model OrgInvite {
+  frontendDestination String @default("site")
+  placementFingerprint String?
+  id               String    @id @default(cuid())
+  organizationId   String
+  emailCanonical   String
+  email            String
+  generation       Int       @default(1)
+  issuedAt         DateTime  @default(now())
+  issuedAtEstimated Boolean  @default(false)
+  intentInvalid    Boolean   @default(false)
+  invitedById      String?
+  tokenHash        String    @unique
+  expiresAt        DateTime
+  acceptedAt       DateTime?
+  acceptedByUserId String?
+  revokedAt        DateTime?
+  revokedById      String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  administratorIntent OrganizationAdministratorInvitation?
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  roleIntents    OrgInviteRoleIntent[]
+  continuations  InvitationContinuation[]
+  invitedBy      User?        @relation("InvitesSent", fields: [invitedById], references: [id], onDelete: SetNull)
+  acceptedByUser User?        @relation("InvitesAccepted", fields: [acceptedByUserId], references: [id], onDelete: SetNull)
+  revokedByUser  User?        @relation("InvitesRevoked", fields: [revokedById], references: [id], onDelete: SetNull)
+
+  @@unique([organizationId, emailCanonical], where: { acceptedAt: null, revokedAt: null })
+  @@index([emailCanonical])
+  @@index([expiresAt])
+  @@index([organizationId, issuedAt(sort: Desc), id])
+  @@map("org_invites")
+  @@schema("core")
+}
+
+model AuditLog {
+  id             String           @id @default(cuid())
+  cursorKey      String           @unique @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  createdAt      DateTime         @default(now())
+  actorType      AuditActorType
+  actorId        String?
+  action         String
+  targetType     AuditTargetType?
+  targetId       String?
+  organizationId String?
+  requestId      String?
+  ip             String?
+  category       AuditCategory    @default(SECURITY)
+  metadata       Json
+
+  @@index([createdAt], type: Brin)
+  @@index([createdAt, id])
+  @@index([actorId])
+  @@index([targetId])
+  @@index([organizationId])
+  @@map("audit_log")
+  @@schema("core")
+}
+
+model OrgInviteRoleIntent {
+  id              String @id @default(cuid())
+  inviteId        String
+  ordinal         Int
+  requestedRoleId String
+  liveRoleId      String?
+  roleNameAtIssue String
+
+  invite OrgInvite @relation(fields: [inviteId], references: [id], onDelete: Cascade)
+  role Role? @relation(fields: [liveRoleId], references: [id], onDelete: SetNull)
+
+  @@unique([inviteId, requestedRoleId])
+  @@unique([inviteId, ordinal])
+  @@index([liveRoleId])
+  @@map("org_invite_role_intents")
+  @@schema("core")
+}
+
+model InvitationContinuation {
+  id String @id @default(cuid())
+  credentialHash String @unique
+  inviteId String
+  generation Int
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  invite OrgInvite @relation(fields: [inviteId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+  @@map("invitation_continuations")
+  @@schema("core")
+}
+
+model InvitationOperation {
+  id String @id @default(cuid())
+  actorId String
+  organizationId String?
+  scope String
+  operationId String @db.Uuid
+  kind String
+  fingerprint String
+  intent Json
+  result Json
+  completedAt DateTime @default(now())
+
+  actor User @relation(fields: [actorId], references: [id], onDelete: Cascade)
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([actorId, scope, operationId])
+  @@index([completedAt])
+  @@map("invitation_operations")
+  @@schema("core")
+}
+
+model InvitationAuthHandoff {
+  attemptId String @id
+  cleanupKeyHash String
+  sessionId String @unique
+  actorId String
+  deadline DateTime
+  status String @default("pending")
+  createdAt DateTime @default(now())
+  settledAt DateTime?
+
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  actor User @relation(fields: [actorId], references: [id], onDelete: Cascade)
+
+  @@index([status, deadline])
+  @@index([createdAt])
+  @@map("invitation_auth_handoffs")
+  @@schema("core")
+}

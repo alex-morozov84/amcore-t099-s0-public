@@ -1,0 +1,591 @@
+# Frontend Architecture & Conventions
+
+How `apps/web` is structured, and the rules that keep it that way. This guide
+is about _decisions and boundaries_ — layers, routing, component defaults, and
+state — not a re-explanation of Next.js, React, or TanStack Query themselves.
+This page is the public frontend architecture contract.
+
+For the tech stack and current package set, read
+[`apps/web/package.json`](../../apps/web/package.json). For backend module
+conventions, see [`docs/backend/architecture-and-conventions.md`](../backend/architecture-and-conventions.md).
+
+## Sources of truth
+
+- **Cross-boundary contracts** (types, Zod schemas shared with `apps/api`)
+  live in [`packages/shared`](../../packages/shared/src) — never duplicate a
+  type that already exists there.
+- **Endpoint shapes** (paths, request/response bodies, status codes, auth
+  schemes) live in the Swagger/OpenAPI document at `/docs` in development —
+  see [Relationship to backend/OpenAPI docs](#relationship-to-backendopenapi-docs).
+  This guide does not re-document individual endpoints.
+- **Framework-level Next.js APIs and behavior** (routing, caching, App Router
+  conventions, config options) live in the version-matched docs bundled with
+  the installed package at `apps/web/node_modules/next/dist/docs/`, not in
+  this guide or in a model's training data. See the root `AGENTS.md` →
+  _Next.js reference_ bullet for exactly when this applies and what's expected
+  in a PR.
+
+## Layers: Next App Router vs FSD
+
+`apps/web` follows Feature-Sliced Design (FSD) on top of Next's App Router.
+The two systems own different things, and the layer names say which:
+
+| Path            | Owns                                                                                                         | Notes                                                                                                                              |
+| --------------- | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `src/app/`      | Next App Router files only: `page`, `layout`, `loading`, `error`, metadata, route handlers when truly needed | Thin — see [Route thinness](#route-thinness). Routes live under a `[locale]` segment — see [Locale routing](#locale-routing)       |
+| `src/i18n/`     | Locale routing config, locale-aware navigation helpers, request config, param validation                     | Link/router consumers use the progress-aware adapters; other locale helpers come from here — see [Locale routing](#locale-routing) |
+| `src/_pages/`   | FSD Pages layer: page composition                                                                            | Canonical FSD meaning, unchanged                                                                                                   |
+| `src/_app/`     | FSD App layer: application composition, mounts, navigation and API-family injection                          | Public slice APIs; imports lower layers only; never imported from below                                                            |
+| `src/widgets/`  | Composed UI blocks made of multiple features/entities                                                        | Canonical FSD meaning, unchanged                                                                                                   |
+| `src/features/` | Single user-interaction-driven slices (e.g. `auth-login`)                                                    | Canonical FSD meaning, unchanged                                                                                                   |
+| `src/entities/` | Business-domain data + its UI (e.g. `user`)                                                                  | Canonical FSD meaning, unchanged                                                                                                   |
+| `src/shared/`   | Generic reusable code with no business meaning: UI primitives, API client, hooks, lib, store                 | Canonical FSD meaning, unchanged                                                                                                   |
+
+The underscore prefix on `_pages`/`_app` exists so the FSD layer names don't
+read as Next reserved directories — Next's own routing only ever looks inside
+`src/app/`.
+
+### Import rule: public API only
+
+Import a slice through its public API: `index.ts` is the default entry point.
+Do not import private files inside a slice:
+
+```ts
+// Correct
+import { LoginForm } from '@/features/auth-login'
+
+// Wrong — reaches past the slice's public API
+import { LoginForm } from '@/features/auth-login/ui/LoginForm'
+```
+
+Each slice folder's public entry points define what other layers may use.
+The exact additional public entries are:
+
+- `entities/api-key/index.server.ts`: actor-bound own-key admission and server operations;
+  create secrets never enter Server Component props.
+- `entities/organization-context/index.server.ts`: the server-only DAL and
+  family descriptor, available to layers that may import this entity.
+- `entities/invitation-flow/index.server.ts`: recipient admission returning only
+  the current flow binding and user snapshot, available to layers that may import
+  this entity. It never exposes continuation credentials or session-vault IDs.
+- `_app/organization-access/index.server.ts`, `index.client.ts` and
+  `index.config.ts`: server mount, client menu and universal placement,
+  respectively, available only to Next route wiring in `src/app/`.
+
+These named exceptions do not permit arbitrary deep imports, additional server
+barrels or lower-layer imports of `_app`. See
+[Organization composition capability entries](#organization-composition-capability-entries)
+for the organization entries' capability boundaries.
+This is enforced by `eslint-plugin-boundaries`, not by convention — see
+[Boundaries & guardrails](./fsd-boundaries-and-guardrails.md#import-rules) for
+what each rule catches, including the `shared` exception below.
+
+A layer may only import from layers below it in the table above (e.g.
+`features` may import `entities`/`shared`, never the reverse, and never a
+sibling `feature`'s internals).
+
+**`shared/ui` and `shared/lib` are the exception**: they are collections of
+independent modules, imported per module (`@/shared/ui/button`,
+`@/shared/lib/utils`), which is also the only shape the shadcn CLI generates.
+There is no layer-level barrel anywhere — `@/features`, `@/shared` and friends
+are not import targets.
+
+## Route thinness
+
+Files under `src/app/` handle **plumbing only**: metadata, route params,
+`redirect`, `notFound`, and provider/layout wiring. They must not contain
+business UI, direct feature/entity data hooks, substantial JSX, or
+client-only state. Composition belongs in `_pages/`:
+
+```
+src/app/[locale]/(dashboard)/page.tsx               → imports and renders a _pages/ component
+src/_pages/dashboard/DashboardPage/DashboardPage.tsx → owns the actual composition
+```
+
+### Product application shell
+
+`widgets/app-shell` uses the shared sidebar's icon-collapse mode on desktop.
+Each navigation entry supplies an icon and a localized tooltip; mobile navigation
+remains a dismissible sheet. Dashboard comes first, followed by the
+`navigationAfterDashboard` slot and active sessions. Page content fills the available width, including
+the space released when the sidebar collapses. Keep narrower widths on individual
+forms or readable text blocks when appropriate, rather than on the whole shell.
+Application composition supplies the optional `sidebarFooter` slot. Product
+administration uses it for the localized website link, with the website origin
+resolved on the server. The account menu stays in the header.
+
+### Operations Console shell
+
+The Operations Console is a separate system-control-plane slice, not a product
+dashboard or downstream backoffice. Upstream route plumbing starts under
+`app/[locale]/admin/`.
+`_pages/console/` composes the current page, and `widgets/console-shell` owns its
+Control Room shell. The shell reuses the generic `shared/ui/sidebar` primitive
+rather than copying it or sharing the product `widgets/app-shell`.
+Console-internal links use `RouteProgressLink`, like every other internal
+navigation. See the [Operations Console guide](../operations-console/README.md)
+for its user, deployment, security, and extension contracts.
+
+## Browser security headers and CSP
+
+`src/proxy.ts` (next-intl's locale-routing middleware) also generates a
+per-request Content Security Policy nonce and composes it with locale
+routing — the CSP/nonce logic itself lives in `shared/lib/csp/`, kept
+separate from proxy composition so it stays independently unit-testable.
+The nonce reaches Server/Client Components via a request header
+(`x-nonce`, read through `headers()`), not a prop — see
+`app/[locale]/layout.tsx` for how the theme-init script and Base UI's
+`CSPProvider` both consume it. Full policy, enforcement mode, and how to
+extend it for a third-party origin:
+[Browser security headers and CSP](./browser-security-and-csp.md).
+
+## Component organization
+
+Choose component boundaries by **cohesion**, not by a target number of files.
+React permits closely related components to live in one file, and Next.js
+supports co-location; neither requires a file per JSX function.
+
+- Keep page and route composition in a dedicated file.
+- Extract a table, form, interactive block, or loading/error/empty state when
+  it is reusable, has independent state, data, or accessibility behavior,
+  creates a Server/Client Component boundary, needs an independent test or
+  Storybook state, or makes its parent materially easier to understand.
+- Keep a small private, single-use leaf beside its parent when it has no such
+  boundary and the parent remains readable. Typical examples are a table row,
+  a small page link, a formatter, or a column map.
+- Create an FSD folder/slice only when the code owns a distinct domain
+  responsibility — not merely because a JSX fragment can be named.
+- Do not create a file, barrel, or test solely because a private component is
+  5–15 lines long.
+
+The repository's under-150-line file and under-30-line function guidelines
+prompt a cohesion review; size alone does not fail lint or CI. The local
+pre-commit advisory reports staged code, including test files and helpers, and
+the author explains each marked item at review handoff (see
+`CONTRIBUTING.md` → _Size review advisory_). A `UsersTable` and its private
+`UserRow`, for example, can form one cohesive responsibility. Reassess a
+co-located leaf when it gains its own state, data, accessibility behavior,
+Client/Server boundary, test, or reuse.
+
+### Promote to `shared/ui` on genuine reuse
+
+Before building a new interactive pattern — a dialog, a table, a form
+control, a status indicator — check whether `shared/ui` or an existing
+feature already expresses the same shape. Two real occurrences of it, not a
+hypothetical third, is the signal to extract or promote it to `shared/ui`
+with configurable props instead of keeping separate, page-local copies. A
+confirm-then-mutate dialog (state a consequence, then cancel or commit) is a
+concrete example: once a second feature needed the same
+trigger/title/description/confirm/cancel shape, it moved to
+`shared/ui/confirm-dialog.tsx` rather than being copied a second time. The
+same reasoning applies to a shared hook in `shared/lib`/`shared/hooks` when
+the duplicated logic, not just the markup, is what repeats.
+
+This is reuse, not speculative design, and does not relax the rest of this
+guide's "don't build for a future that isn't here yet" stance: do not
+generalize a pattern that has exactly one consumer today on the theory that
+a second one might eventually appear — that is the premature abstraction
+this guide already warns against elsewhere. Promote only once a second real
+consumer exists, or the task you are implementing right now explicitly
+requires the same shape for a second, concrete caller.
+
+## Interaction patterns: buttons, tabs and lists
+
+Start with the short [UI/UX checklist](./ux-checklist.md) for the user's goal,
+understandable actions, consequences and recovery. The rules below cover implementation.
+
+Use the existing `shared/ui` components before composing a page-local alternative.
+Keep feature wrappers thin: they supply localized labels, policy/state and event
+handlers; shared components own the repeated markup, styling and accessibility
+pattern. Component boundaries still follow [cohesion](#component-organization),
+not a target number of files.
+
+### Action, selection and mode are different states
+
+| Intent                                    | Shared pattern                                              | Appearance                                                                       |
+| ----------------------------------------- | ----------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| Ordinary or reversible action             | `Button` with its ordinary variant                          | Neutral; pause/resume is not destructive merely because processing stops         |
+| Single-choice filter                      | `FilterButtons`                                             | Selected option uses `selection`; retain visible and semantic selection          |
+| Related content panels                    | `Tabs`, `TabsList`, `TabsTrigger`, `TabsContent`            | Selected tab uses the selection token pair and remains associated with its panel |
+| Checkbox selection                        | `Checkbox`                                                  | Checked and indeterminate states use the selection token pair                    |
+| Open inspection target                    | `Button` with `selection-soft`                              | Muted selected surface; identify which item owns the revealed content            |
+| Independent on/off mode                   | `Button` with `aria-pressed` and explicit ordinary variants | Neutral; state and localized label identify on/off                               |
+| Destructive action requiring confirmation | Ordinary initial button, `destructive` final confirmation   | Red emphasizes the point where cancellation/removal is committed                 |
+
+Do not turn every `aria-pressed` button into an accent button. That attribute
+expresses a persistent toggle state; it does not choose the visual intent.
+A momentary pointer press and keyboard focus are also separate from selection.
+Keep a visible focus ring.
+
+Use filters to narrow one list and tabs to switch linked content panels. Do not
+copy tab markup for a filter or implement separate selected-state colors in each
+feature. Colors come from semantic tokens: `selection` / `selection-foreground`
+default to the neutral `primary` pair and can be scoped by an application shell.
+`primary` is not necessarily the brand color. A muted selection must remain
+readable in both themes; do not assume accent-colored text contrasts with every
+surface. See [Selected controls](./shared-ui-and-shadcn.md#selected-controls).
+
+Reserve destructive styling for destructive consequences, not for every action
+that sounds negative. State the actual consequence in the confirmation and use
+specific action labels. An action that only prevents new work from starting is
+**Pause**, not a promise to terminate running work. This follows the confirmation
+patterns in [GOV.UK](https://design-system.service.gov.uk/components/button/) and
+[Atlassian](https://atlassian.design/components/button/).
+
+### List and detail journeys
+
+- Reuse `Card` for distinct content widgets instead of rebuilding the surface,
+  border, spacing and shadow. Keep loading and loaded containers consistent.
+- When a control reveals details elsewhere on the page, visibly identify the
+  selected item. Bring newly revealed content into view and move focus to its
+  heading. Smooth scrolling must respect `prefers-reduced-motion`.
+- Show batch action controls after at least one item is selected. Clearly tie
+  them to the selection; if an operation is unavailable, explain its reason.
+  This follows [Carbon's batch action pattern](https://v10.carbondesignsystem.com/components/data-table/usage/).
+- Reuse `PaginationButtons` for local-state previous/next pagination. Supply
+  either `total` + `pageSize`, or explicit `hasPreviousPage` + `hasNextPage`
+  when the total is unknown. Keep boundaries and selection handling in the
+  feature, and repeated rendering in the shared component. Hide the pager when
+  neither direction is available. Do not invent a total for a bounded live list.
+- Reuse `Empty` with a localized title and useful next step. Distinguish an empty
+  collection from no filter matches, an out-of-range page, a read limit and a
+  failed request. Never present unavailable data as a successful empty result.
+- Use structural skeletons for initial list loads and filter/page transitions,
+  not only the first route load. Keep the surrounding widget and current context
+  visible; announce loading without exposing decorative skeletons to assistive
+  technology. See [Loading skeletons](#loading-skeletons).
+- Keep action results in confirmations/result dialogs or standard toasts. Close
+  a fully successful confirmation and refresh its data. Keep refusals, partial
+  results and uncertainty explainable in the dialog; retain a way to reopen an
+  uncertain result without resending. Page alerts describe page/section loading
+  and availability, rather than duplicating each action outcome.
+- Show counts next to filters only when the API defines their scope and
+  freshness. Distinguish exact, bounded and unavailable values; do not infer the
+  full count from the current page or from another data source.
+
+Before review, check these states in the running UI: initial loading, filtered
+loading, empty, error/limit, selection, confirmation and narrow layout. Verify
+both themes, keyboard focus, reduced motion and all supported locales for the
+changed behavior. Static lint proves import/style constraints, not the clarity
+of the journey.
+
+## Loading skeletons
+
+A loading state preserves the page's stable context. Do not replace persistent
+chrome such as an application shell, sidebar, header, breadcrumbs, or the
+current user context merely because page data is loading. Put the Suspense
+boundary **inside** that stable frame, so navigation keeps its orientation and
+only the changing content is pending.
+
+A skeleton is a structural preview of the final UI, not a generic collection
+of grey bars. It must mirror the loaded page's information hierarchy,
+containers, column or card layout, spacing, and responsive behavior. In
+particular, a narrow-screen table skeleton must use the same horizontal-scroll
+or reflow strategy as the real table. Reuse the same layout primitives where
+practical, and visually verify both a narrow and desktop viewport.
+
+Use route-level `loading.tsx` only when replacing the entire route segment is
+intentional and safe. If the route has an admission, authorization, or other
+frame that must decide whether chrome may be shown, use a local `<Suspense>`
+fallback after that decision instead. See [Server-rendered graceful
+degradation](./server-rendered-resilience.md) for streaming and error-boundary
+rules.
+
+## Locale routing
+
+Every route lives under a `[locale]` segment: `src/app/[locale]/(auth)/login/page.tsx`.
+The locale set and default come from `SERVED_LOCALES` / `DEFAULT_LOCALE` in
+`@amcore/shared` — the same source the API uses for `User.locale`,
+`Accept-Language` negotiation, and email rendering, so the frontend can never
+disagree with the backend about which locales exist.
+
+The served list is read from `packages/shared/src/config/locales.json`
+(`SERVED_LOCALES` means the locales this build serves). With two or more served
+locales `localePrefix` is `'always'`: **every** locale is explicit, including the
+default — `/en/login`, `/ru/login`. A request to `/login` redirects to
+`/en/login`; an unsupported locale such as `/de/login` is a 404, never a silent
+fallback to English. With **one** served locale the URLs are bare (`/login`) and a
+prefix of a locale the build does not serve is a 404; how that works without a proxy
+rewrite is in [i18n and error localization](./i18n-and-errors.md#why-the-middleware-keeps-localeprefix-always).
+
+`'as-needed'` (default locale at bare `/login`) looks nicer and is deliberately
+**not** used. It needs the proxy to rewrite `/login` → `/en/login` internally,
+and Next's standalone server — what the Docker image runs — does not consume
+the resulting `x-middleware-rewrite`; it returns it to the client alongside a
+307 to the original path, so `/login` redirects to itself forever
+(vercel/next.js#91844). `'always'` reaches every locale by redirect, which
+standalone handles correctly. Do not switch back without re-testing against the
+standalone server — `next start` does not reproduce the fault.
+
+Two rules that are easy to get wrong:
+
+- **Use `RouteProgressLink` for internal navigating links and
+  `useRouteProgressRouter()` for programmatic navigation.** They wrap
+  `@/i18n/navigation` and preserve both the locale prefix and the global
+  progress signal. Import other locale-aware helpers directly from
+  `@/i18n/navigation`. Never bypass these with `next/link` or locale-unaware
+  `next/navigation`; Oxlint enforces both boundaries. `notFound()` and other
+  non-navigating helpers may still come from `next/navigation`. See
+  [Top route progress bar](./route-progress.md).
+- **Call `setRequestLocale(locale)` before any other next-intl call** in each
+  page/layout that should render statically, passing it through
+  `resolveLocaleParam(params)` from `@/i18n/params` so the URL segment is
+  validated. Skipping it makes the route silently opt out of static rendering.
+
+Locale resolution order: URL prefix → the signed-in user's stored
+`User.locale` (applied at the post-login redirect) → the `NEXT_LOCALE` cookie →
+`Accept-Language` → `DEFAULT_LOCALE`. An explicit URL prefix always wins for
+the request it is on, so following a `/ru/...` link is never overridden
+mid-session. For the language control and separate product/authentication/Console
+preference policies, see [Language selection](./i18n-and-errors.md#language-selection).
+
+Message catalogues live in `apps/web/messages/`. **`en.json` is the source of
+truth**; every other catalogue must have exactly the same keys, which a test
+enforces. Translation keys are type-checked against `en.json` via the
+`AppConfig` augmentation in `src/global.d.ts`, so a typo fails `pnpm typecheck`
+rather than surfacing in the browser.
+
+## API errors
+
+The backend emits a stable machine-readable `errorCode` (ADR-023) and an English
+`message` written for developers. **The frontend translates by code and never
+renders the backend's message** — showing it puts developer-facing English in
+front of a Russian user, which is the whole reason the code contract exists.
+
+Render failures with `<ApiErrorAlert error={error} />`, or call `useApiError()`
+for the resolved `{ code, message, correlationId, isUnknown }`. Codes that the
+client does not recognise fall back to a generic message plus the correlation
+ID — that is what support needs to find the request, and it leaks nothing.
+
+`shared/api/errors.ts` is the locale-agnostic layer: it returns codes, never
+prose. Network failures and timeouts get their own client-side codes
+(`NETWORK_ERROR`, `TIMEOUT`) so every failure, wherever it came from, goes
+through one translation path.
+
+**Adding a backend error code** — add it to the enum in `@amcore/shared`, then
+add a message under `errors.<CODE>` in _every_ catalogue.
+`src/shared/api/error-messages.test.ts` derives its expectations from the shared
+enums, so a code with no translation fails the required tests rather than silently
+degrading to the generic message. It also fails on an orphaned message, which
+catches a typo or a code the backend has since removed.
+
+## Form validation
+
+Build forms with **`useLocalizedForm(schema, options)`** rather than `useForm` +
+`zodResolver` directly. It wires a per-parse Zod error map so validation
+messages render in the active locale.
+
+Zod's own `z.config(z.locales.*)` is deliberately not used: it sets the locale
+**process-globally**, cannot be scoped to a request or a render
+([colinhacks/zod#4986](https://github.com/colinhacks/zod/issues/4986)), and so
+cannot represent two live locales — on the server it would race across requests.
+An ESLint rule blocks it.
+
+Two rules follow from Zod's precedence (schema-level → per-parse → global →
+locale):
+
+- **Never put a literal `message` in a shared schema.** A schema-level message
+  outranks the per-parse map and silently defeats localization for that field.
+  Schemas stay language-neutral; `superRefine` rules carry `params.errorCode`
+  instead, which the map translates through the same `errors.*` catalogue that
+  API errors use — so a rule enforced on both client and server reads
+  identically wherever it fires.
+- **Server-side field errors are localized by code too.** `useFormMutation`
+  maps `errors[]` entries through `useFieldErrorTranslator`, never the wire
+  `message`. That path is necessarily coarser — the wire format carries no
+  `minimum`/`format` — so it is the backstop, with the client schema catching
+  most issues first.
+
+## Server/Client Component defaults
+
+**Server Components are the default** for routes and page composition.
+`'use client'` is pushed down to the leaf component that actually needs:
+
+- interactivity (event handlers, form state);
+- effects (`useEffect`, subscriptions);
+- browser-only APIs;
+- a Zustand store or a TanStack Query hook.
+
+`src/app/[locale]/layout.tsx` stays a Server Component. It mounts
+`RootClientMessages` for the client core catalogue. Sections add their explicit
+namespaces through `ClientMessages`; see
+[Browser messages](./i18n-and-errors.md#which-messages-reach-the-browser).
+`src/app/[locale]/providers.tsx` owns client-only providers such as Query and PWA.
+Do not mark the root layout as client code. Server translation reads do not
+require moving the complete catalogue into client props.
+
+## State model
+
+| Kind                        | Owner                                                                       | Example                             |
+| --------------------------- | --------------------------------------------------------------------------- | ----------------------------------- |
+| Server-rendered data        | Server Component and server DAL; URL navigation or route refresh updates it | Console inventories                 |
+| Browser-managed server data | TanStack Query; add only required domain rules                              | `entities/user/api/user-queries.ts` |
+| Local client state          | Component/form state; Zustand for shared local state when needed            | No Zustand store required today     |
+
+Choose ownership by behavior. A server-rendered page can keep server-owned rows
+and compose interactive Query leaves. Do not add a browser cache merely because
+its data comes from an API.
+
+When server hydration improves an interactive initial view, seed a request-local
+QueryClient from the server DAL and use `HydrationBoundary`. This is optional;
+client-loaded lists and on-demand dialogs can be appropriate. Organization
+invitations and members show the hydration variant. Keep form input separate
+from cached data and current command permission. Writes update their actual
+dependencies. Use the [data ownership recipe](./api-consumption.md#data-ownership-for-interactive-pages)
+for the three patterns, ordinary list/edit example and named domain rules.
+
+The optional Console's User Detail page uses this split for its Sessions card
+(`features/console-user-sessions/model/use-user-sessions.ts`); its server-side
+fetches follow ADR-079's primary/secondary graceful-degradation contract.
+
+Keep browser-managed server data in its Query cache. Use Zustand only for local client state that
+needs to survive navigation; add such stores under `shared/store/stores/`.
+No Zustand store is currently required. The sidebar owns its state through
+`SidebarProvider`/`useSidebar()` from `shared/ui/sidebar.tsx`.
+Theme uses `useSyncExternalStore` because it synchronizes external
+`localStorage`/`matchMedia` state.
+
+`useCurrentUser()`/`userKeys.me()` is the client source for the current user.
+Login/register/logout update it through `queryClient.setQueryData` or
+`queryClient.clear()`. Do not add a parallel authentication store.
+
+### Search
+
+Keep general FSD and Server/Client rules here. For choosing a search pattern,
+using the shared field and draft controller, building a URL-backed feature
+adapter, and testing navigation races, start with the dedicated
+[Frontend search guide](./search/README.md). The feature owns its query,
+result and navigation policy; shared primitives remain Console-independent.
+
+## Relationship to backend/OpenAPI docs
+
+`docs/frontend/` documents **consumption patterns** — how the frontend calls
+the backend, maps errors, and structures query keys. It never re-documents
+endpoint shapes; those live in the Swagger/OpenAPI document at `/docs`
+(`apps/api/src/swagger.config.ts`), per `AGENTS.md`'s "OpenAPI is public
+documentation" rule. When in doubt about a request/response shape, the
+answer is `/docs` or the shared Zod schema in `packages/shared`, not this
+guide.
+
+### Browser API reach
+
+All browser-side calls go through this app's own same-origin `/api/*` Route
+Handlers (ADR-068) — never a `next.config.ts` `rewrites()` proxy, and never
+a direct cross-origin client against `apps/api`. Same-origin avoids a class
+of CORS/cookie problems for free, and it's what lets the browser hold only
+one opaque `amcore_session` cookie instead of a backend access token in any
+form.
+
+The main Route Handler shapes live under
+`apps/web/src/app/api/`:
+
+- **Session-minting handlers** for auth-specific concerns that need the raw
+  backend `refresh_token` server-side
+  (`/api/auth/{login,register,logout}`, the OAuth init/callback/exchange
+  routes) — see `shared/api/bff/credential-auth-handler.ts`. OAuth briefly
+  relays a temporary HttpOnly/Strict refresh cookie. The localized callback is
+  a public document; its native form posts to the literal site/admin completion
+  Route Handler. That admitted POST consumes/deletes the temporary cookie;
+  see [OAuth](../auth/oauth.md). Dedicated session list/revoke handlers attach
+  the stored refresh cookie server-side as well.
+- **Public action handlers** for the four email-link auth flows
+  (`/api/auth/{forgot-password,reset-password,verify-email,resend-verification}`)
+  — `shared/api/bff/public-auth-action.ts`. These don't mint a session
+  (none of the four authenticate anyone); they exist because the caller may
+  have **no** `amcore_session` cookie at all, which the generic catch-all
+  below requires and 401s without.
+- **The generic catch-all** (`/api/[...path]`) for everything else that
+  has a session and is safe to forward: reads `amcore_session`, refreshes the
+  access token if needed (`ensureFreshSession`), and proxies to `apps/api`
+  with `Authorization: Bearer` attached server-side.
+
+The catch-all rejects JWT issuance before reading a session or contacting the API:
+login/register/refresh/step-up, OAuth exchange and organization switch. It checks
+its effective upstream URL, including case and dot-segment resolution, rather
+than relying on dedicated handlers to shadow canonical paths. Authenticated JWT
+issuance still needs deliberate server consumption; see
+[Credential containment](./api-consumption.md#credential-containment).
+
+`apps/web/src/shared/api/http-client.ts` is the reference client for
+Client Components: same-origin relative paths (`fetch('/api' + path)`), no
+manual `Authorization` header, no manual `credentials` option (`fetch`
+already defaults to `credentials: 'same-origin'`). `ApiRequestError`/
+`ApiNetworkError` identify application and transport failures in
+`shared/api/errors.ts`. Use its public helpers, such as `isApiError` and
+`getValidationErrors`, through `ApiErrorAlert` and `useFormMutation`.
+
+## The recipe — adding a route
+
+1. Add the route file under `src/app/[locale]/` (`page.tsx`, `layout.tsx`,
+   etc.) — metadata and plumbing only. Server Component pages should call
+   `setRequestLocale(await resolveLocaleParam(params))` first; see
+   [Locale routing](#locale-routing). **If this route is genuinely public
+   content that should stay statically generated/CDN-cached** (a
+   marketing/landing page, not an authenticated app page), read
+   [Browser security headers and CSP § Downstream forks](./browser-security-and-csp.md#downstream-forks-publicmarketing-routes-and-route-scoping)
+   first — the CSP wiring every route inherits by default will otherwise
+   silently force it dynamic.
+2. Build the actual page composition under `src/_pages/<route>/`, importing
+   whatever `widgets`/`features`/`entities` it needs through their public
+   APIs.
+3. If the route needs new server state, add a query (and query keys) in the
+   owning `entities/` slice, following `entities/user/api/user-queries.ts`.
+4. If the route needs new local UI state, add it to `shared/store` or a
+   feature-local store — only promote it to `shared` if more than one feature
+   needs it.
+5. Decide Server vs Client for each new component per
+   [Server/Client Component defaults](#serverclient-component-defaults)
+   before defaulting to `'use client'`.
+6. Add copy to **every** catalogue under `apps/web/messages/`, starting from
+   `en.json` — the parity test fails a key that exists in one locale only.
+   Never inline user-facing text in a component.
+7. Update this guide's tables only if the route introduces a new pattern, not
+   for routine additions.
+
+## Downstream adoption
+
+A downstream product forks `apps/web` **in place**: same repository layout,
+same layer contract described in this guide. Branding, theme, and design
+tokens replace assets, copy, and tokens — they do not change this
+architectural structure.
+
+## See also
+
+- [Frontend search](./search/README.md) — choosing and implementing search
+  patterns with the shared field and draft controller.
+- [Brand, theme, and design tokens](./brand-theme-and-tokens.md) — token
+  architecture, light/dark/system modes, the no-flash mechanism, and the
+  downstream rebrand checklist.
+- [Browser security headers and CSP](./browser-security-and-csp.md) — the
+  static header baseline, nonce-based CSP, enforcement mode, and
+  downstream route-scoping for public/marketing routes.
+- [Shared UI & shadcn](./shared-ui-and-shadcn.md) — the `shared/ui` reuse
+  rule, the safe shadcn CLI procedure, and the current primitive inventory.
+- [API consumption](./api-consumption.md) — the hooks that consume media,
+  notifications, and AI through the BFF Route Handler layer this page
+  describes.
+- [Testing](./testing.md) — test-layer selection, async Server Component limits,
+  the narrow resolved-output unit-test case and real auth/BFF coverage.
+- [Storybook](./storybook.md) — the component workshop and its own
+  accessibility gate, a fifth layer of the testing pyramid above.
+- [Backend architecture & conventions](../backend/architecture-and-conventions.md) —
+  the equivalent contract for `apps/api`.
+- `AGENTS.md` → Code conventions — the condensed cross-tool version of the
+  rules on this page.
+- [Route bundle budgets](./bundle-budget.md) — the per-page first-load
+  JavaScript limits CI enforces after every web build.
+
+### Organization composition capability entries
+
+Next route wiring may enter `_app/organization-access/index.server.ts` (ready
+content mount without AppShell), `index.client.ts` (menu), and `index.config.ts`
+(serializable placement). These are exact ESLint boundary exceptions for this
+slice; lower layers and arbitrary deep imports remain forbidden. The existing
+slice index preserves compatibility but has a mixed module graph. See
+[product integration](../product-admin/integration.md).
+
+Invitation routes use the named `_app/invitation-flow/index.server.ts`,
+`index.client.ts`, and `index.config.ts` capability entries for server wiring,
+interactive composition, and serializable placement respectively. ESLint permits
+only those entry files from Next routing. Lower layers cannot import composition;
+downstream presentation uses the headless `entities/invitation-flow` public API.

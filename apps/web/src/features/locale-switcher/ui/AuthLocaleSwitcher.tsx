@@ -1,0 +1,25 @@
+'use client'
+
+import { useTranslations } from 'next-intl'
+import { SERVED_LOCALES } from '@amcore/shared'
+
+import { LocaleSelector } from '@/shared/ui/locale-selector'
+
+import { useLocaleChange } from '../model/use-locale-change'
+
+/** Pending authentication changes URL/cookie only; it never reads a product profile. */
+export function AuthLocaleSwitcher() {
+  const t = useTranslations('locale')
+  const { value, pending, change } = useLocaleChange()
+  // A build that serves one locale has nothing to choose; hooks above stay unconditional.
+  if (SERVED_LOCALES.length < 2) return null
+  return (
+    <LocaleSelector
+      label={t('label')}
+      items={SERVED_LOCALES.map((locale) => ({ value: locale, label: t(locale) }))}
+      value={value}
+      pending={pending}
+      onChange={change}
+    />
+  )
+}

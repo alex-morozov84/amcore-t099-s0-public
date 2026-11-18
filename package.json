@@ -1,0 +1,93 @@
+{
+  "name": "amcore",
+  "version": "0.11.0",
+  "private": true,
+  "type": "module",
+  "description": "Production-oriented NestJS application starter",
+  "author": "Alexander Morozov <mail@alex-morozov.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alex-morozov84/AMCore.git"
+  },
+  "engines": {
+    "node": ">=24.15.0",
+    "pnpm": ">=12.18.0"
+  },
+  "packageManager": "pnpm@12.18.0",
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "check:route-budgets": "node scripts/check-route-budgets.mjs",
+    "lint": "turbo lint && node scripts/lint.mjs --scope root scripts",
+    "lint:fix": "turbo run lint:fix && node scripts/lint.mjs --scope root --fix scripts",
+    "test": "turbo test",
+    "test:console-session-e2e": "node scripts/run-console-session-e2e.mjs",
+    "test:scripts": "node --test --test-concurrency=1 scripts/lib/*.test.mjs scripts/*.test.mjs",
+    "test:observability-contract": "node --test --test-concurrency=1 scripts/observability-contract/*.test.mjs scripts/observability-contract/live/*.test.mjs",
+    "test:observability-contract:live": "bash scripts/observability-contract/run-live.sh",
+    "typecheck": "turbo typecheck",
+    "clean": "turbo clean && rm -rf node_modules",
+    "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md}\"",
+    "format:check": "prettier --check \"**/*.{ts,tsx,js,jsx,json,md}\"",
+    "prepare": "husky",
+    "init:brand": "node scripts/init-brand.mjs",
+    "stand": "node scripts/stand.mjs",
+    "test:stands": "node scripts/stand/run-tests.mjs",
+    "test:capability-extension": "bash scripts/fixtures/t024-capability-extension.sh",
+    "test:extension-contracts": "bash scripts/fixtures/notification-ai-extension-contracts.sh",
+    "test:background-work-contracts": "pnpm --filter api test:e2e --runTestsByPath test/notification-work-control.e2e-spec.ts test/notification-work-retention.e2e-spec.ts test/notification-work-races.e2e-spec.ts test/notification-work-http.e2e-spec.ts test/notification-control-migration.e2e-spec.ts test/notification-dispatch.e2e-spec.ts test/background-work-startup.e2e-spec.ts test/background-work-image.e2e-spec.ts test/background-work-http.e2e-spec.ts test/background-work-ledger.e2e-spec.ts test/background-work-pause.e2e-spec.ts test/queued-email-control.e2e-spec.ts test/queue-inventory.e2e-spec.ts test/queue-inventory-worker.e2e-spec.ts test/queue-inventory-disabled.e2e-spec.ts test/queue-inventory-disabled-worker.e2e-spec.ts test/queue-inventory-production.e2e-spec.ts test/queue-observation.e2e-spec.ts test/admin-queues.e2e-spec.ts test/bull-board-readonly.e2e-spec.ts test/bull-board-disclosure.e2e-spec.ts test/bull-board-edge.e2e-spec.ts test/bull-board-disabled-boot.e2e-spec.ts",
+    "audit:web": "node scripts/lighthouse.mjs",
+    "audit:web:plan": "node scripts/lighthouse.mjs --plan",
+    "test:lighthouse": "node --test --test-concurrency=1 scripts/lib/lighthouse*.test.mjs",
+    "audit:web:browser": "node scripts/lighthouse/install-browser.mjs"
+  },
+  "devDependencies": {
+    "@amcore/eslint-config": "workspace:*",
+    "@clack/prompts": "^1.8.1",
+    "@commitlint/cli": "^21.2.4",
+    "@commitlint/config-conventional": "^21.2.4",
+    "@eslint/js": "10.0.1",
+    "@puppeteer/browsers": "3.2.6",
+    "eslint": "10.14.0",
+    "husky": "^9.1.7",
+    "lighthouse": "13.6.0",
+    "lint-staged": "^17.6.0",
+    "oxlint": "1.92.0",
+    "prettier": "^3.9.10",
+    "puppeteer-core": "25.16.0",
+    "turbo": "^2.11.10",
+    "typescript": "^5.9.3",
+    "yaml": "^2.9.1"
+  },
+  "lint-staged": {
+    "*.{json,md,yml,yaml}": [
+      "prettier --write"
+    ],
+    "apps/api/**/*.{ts,tsx,js,jsx}": [
+      "node scripts/lint.mjs --scope api --fix --no-warn-ignored",
+      "node scripts/lint.mjs --scope api --max-warnings=0 --no-warn-ignored",
+      "prettier --write"
+    ],
+    "apps/web/**/*.{ts,tsx,js,jsx}": [
+      "node scripts/lint.mjs --scope web --fix --no-warn-ignored",
+      "node scripts/lint.mjs --scope web --max-warnings=0 --no-warn-ignored",
+      "prettier --write"
+    ],
+    "packages/shared/**/*.{ts,tsx,js,jsx}": [
+      "node scripts/lint.mjs --scope shared --fix --no-warn-ignored",
+      "node scripts/lint.mjs --scope shared --max-warnings=0 --no-warn-ignored",
+      "prettier --write"
+    ],
+    "!({apps,packages}/**).{ts,tsx,js,jsx,mjs}": [
+      "node scripts/lint.mjs --scope root --fix --no-warn-ignored",
+      "node scripts/lint.mjs --scope root --max-warnings=0 --no-warn-ignored",
+      "prettier --write"
+    ],
+    "packages/eslint-config/**/*.{js,mjs}": [
+      "node scripts/lint.mjs --scope config --fix --no-warn-ignored",
+      "node scripts/lint.mjs --scope config --max-warnings=0 --no-warn-ignored",
+      "prettier --write"
+    ]
+  }
+}

@@ -1,0 +1,134 @@
+# CSRF Posture
+
+AMCore's backend API is bearer-first. Most routes authenticate with an explicit
+`Authorization: Bearer ...` header, so they are not vulnerable to classic CSRF:
+an attacker's page cannot cause the browser to invent that header.
+
+For direct `apps/api` browser consumers, the only ambient browser credential is
+the `refresh_token` cookie. The bundled Next.js app (`apps/web`) adds a second
+browser boundary of its own: the browser holds an opaque `amcore_session` cookie
+for `apps/web`, while the backend access/refresh tokens live in the web
+server's Redis session vault (ADR-068). That shifts CSRF protection for
+same-origin `/api/*` web calls to the browser→Next layer; see
+[Frontend architecture → Browser API reach](../frontend/architecture-and-conventions.md#browser-api-reach).
+
+## What is actually in scope
+
+Cookie-backed browser surfaces are intentionally narrow:
+
+- `POST /auth/logout`
+- `POST /auth/refresh`
+- `POST /auth/oauth/exchange`
+- Bull Board at `/admin/queues` (view-only, `GET`/`HEAD` only)
+
+The backend refresh cookie is `httpOnly` and `SameSite=Strict`, so browsers do
+not send it on normal cross-site requests. That is the primary CSRF layer for
+direct API consumers.
+
+For `apps/web`, state-changing same-origin BFF Route Handlers apply the same
+Origin/Referer reasoning with a web-owned allowlist (`WEB_TRUSTED_ORIGINS`),
+not `apps/api`'s `CORS_ORIGIN`. Keep those two configs aligned in deployment,
+but do not treat them as the same setting: one protects browser→Next, the other
+protects browser→API.
+
+## Why AMCore does not use blanket CSRF middleware
+
+Blanket CSRF middleware across the whole API would mostly wrap bearer-only routes
+that do not use ambient credentials. It would add integration friction without
+covering a real threat. AMCore instead protects only the cookie-auth browser
+surfaces.
+
+## Second layer on cookie POST routes
+
+Bundled web requests additionally carry a confidential server-side frontend proof.
+For proved requests the selected frontend origin must match exactly. The staff
+BFF rejects mutations without a matching Origin or Referer before cookie/vault
+work; site native-client compatibility does not weaken this staff check.
+See [product-admin placement](../product-admin/placement-and-sessions.md).
+
+AMCore adds a narrow `Origin` / `Referer` check on the cookie-auth POST endpoints.
+
+- Trusted origins come from `CORS_ORIGIN`.
+- Matching is exact origin matching: `scheme://host[:port]`.
+- `Origin` is checked first.
+- If `Origin` is absent, the backend falls back to the origin portion of
+  `Referer`.
+- If both are absent, the request is allowed by design.
+
+This allow-on-missing policy is a deliberate, **frontend-agnostic** choice, not a
+Next.js-specific one. CSRF is a browser-only threat: it relies on the browser
+auto-attaching the cookie, and browsers always send `Origin` on cross-origin POST
+(and on same-origin non-GET). It follows that:
+
+- A **plain React / SPA** frontend always sends `Origin` on its API calls, so the
+  check fully enforces and the "both absent" branch is never reached.
+- A request that carries the cookie but **no** `Origin`/`Referer` is necessarily a
+  non-browser caller — SSR server-to-server, native/mobile, or CLI. Those cannot
+  mount CSRF (they don't ride a victim's ambient cookie), so allowing them removes no
+  protection, while blocking them would only break legitimate clients.
+
+The enforced guarantee is therefore: **any browser cross-origin POST must come from an
+allowlisted origin** — which is exactly the situation where cookie-CSRF is possible.
+
+## Invitation browser mutations
+
+Recipient invitation mutations require an explicit `Origin` equal to their
+canonical trusted product origin. Missing Origin, Referer alone, another trusted
+origin and sibling hosts do not satisfy this check. The HttpOnly invitation owner
+proof additionally binds the flow to that browser/origin and current session;
+selectors are not credentials. GET ingress/reads never join or confirm login.
+Manager invitation commands use the strict mutation Origin check in their typed
+product context adapters. This is narrower than the direct API cookie POST
+policy above. See [invitation BFF contracts](invites.md#browser-bff-contract) and
+[proof cookie options](../frontend/browser-security-and-csp.md#invitation-browser-proof).
+
+## Operations Console host mode
+
+Console login and logout are a narrower, host-only cookie surface. They require
+an explicit `Origin` or `Referer` resolving to the exact configured
+`https://ADMIN_CONSOLE_HOSTNAME` origin; missing, malformed, product-host, and
+other sibling-origin values are rejected. The console does not extend the
+product `WEB_TRUSTED_ORIGINS` allowlist, because same-site subdomains are still
+different origins for this browser-to-BFF boundary. `SameSite=Strict` and the
+host-only `__Host-amcore_console_session` cookie are complementary controls,
+not substitutes for this exact-origin check.
+
+## Bull Board
+
+Bull Board is not mounted in production unless explicitly enabled, and it is never
+mounted on the `worker` HTTP role. It has no writable mode: every other method than
+`GET`/`HEAD` is refused with `405` by the server, whatever the environment, so a
+cookie-backed request cannot change a queue and there is no state-changing request to forge.
+The cookie only authorizes reading. The board is also reached with a bearer token by a server-side client (the
+Operations Console's server, when it is present); that path involves no ambient browser
+credential.
+
+## OAuth note
+
+OAuth has its own CSRF class: login CSRF / session swapping. A one-time server-side
+`state` value is not enough unless it is also bound to the browser that initiated
+the flow. AMCore therefore binds OAuth login/link state to a short-lived browser
+cookie in addition to the server-side state record.
+
+The final web completion document has no auth side effects. Both site and admin
+completion POSTs additionally require exact Host and a non-null Origin before
+credential/recovery/cleanup work. The document alone uses strict-origin so native
+forms preserve Origin without disclosing the ticket in Referer; POST responses and
+other secret routes keep no-referrer. See [OAuth completion](oauth.md#how-oauth-login-works).
+
+## Static analysis (CodeQL) false positives
+
+The OAuth browser-binding nonce trips three CodeQL queries that are vetted false
+positives — they are dismissed (reason: _false positive_), not real findings:
+
+- **`js/insufficient-password-hash`** on `hashOAuthStateNonce` — the input is a
+  256-bit cryptographically-random nonce, not a low-entropy password, so a fast
+  SHA-256 is correct (a slow KDF defends only against brute-forcing guessable
+  secrets). Same transform as `refresh-token-hash.ts`.
+- **`js/clear-text-storage-of-sensitive-data`** on the `oauth_state` cookie — storing
+  the raw nonce in the browser cookie _is_ the binding mechanism; the server keeps
+  only its hash. Removing it would delete the protection.
+
+The cookie-hardening queries (`js/client-exposed-cookie`, `js/clear-text-cookie`) are
+_not_ dismissed: the cookie is set with an inline options literal so `httpOnly` and
+`secure` (prod) are statically visible to the analyzer.

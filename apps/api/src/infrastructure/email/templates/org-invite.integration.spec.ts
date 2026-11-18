@@ -1,0 +1,68 @@
+/**
+ * Integration test for Organization Invite Email Template (OB-02).
+ *
+ * Tests real React Email rendering without mocks.
+ * Uses Vitest (React Email's official testing framework) with happy-dom.
+ *
+ * @see https://react.email/docs/introduction#testing
+ */
+
+import { render } from '@react-email/render'
+import { describe, expect, it } from 'vitest'
+
+import OrgInviteEmail, { getOrgInviteSubject } from './org-invite'
+
+const baseProps = {
+  orgName: 'Acme Inc.',
+  inviterName: 'Александр Морозов',
+  inviterEmail: 'alex@example.com',
+  roleName: 'MEMBER',
+  acceptUrl: 'https://app.example.com/invite/accept?token=raw-token-123',
+  expiresInDays: 7,
+}
+
+// Supplied by the configured happy-dom test environment.
+declare const DOMParser: typeof import('happy-dom').DOMParser
+
+describe('OrgInviteEmail Template (Integration)', () => {
+  it('should render in the base locale (English) by default with the sign-in CTA', async () => {
+    const html = await render(OrgInviteEmail({ ...baseProps, hasAccount: true }))
+
+    // English content
+    expect(html).toContain('Acme Inc.')
+    expect(html).toContain('alex@example.com')
+    expect(html).toContain('MEMBER')
+    expect(html).toContain('Sign in to accept the invitation')
+
+    // The raw accept token must reach the recipient via the button href.
+    const document = new DOMParser().parseFromString(html, 'text/html')
+    const cta = Array.from(document.querySelectorAll('a')).find((link) =>
+      link.textContent?.includes('Sign in to accept the invitation')
+    )
+    expect(cta?.getAttribute('href')).toBe(baseProps.acceptUrl)
+
+    // HTML structure
+    expect(html).toContain('<!DOCTYPE html')
+    expect(html).toContain('</html>')
+  })
+
+  it('should render the sign-up CTA when the recipient has no account', async () => {
+    const html = await render(OrgInviteEmail({ ...baseProps, hasAccount: false }))
+
+    expect(html).toContain('Create an account to join')
+    expect(html).not.toContain('Sign in to accept the invitation')
+  })
+
+  it('should render in Russian when locale=ru', async () => {
+    const html = await render(OrgInviteEmail({ ...baseProps, hasAccount: true, locale: 'ru' }))
+
+    expect(html).toContain('Войти и принять приглашение')
+    expect(html).not.toContain('Sign in to accept the invitation')
+    expect(html).toContain('https://app.example.com/invite/accept?token=raw-token-123')
+  })
+
+  it('should localize the subject with the org name', () => {
+    expect(getOrgInviteSubject('Acme Inc.', 'ru')).toContain('Acme Inc.')
+    expect(getOrgInviteSubject('Acme Inc.', 'en')).toBe('Invitation to join Acme Inc.')
+  })
+})

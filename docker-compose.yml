@@ -1,0 +1,686 @@
+# AMCore — reference full stack + the production migration contract (ADR-040).
+#
+# Default (.env has COMPOSE_PROFILES=local-infra):
+#   docker compose up          → bundled Postgres + Redis start, the one-shot
+#                                `migrate` service runs `migrate deploy` once,
+#                                then api + web boot. Works out of the box.
+#
+# Remote DB / Redis (managed or VPS):
+#   set COMPOSE_PROFILES= (empty) and COMPOSE_DATABASE_URL / COMPOSE_REDIS_URL
+#   in .env → bundled Postgres/Redis are NOT started. File storage is separate:
+#   choose STORAGE_DRIVER=s3 (+ creds) or explicitly keep local with the shared
+#   persistent local_storage volume and a public API URL.
+#   `required:false` makes the optional dependency skip. (The host DATABASE_URL /
+#   REDIS_URL are for `pnpm dev` and do not affect this stack.)
+#
+# Optional bundled edge (COMPOSE_PROFILES=...,edge): an automatic-HTTPS Caddy
+# reverse proxy in front of `api`. This REPLACES a reverse proxy — use only if
+# you don't already run nginx/Traefik/a cloud LB. See deployment.md → "TLS &
+# reverse proxy" → "Optional bundled edge: Caddy".
+#
+# Optional bundled backup/restore (COMPOSE_PROFILES=...,backup for scheduled
+# pg_dump snapshots; `--profile restore run --rm --no-deps restore <file>` for the
+# one-shot restore). Logical-dump fallback only, NOT point-in-time recovery —
+# Prepare the target DB and stop writers first; follow the full recovery sequence
+# in docs/operations/single-host-compose.md → "Restore a database dump".
+# See docs/operations/backup-restore.md.
+#
+# Optional bundled monitoring (COMPOSE_PROFILES=...,monitoring): a dev-only
+# Prometheus + Grafana + Alertmanager harness that scrapes THIS stack's real
+# api/worker metrics — never part of docker/compose/prod.yml, never a
+# production monitoring stack. Requires METRICS_AUTH_TOKEN and
+# GF_SECURITY_ADMIN_PASSWORD set in .env (compose refuses to start `prometheus`/
+# `grafana` otherwise — no insecure default). See
+# docs/operations/observability.md → "Local Verification Harness".
+#
+# Requires Docker Compose v2.20.2+ (depends_on `required:false`,
+# `service_completed_successfully`; this floor already comfortably covers
+# top-level `secrets: <name>: environment:` too, which the `monitoring`
+# profile's `prometheus` service uses to source its scrape bearer token from
+# the host env without ever writing it to a tracked file — that feature
+# shipped in Compose v2.6.0, 2022-05-30). Production hardening (sslmode, S3,
+# real JWT secret >= 32 chars) is documented in docs/operations/deployment.md.
+#
+# Production image-pull rollout: apply docker/compose/prod.yml on top of this
+# file through the saved complete COMPOSE_FILE to pin api/worker/
+# web/migrate to immutable registry digests instead of building locally, add
+# restart policies, and bound/rotate container logs. See deployment.md →
+# "Production rollout via registry (image-pull path)".
+#
+# The `api` (web role) and `worker` (worker role) run the SAME image; PROCESS_ROLE
+# selects behavior (ADR-041). For a single-process setup, set the api's
+# PROCESS_ROLE=all and drop the worker service.
+
+# Shared backend env for `api` + `worker` (the `web` compose service is the
+# Next.js frontend — unrelated to the backend `web` role).
+x-app-env: &app-env
+  NODE_ENV: ${NODE_ENV:-development}
+  API_PORT: 5002
+  # Operator-declared metadata; web artifact identity is set separately at build time.
+  APP_VERSION: ${APP_VERSION:-unknown}
+  APP_COMMIT: ${APP_COMMIT:-unknown}
+  APP_ENVIRONMENT: ${APP_ENVIRONMENT:-}
+  APP_DEPLOYMENT_ID: ${APP_DEPLOYMENT_ID:-}
+  DATABASE_POOL_MAX: ${DATABASE_POOL_MAX:-10}
+  DATABASE_POOL_IDLE_MS: ${DATABASE_POOL_IDLE_MS:-30000}
+  DATABASE_CONNECT_MS: ${DATABASE_CONNECT_MS:-5000}
+  DATABASE_STATEMENT_TIMEOUT_MS: ${DATABASE_STATEMENT_TIMEOUT_MS:-30000}
+  DATABASE_QUERY_TIMEOUT_MS: ${DATABASE_QUERY_TIMEOUT_MS:-30000}
+  LOG_BODY_MAX_BYTES: ${LOG_BODY_MAX_BYTES:-4096}
+  DATABASE_POOL_WAITING_THRESHOLD: ${DATABASE_POOL_WAITING_THRESHOLD:-5}
+  HEALTH_DISK_THRESHOLD_PERCENT: ${HEALTH_DISK_THRESHOLD_PERCENT:-0.9}
+  # Blank is absent: readiness/liveness retain their distinct default heap ceilings.
+  HEALTH_MEMORY_HEAP_BYTES: ${HEALTH_MEMORY_HEAP_BYTES:-}
+  # Express `trust proxy` (ADR / deployment.md → "TLS & reverse proxy").
+  # Default off (safe with no proxy in front). Set TRUST_PROXY=1 in .env when
+  # enabling the `edge` Caddy profile — Caddy is exactly one hop.
+  TRUST_PROXY: ${TRUST_PROXY:-false}
+  CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3002}
+  # Trusted apps/web peer(s) for the BFF client-IP relay (ADR-072) — a
+  # SEPARATE contract from TRUST_PROXY above (edge -> app hop only). Disabled
+  # by default; only meaningful together with WEB_TRUSTED_CLIENT_IP_HEADER on
+  # the `web` service below. See docs/operations/deployment.md -> "BFF
+  # client-IP relay".
+  TRUSTED_WEB_PEERS: ${TRUSTED_WEB_PEERS:-}
+  GEOIP_ENABLED: ${GEOIP_ENABLED:-true}
+  GEOIP_DB_PATH: ${GEOIP_DB_PATH:-/data/geoip/dbip-city-lite.mmdb}
+  # COMPOSE_* are decoupled from the host DATABASE_URL/REDIS_URL (which are for
+  # `pnpm dev`), so a host `.env` can never poison the container config. Unset →
+  # bundled services; set COMPOSE_DATABASE_URL/COMPOSE_REDIS_URL for managed DB/Redis.
+  DATABASE_URL: ${COMPOSE_DATABASE_URL:-postgresql://amcore:amcore@postgres:5432/amcore}
+  REDIS_URL: ${COMPOSE_REDIS_URL:-redis://redis:6379}
+  # Dev-only secret; production requires a real value >= 32 chars (ADR-029/040).
+  AUTH_PUBLIC_SIGNUP_ENABLED: ${AUTH_PUBLIC_SIGNUP_ENABLED:-true}
+  ORG_SELF_SERVICE_CREATION_ENABLED: ${ORG_SELF_SERVICE_CREATION_ENABLED:-true}
+  # Secret-bearing invitations use direct email; all backend roles need matching mail/link settings.
+  EMAIL_PROVIDER: ${EMAIL_PROVIDER:-mock}
+  RESEND_API_KEY: ${RESEND_API_KEY:-}
+  EMAIL_FROM: ${EMAIL_FROM:-noreply@amcore.com}
+  SUPPORT_EMAIL: ${SUPPORT_EMAIL:-support@amcore.com}
+  FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3002}
+  PRODUCT_ADMIN_ORIGIN: ${PRODUCT_ADMIN_ORIGIN:-}
+  WEB_FRONTEND_CONTEXT_KEY: ${WEB_FRONTEND_CONTEXT_KEY:-}
+  JWT_SECRET: ${JWT_SECRET:-dev-only-jwt-secret-min-32-characters-change-me}
+  JWT_ACCESS_EXPIRATION: ${JWT_ACCESS_EXPIRATION:-15m}
+  JWT_REFRESH_DAYS: ${JWT_REFRESH_DAYS:-7}
+  STEP_UP_MAX_AGE_SECONDS: ${STEP_UP_MAX_AGE_SECONDS:-600}
+  PASSWORD_RESET_EXPIRY_MINUTES: ${PASSWORD_RESET_EXPIRY_MINUTES:-15}
+  EMAIL_VERIFICATION_EXPIRY_HOURS: ${EMAIL_VERIFICATION_EXPIRY_HOURS:-48}
+  # Storage: local by default; set STORAGE_DRIVER=s3 + the vars below for real S3.
+  STORAGE_DRIVER: ${STORAGE_DRIVER:-local}
+  STORAGE_LOCAL_ROOT: ${STORAGE_LOCAL_ROOT:-/app/uploads}
+  STORAGE_ENDPOINT: ${STORAGE_ENDPOINT:-}
+  STORAGE_PRESIGN_ENDPOINT: ${STORAGE_PRESIGN_ENDPOINT:-}
+  STORAGE_PUBLIC_DELIVERY: ${STORAGE_PUBLIC_DELIVERY:-external}
+  STORAGE_PUBLIC_BUCKET: ${STORAGE_PUBLIC_BUCKET:-}
+  STORAGE_MAX_FILE_SIZE: ${STORAGE_MAX_FILE_SIZE:-52428800}
+  STORAGE_SIGNED_URL_DEFAULT_TTL: ${STORAGE_SIGNED_URL_DEFAULT_TTL:-3600}
+  STORAGE_SIGNED_URL_MAX_TTL: ${STORAGE_SIGNED_URL_MAX_TTL:-604800}
+  STORAGE_FORCE_PATH_STYLE: ${STORAGE_FORCE_PATH_STYLE:-false}
+  STORAGE_PUBLIC_BASE_URL: ${STORAGE_PUBLIC_BASE_URL:-}
+  STORAGE_HEALTH_ENABLED: ${STORAGE_HEALTH_ENABLED:-false}
+  STORAGE_HEALTH_PROBE_KEY: ${STORAGE_HEALTH_PROBE_KEY:-__storage_health_check__}
+  STORAGE_PROBE_INTERVAL_SECONDS: ${STORAGE_PROBE_INTERVAL_SECONDS:-600}
+  STORAGE_PROBE_TIMEOUT_SECONDS: ${STORAGE_PROBE_TIMEOUT_SECONDS:-10}
+  STORAGE_PROBE_PREFIX: ${STORAGE_PROBE_PREFIX:-__amcore_probes__}
+  STORAGE_PUBLIC_CHECK_ENABLED: ${STORAGE_PUBLIC_CHECK_ENABLED:-true}
+  STORAGE_PUBLIC_CHECK_INTERVAL_SECONDS: ${STORAGE_PUBLIC_CHECK_INTERVAL_SECONDS:-3600}
+  STORAGE_PUBLIC_CHECK_TIMEOUT_SECONDS: ${STORAGE_PUBLIC_CHECK_TIMEOUT_SECONDS:-10}
+  STORAGE_REGION: ${STORAGE_REGION:-us-east-1}
+  STORAGE_BUCKET: ${STORAGE_BUCKET:-}
+  STORAGE_ACCESS_KEY_ID: ${STORAGE_ACCESS_KEY_ID:-}
+  STORAGE_SECRET_ACCESS_KEY: ${STORAGE_SECRET_ACCESS_KEY:-}
+  # Media limits apply to both roles; keep the runtime schema defaults.
+  MEDIA_MAX_SOURCE_BYTES: ${MEDIA_MAX_SOURCE_BYTES:-5242880}
+  MEDIA_MAX_WIDTH: ${MEDIA_MAX_WIDTH:-8000}
+  MEDIA_MAX_HEIGHT: ${MEDIA_MAX_HEIGHT:-8000}
+  MEDIA_MAX_PIXELS: ${MEDIA_MAX_PIXELS:-40000000}
+  MEDIA_SHARP_LIMIT_INPUT_PIXELS: ${MEDIA_SHARP_LIMIT_INPUT_PIXELS:-40000000}
+  MEDIA_AVATAR_MAX_PIXELS: ${MEDIA_AVATAR_MAX_PIXELS:-8000000}
+  MEDIA_AVATAR_CACHE_CONTROL: ${MEDIA_AVATAR_CACHE_CONTROL:-public, max-age=31536000, immutable}
+  # Provider credentials are backend-only; an empty key does not enable a provider.
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+  YANDEX_API_KEY: ${YANDEX_API_KEY:-}
+  AI_OPENAI_COMPATIBLE_API_KEY: ${AI_OPENAI_COMPATIBLE_API_KEY:-}
+  AI_REQUEST_TIMEOUT_MS: ${AI_REQUEST_TIMEOUT_MS:-60000}
+  AI_CATALOG_CACHE_TTL_SECONDS: ${AI_CATALOG_CACHE_TTL_SECONDS:-300}
+  AI_GUARDRAIL_INPUT_MODE: ${AI_GUARDRAIL_INPUT_MODE:-flag}
+  AI_GUARDRAIL_MAX_INPUT_CHARS: ${AI_GUARDRAIL_MAX_INPUT_CHARS:-100000}
+  AI_TOOL_LOOP_MAX_STEPS: ${AI_TOOL_LOOP_MAX_STEPS:-8}
+  AI_TOOL_EXECUTION_TIMEOUT_MS: ${AI_TOOL_EXECUTION_TIMEOUT_MS:-15000}
+  AI_APPROVAL_TTL_MS: ${AI_APPROVAL_TTL_MS:-86400000}
+  AI_RUN_DEADLINE_MS: ${AI_RUN_DEADLINE_MS:-172800000}
+  AI_ARTIFACT_MAX_IMAGE_BYTES: ${AI_ARTIFACT_MAX_IMAGE_BYTES:-5242880}
+  AI_ARTIFACT_MAX_DOCUMENT_BYTES: ${AI_ARTIFACT_MAX_DOCUMENT_BYTES:-10485760}
+  AI_ARTIFACT_MAX_PARTS_PER_MESSAGE: ${AI_ARTIFACT_MAX_PARTS_PER_MESSAGE:-4}
+  # Realtime notifications (ADR-053). Forwarded to BOTH api (web) and worker via
+  # this anchor so they resolve the SAME channel namespace. Set NAMESPACE per
+  # deployment when several share one Redis (staging != production); the rest fall
+  # back to the env.ts defaults unless an operator overrides them.
+  NOTIFICATIONS_REALTIME_NAMESPACE: ${NOTIFICATIONS_REALTIME_NAMESPACE:-}
+  NOTIFICATIONS_REALTIME_HEARTBEAT_MS: ${NOTIFICATIONS_REALTIME_HEARTBEAT_MS:-20000}
+  NOTIFICATIONS_REALTIME_MAX_PER_USER: ${NOTIFICATIONS_REALTIME_MAX_PER_USER:-5}
+  NOTIFICATIONS_REALTIME_MAX_CONNECTIONS: ${NOTIFICATIONS_REALTIME_MAX_CONNECTIONS:-10000}
+  NOTIFICATIONS_REALTIME_QUEUE_DEPTH: ${NOTIFICATIONS_REALTIME_QUEUE_DEPTH:-16}
+  NOTIFICATIONS_REALTIME_MAX_STREAM_LIFETIME_MS: ${NOTIFICATIONS_REALTIME_MAX_STREAM_LIFETIME_MS:-3600000}
+  NOTIFICATIONS_REALTIME_PUBLISH_TIMEOUT_MS: ${NOTIFICATIONS_REALTIME_PUBLISH_TIMEOUT_MS:-1000}
+  NOTIFICATIONS_REALTIME_MAX_INFLIGHT_PUBLISH: ${NOTIFICATIONS_REALTIME_MAX_INFLIGHT_PUBLISH:-1000}
+  # Prometheus metrics-endpoint bearer token (ADR-042). Empty by default —
+  # `optionalEnvString()` treats "" as unset, so the metrics route stays open
+  # (matching the app's own env-schema default) unless a real token is set.
+  # The `monitoring` profile's `prometheus` service requires this var to be
+  # set (its Compose secret refuses to start otherwise) so the harness always
+  # exercises the authenticated scrape path, never the open default.
+  METRICS_AUTH_TOKEN: ${METRICS_AUTH_TOKEN:-}
+
+# Health-only Node fetch check (node:24-slim has no wget/curl). Readiness, so
+# web waits for DB/Redis to be usable; the worker uses it for liveness too.
+# Use the IPv4 loopback 127.0.0.1, not `localhost`: on minimal/Alpine images
+# `localhost` can resolve to ::1 (IPv6) first while the app listens on IPv4, so
+# the probe would flap `unhealthy`. This upstream image is slim (IPv6 loopback
+# present), but a fork onto a minimal image must not inherit that fragility.
+x-health-ready: &health-ready
+  test:
+    - CMD
+    - node
+    - -e
+    - "fetch('http://127.0.0.1:5002/api/v1/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 20s
+
+services:
+  # ---------------------------------------------------------------------------
+  # Bundled infra — OPTIONAL, only with COMPOSE_PROFILES=local-infra.
+  # Skip these (empty COMPOSE_PROFILES) when using a managed/VPS DB or Redis.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:18-alpine
+    profiles: ['local-infra']
+    # Loads pg_stat_statements at server start (verified: this module cannot be
+    # added without a restart — see docs/operations/pg-stat-statements-setup.md)
+    # so a fork can exercise docs/operations/slow-query-investigation.md's
+    # queries directly against this bundled instance. Collection begins the
+    # moment the module loads here, at container start — verified live, not
+    # gated on `CREATE EXTENSION`, which (superuser-only, `amcore` already is
+    # one here) is still a separate, deliberate step the setup guide walks
+    # through; it registers the extension and builds its query interface
+    # (the pg_stat_statements/pg_stat_statements_info views and the
+    # pg_stat_statements_reset() function) onto data that's already
+    # accumulating, not merely "a view."
+    # track_utility=off is NOT PostgreSQL's own default (which is `on`) —
+    # verified live that the default lets every pg_monitor-holding role read
+    # back the literal text of CREATE ROLE/ALTER ROLE ... PASSWORD statements,
+    # including the password itself. Off here for the same reason production
+    # must set it off too (see the guide).
+    command: postgres -c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.track=top -c pg_stat_statements.track_utility=off
+    environment:
+      POSTGRES_USER: amcore
+      POSTGRES_PASSWORD: amcore
+      POSTGRES_DB: amcore
+    ports:
+      # Loopback-only by default, like api/web: host tools reach localhost:5432, other
+      # hosts do not. Docker port publishing bypasses host firewalls such as ufw, and this
+      # bundled role uses the fixed amcore/amcore credentials above. Widen it only behind
+      # your own firewall. See docs/operations/deployment.md → "Bundled Postgres and Redis".
+      - '${POSTGRES_PUBLISH_HOST:-127.0.0.1}:5432:5432'
+    # postgres:18+ images declare VOLUME /var/lib/postgresql (PGDATA lives at
+    # /var/lib/postgresql/18/docker inside it) — the pre-18 /var/lib/postgresql/data
+    # mount point is gone; see docs/operations/postgresql-major-upgrade.md.
+    # A distinct volume name (not the old postgres_data) so an existing PG16
+    # deployment's data is never silently mounted into a PG18 server.
+    volumes:
+      - postgres_data_pg18:/var/lib/postgresql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U amcore -d amcore']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    profiles: ['local-infra']
+    # noeviction is mandatory for BullMQ (the only policy that keeps queues
+    # correct — BullMQ docs); appendonly (AOF) persists jobs across restarts.
+    command: redis-server --appendonly yes --maxmemory-policy noeviction
+    ports:
+      # Loopback-only by default: the bundled Redis has no password.
+      - '${REDIS_PUBLISH_HOST:-127.0.0.1}:6379:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # One-shot migration step (ADR-040/058): runs `migrate deploy` once, BEFORE api/web.
+  # This uses the CLI-capable migrator target; the app runtime image is CLI-free.
+  # Uses MIGRATION_DATABASE_URL (direct connection) when set, else DATABASE_URL.
+  # `required:false` lets it wait for bundled Postgres when present and skip it
+  # when using a remote DB. Rerun it on upgrades before recreating api/web.
+  # ---------------------------------------------------------------------------
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: migrator
+    environment:
+      DATABASE_URL: ${MIGRATION_DATABASE_URL:-${COMPOSE_DATABASE_URL:-postgresql://amcore:amcore@postgres:5432/amcore}}
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+    restart: 'no'
+
+  # ---------------------------------------------------------------------------
+  # Guarded system seed — one-shot, never part of a normal `up`. Runs from the API
+  # image, so a production host needs no source checkout or Node toolchain:
+  #   docker compose --profile seed run --rm system-seed
+  # Only this container receives the migration (owner) URL; api/worker never do.
+  # An unset URL keeps `compose config` working; the seed command then refuses.
+  # See docs/operations/deployment.md → "Seeding".
+  # ---------------------------------------------------------------------------
+  system-seed:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      args:
+        BUILD_NODE_OPTIONS: ${BUILD_NODE_OPTIONS:-}
+        BUILD_SOURCE_COMMIT: ${BUILD_SOURCE_COMMIT:-}
+    profiles: ['seed']
+    command: ['node', 'dist/cli/system-seed.js', '--url-from-env', 'MIGRATION_DATABASE_URL']
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+    restart: 'no'
+
+  # API (web role): HTTP only, enqueues jobs. PROCESS_ROLE=web → no processors/cron.
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      args:
+        # Build stage only (never the runtime image). See docs/operations/capacity.md.
+        BUILD_NODE_OPTIONS: ${BUILD_NODE_OPTIONS:-}
+        BUILD_SOURCE_COMMIT: ${BUILD_SOURCE_COMMIT:-}
+    ports:
+      # Loopback-only by default (ADR-072): reachable as localhost:5002 on
+      # THIS host for local dev/curl, but not from other hosts or the
+      # internet. This is the single-path production default — the bundled
+      # Caddy (`edge` profile) and the documented nginx reference config
+      # both reach api by its Docker network name (api:5002), never through
+      # this published host port, so nothing documented depends on it being
+      # broader. If your own topology genuinely needs api reachable on all
+      # interfaces (e.g. an external reverse proxy NOT on this compose
+      # network), set API_PUBLISH_HOST=0.0.0.0 in .env — you then own
+      # firewalling/access control for that port yourself. See
+      # docs/operations/deployment.md → "BFF client-IP relay".
+      - '${API_PUBLISH_HOST:-127.0.0.1}:5002:5002'
+    # Docker sends SIGTERM and kills the container after this long (the default is 10 s). The
+    # API's own shutdown (HTTP drain, queue/Redis/DB teardown) needs more than that; the worker
+    # below stops taking new notification work immediately, then gives in-flight deliveries
+    # up to 15 s to record their results. See docs/operations/deployment.md → "Graceful shutdown".
+    stop_grace_period: 30s
+    environment:
+      <<: *app-env
+      PROCESS_ROLE: web
+    volumes:
+      # GeoIP database (read-only here; the worker's own updater is the sole
+      # writer). Shared across replicas on this single-host Compose topology
+      # only — see docs/operations/geoip-setup.md.
+      - local_storage:/app/uploads
+      - geoip_data:/data/geoip:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+        required: false
+      redis:
+        condition: service_healthy
+        required: false
+    healthcheck: *health-ready
+
+  # Worker role: BullMQ processors + cron, health-only HTTP (no published port —
+  # avoids the api's 5002; k8s probes the pod directly). PROCESS_ROLE=worker.
+  worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      args:
+        BUILD_NODE_OPTIONS: ${BUILD_NODE_OPTIONS:-}
+        BUILD_SOURCE_COMMIT: ${BUILD_SOURCE_COMMIT:-}
+    # See the note on `api`: the worker's notification dispatcher closes (no new claims or sends),
+    # waits up to ~15 s for in-flight deliveries to record their result, then the database is
+    # torn down. The default 10 s kill timer would cut that short.
+    stop_grace_period: 30s
+    environment:
+      <<: *app-env
+      PROCESS_ROLE: worker
+    volumes:
+      # Sole GeoIP updater writer — see docs/operations/geoip-setup.md.
+      - local_storage:/app/uploads
+      - geoip_data:/data/geoip
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+        required: false
+      redis:
+        condition: service_healthy
+        required: false
+    healthcheck: *health-ready
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        NEXT_DEPLOYMENT_ID: ${NEXT_DEPLOYMENT_ID:-}
+        BUILD_NODE_OPTIONS: ${BUILD_NODE_OPTIONS:-}
+        BUILD_SOURCE_COMMIT: ${BUILD_SOURCE_COMMIT:-}
+    ports:
+      - '${WEB_PUBLISH_HOST:-127.0.0.1}:3000:3000'
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      API_URL: ${API_URL:-http://api:5002}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3002}
+      PRODUCT_ADMIN_ORIGIN: ${PRODUCT_ADMIN_ORIGIN:-}
+      WEB_FRONTEND_CONTEXT_KEY: ${WEB_FRONTEND_CONTEXT_KEY:-}
+      # BFF session vault (ADR-068) — required for authenticated flows, not
+      # just the API. Same COMPOSE_REDIS_URL override as `x-app-env` above.
+      REDIS_URL: ${COMPOSE_REDIS_URL:-redis://redis:6379}
+      # CSRF trusted-origin allowlist (ADR-068) for the browser<->Next
+      # boundary. Defaults to THIS service's own published origin
+      # (localhost:3000) — deliberately different from origin-guard.ts's
+      # bare-`pnpm dev` default (localhost:3002, matching `next dev --port
+      # 3002`). The two dev entry points publish on different ports; each
+      # environment's WEB_TRUSTED_ORIGINS must match how the browser
+      # actually reaches this stack.
+      WEB_TRUSTED_ORIGINS: ${WEB_TRUSTED_ORIGINS:-http://localhost:3000}
+      WEB_INVITATION_LOCAL_HTTP_ORIGIN: ${WEB_INVITATION_LOCAL_HTTP_ORIGIN:-}
+      # Origin public files (avatars) load from; added to the CSP img-src. Must equal the origin of
+      # STORAGE_PUBLIC_BASE_URL (the default matches the local driver served by the api service).
+      # A set but unusable value stops the web service at start-up.
+      WEB_PUBLIC_FILES_ORIGIN: ${WEB_PUBLIC_FILES_ORIGIN:-http://localhost:5002}
+      # Search-engine indexing is closed unless both are set (docs/frontend/seo.md). Read at run
+      # time: the same image is closed on staging and open in production. Enabled requires an
+      # https WEB_SITE_ORIGIN that is also in WEB_TRUSTED_ORIGINS, or the web service stops.
+      WEB_SEO_INDEXING: ${WEB_SEO_INDEXING:-}
+      WEB_SITE_ORIGIN: ${WEB_SITE_ORIGIN:-}
+      # Trusted inbound client-IP header (ADR-072) — disabled by default
+      # (empty), matching apps/web's own safe default. Only set this when an
+      # edge proxy/LB sits directly in front of THIS web container and
+      # overwrites (never appends to) the named header; see .env.example and
+      # docs/frontend/api-consumption.md.
+      WEB_TRUSTED_CLIENT_IP_HEADER: ${WEB_TRUSTED_CLIENT_IP_HEADER:-}
+      # CSP mode. This service
+      # runs the standalone production build, so unset defaults to
+      # "enforce" (the module's own environment-aware default); see
+      # .env.example for the full contract.
+      WEB_CSP_MODE: ${WEB_CSP_MODE:-}
+      ADMIN_CONSOLE_HOSTNAME: ${ADMIN_CONSOLE_HOSTNAME:-}
+      ADMIN_CONSOLE_ORIGIN: ${ADMIN_CONSOLE_ORIGIN:-}
+      ADMIN_CONSOLE_METRICS_URL: ${ADMIN_CONSOLE_METRICS_URL:-}
+      ADMIN_CONSOLE_METRICS_GRAFANA_URL: ${ADMIN_CONSOLE_METRICS_GRAFANA_URL:-}
+      ADMIN_CONSOLE_LOGS_URL: ${ADMIN_CONSOLE_LOGS_URL:-}
+      ADMIN_CONSOLE_ALERTS_URL: ${ADMIN_CONSOLE_ALERTS_URL:-}
+      ADMIN_CONSOLE_LOGS_GRAFANA_URL: ${ADMIN_CONSOLE_LOGS_GRAFANA_URL:-}
+    # Local HTTP readiness only: no session, page rendering or backend request.
+    # Node bounds I/O at 3s; Docker's outer timeout also kills a blocked event loop.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          setTimeout(() => process.exit(1), 3000);
+          fetch('http://127.0.0.1:3000/api/deployment-version', { redirect: 'error', signal: AbortSignal.timeout(3000) })
+          .then(async response => {
+            if (response.status !== 200) process.exit(1);
+            const data = await response.json();
+            process.exit(typeof data?.version === 'string' && /^[a-zA-Z0-9._-]{1,128}$$/.test(data.version) ? 0 : 1);
+          }).catch(() => process.exit(1));
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+        required: false
+
+  # ---------------------------------------------------------------------------
+  # Optional bundled edge — OPTIONAL, only with COMPOSE_PROFILES=...,edge.
+  # Replaces a reverse proxy; requires CADDY_DOMAIN/CADDY_EMAIL (below) and a
+  # real domain pointed at this host. See deployment.md → "TLS & reverse
+  # proxy" → "Optional bundled edge: Caddy".
+  # ---------------------------------------------------------------------------
+  caddy:
+    image: caddy:2-alpine
+    profiles: ['edge']
+    environment:
+      # NOT `:?required` — that's interpolated for every service at `compose
+      # config` time regardless of profile, which would break the default
+      # (non-`edge`) stack for everyone. An empty value here instead fails
+      # inside the `caddy` container at startup — only when `edge` is active.
+      CADDY_DOMAIN: ${CADDY_DOMAIN:-}
+      CADDY_EMAIL: ${CADDY_EMAIL:-}
+    ports:
+      - '80:80'
+      - '443:443'
+      - '443:443/udp' # HTTP/3
+    volumes:
+      - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Optional bundled backup — OPTIONAL, only with COMPOSE_PROFILES=...,backup.
+  # Logical-dump fallback (NOT point-in-time recovery) — see
+  # docs/operations/backup-restore.md.
+  # ---------------------------------------------------------------------------
+  backup:
+    image: postgres:18-alpine
+    profiles: ['backup']
+    entrypoint: ['sh', '/scripts/backup.sh']
+    environment:
+      # A read-only role (amcore_backup in setup-roles.sql) under role separation:
+      # the runtime role cannot read Prisma's history table.
+      DATABASE_URL: ${BACKUP_DATABASE_URL:-${COMPOSE_DATABASE_URL:-postgresql://amcore:amcore@postgres:5432/amcore}}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
+    volumes:
+      - ./docker/postgres/backup.sh:/scripts/backup.sh:ro
+      - postgres_backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Optional bundled restore — one-shot, like `migrate`; never runs on a normal
+  # `docker compose up`. Requires its own profile AND an explicit `run` so it
+  # cannot fire by accident. Prepare the target DB and stop writers first; follow
+  # docs/operations/single-host-compose.md → "Restore a database dump":
+  #   docker compose --profile restore run --rm --no-deps restore <dump-filename>
+  # ---------------------------------------------------------------------------
+  restore:
+    image: postgres:18-alpine
+    profiles: ['restore']
+    entrypoint: ['sh', '/scripts/restore.sh']
+    environment:
+      # Like `migrate`: restore drops and recreates objects, so it needs the owner role
+      # when roles are separated (database-role-separation.md); one-shot only.
+      DATABASE_URL: ${MIGRATION_DATABASE_URL:-${COMPOSE_DATABASE_URL:-postgresql://amcore:amcore@postgres:5432/amcore}}
+    volumes:
+      - ./docker/postgres/restore.sh:/scripts/restore.sh:ro
+      - postgres_backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+    restart: 'no'
+
+  # ---------------------------------------------------------------------------
+  # Optional bundled restore-drill — one-shot, like `restore`; never runs on a
+  # normal `docker compose up`. Rehearses restoring the latest dump into a
+  # throwaway, in-container Postgres instance to prove it's actually
+  # restorable — never touches the real database (no DATABASE_URL, no network
+  # dependency on `postgres`). See docs/operations/backup-restore.md →
+  # "Restore-drill (rehearsing a restore, not just taking one)".
+  #   docker compose --profile restore-drill run --rm restore-drill
+  # ---------------------------------------------------------------------------
+  restore-drill:
+    image: postgres:18-alpine
+    profiles: ['restore-drill']
+    entrypoint: ['sh', '/scripts/restore-drill.sh']
+    network_mode: none
+    # tmpfs, not a volume: postgres:18-alpine declares /var/lib/postgresql
+    # (not the pre-18 /var/lib/postgresql/data) as a VOLUME, so Docker
+    # allocates an anonymous volume there for every container regardless of
+    # what the entrypoint actually uses. The script never writes there (its
+    # scratch instance lives under /tmp instead), but without this override
+    # `docker compose up restore-drill` (rather than the documented `run
+    # --rm`) would still leave that unused anonymous volume behind after
+    # `down` — tmpfs is RAM-backed and gone with the container, no Docker
+    # volume object ever created either way.
+    tmpfs:
+      - /var/lib/postgresql
+    volumes:
+      - ./docker/postgres/restore-drill.sh:/scripts/restore-drill.sh:ro
+      - ./docker/postgres/restore-baseline.sql:/scripts/restore-baseline.sql:ro
+      - postgres_backups:/backups:ro
+    restart: 'no'
+
+  # ---------------------------------------------------------------------------
+  # Optional bundled monitoring — OPTIONAL, only with
+  # COMPOSE_PROFILES=...,monitoring. Dev-only verification harness: proves the
+  # metric surface, alert rules, and dashboards this repo ships actually work
+  # against THIS stack's real api/worker, before a fork wires its own
+  # production Prometheus/Grafana/Alertmanager (this profile is never applied
+  # by docker/compose/prod.yml, never a production stack of its own). All
+  # three ports are loopback-only, unlike postgres/redis above — ADR-072
+  # precedent extended here because Grafana is a web UI, not a bare data
+  # port. See docs/operations/observability.md → "Local Verification
+  # Harness".
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.14.0@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
+    profiles: ['monitoring']
+    ports:
+      - '127.0.0.1:9090:9090'
+    secrets:
+      - metrics_auth_token
+    volumes:
+      - ./docker/monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docs/operations/prometheus:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+
+  alertmanager:
+    image: prom/alertmanager:v0.34.0@sha256:690c7b525f4367aa91f73e2f91c632206d32e97c6384bdbf2fb7a861b420340d
+    profiles: ['monitoring']
+    ports:
+      - '127.0.0.1:9093:9093'
+    volumes:
+      - ./docker/monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      # Always mounted (fine if empty) so copying an email/Telegram
+      # receiver example from tests/alertmanager.example-full.yml into
+      # alertmanager.yml and dropping a real secret file in
+      # docker/monitoring/alertmanager/secrets/ (gitignored, see its
+      # README) actually works — no further compose change needed.
+      - ./docker/monitoring/alertmanager/secrets:/run/secrets/alertmanager:ro
+      - alertmanager_data:/alertmanager
+
+  grafana:
+    image: grafana/grafana:13.2.1@sha256:f772d434e8fab0049deb2b1b30abd43342bcfca1537614aa8d36080232cf4283
+    profiles: ['monitoring']
+    # Official image's entrypoint is /run.sh. Wrapped here (rather than a
+    # custom Dockerfile) so an empty/unset GF_SECURITY_ADMIN_PASSWORD fails
+    # this container loudly at startup instead of silently falling back to
+    # Grafana's own built-in "admin" default — mirrors the `caddy` service's
+    # existing "fails inside the container at startup, only when this profile
+    # is active" pattern (see the top-of-file comment on `:?` vs. profile
+    # gating; the same reasoning blocks using `:?` directly here).
+    entrypoint:
+      - sh
+      - -c
+      - |
+        if [ -z "$$GF_SECURITY_ADMIN_PASSWORD" ]; then
+          echo 'GF_SECURITY_ADMIN_PASSWORD must be set in .env to use the monitoring profile (no shipped default admin password).' >&2
+          exit 1
+        fi
+        exec /run.sh
+    ports:
+      - '127.0.0.1:3001:3000'
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:-}
+      GF_AUTH_ANONYMOUS_ENABLED: 'false'
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      # The pinned digest fixes Grafana's OWN code but not its default
+      # runtime behavior: Grafana 12+ preinstalls a fixed set of plugins
+      # (metricsdrilldown, exploretraces, lokiexplore, pyroscope-app) from
+      # the network on every boot with an empty `grafana_data` volume,
+      # selecting their latest version at install time — verified live,
+      # confirmed unrelated to the datasource/dashboards this profile ships.
+      # Disabled so a clean boot installs nothing beyond the pinned image and
+      # two clean boots on different dates produce the same result.
+      GF_PLUGINS_PREINSTALL_DISABLED: 'true'
+      # Same offline/deterministic reasoning: don't let a clean boot phone
+      # home to grafana.com for update/version checks.
+      GF_ANALYTICS_REPORTING_ENABLED: 'false'
+      GF_ANALYTICS_CHECK_FOR_UPDATES: 'false'
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: 'false'
+    volumes:
+      - ./docker/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+secrets:
+  # Sourced from the host env var of the same name, never written to a file
+  # this repo tracks — Compose materializes /run/secrets/metrics_auth_token
+  # inside `prometheus` only, and only while the `monitoring` profile is
+  # active. Compose refuses to start `prometheus` if METRICS_AUTH_TOKEN is
+  # entirely unset (verified: "environment variable ... is not set"); a set-
+  # but-empty value creates no file at all, which `prometheus.yml`'s
+  # `credentials_file` would then fail to read — so an operator activating
+  # this profile must set a real, non-empty token, not leave the var present
+  # but blank.
+  metrics_auth_token:
+    environment: METRICS_AUTH_TOKEN
+
+volumes:
+  postgres_data_pg18:
+  redis_data:
+  local_storage:
+  geoip_data:
+  caddy_data:
+  caddy_config:
+  postgres_backups:
+  prometheus_data:
+  alertmanager_data:
+  grafana_data:

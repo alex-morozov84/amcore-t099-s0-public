@@ -1,0 +1,431 @@
+import { type DeepMockProxy, mockDeep } from 'jest-mock-extended'
+
+import type { RequestPrincipal } from '@amcore/shared'
+import { SystemRole } from '@amcore/shared'
+
+import { ConflictException, ForbiddenException, NotFoundException } from '../../common/exceptions'
+import type { PrismaService } from '../../prisma'
+import type { AuditLogService } from '../audit'
+
+import type { AssignPermissionDto, CreateRoleDto, UpdateRoleDto } from './dto'
+import type { OrganizationsService } from './organizations.service'
+import { RoleService } from './role.service'
+
+import type { Permission, Role } from '@/generated/prisma/client'
+import type { PrismaClient } from '@/generated/prisma/client'
+
+describe('RoleService', () => {
+  let service: RoleService
+  let prisma: DeepMockProxy<PrismaClient>
+  let orgsService: jest.Mocked<
+    Pick<OrganizationsService, 'bumpAclVersion' | 'bumpAclVersionTx' | 'invalidateAclVersion'>
+  >
+  let audit: { record: jest.Mock }
+
+  const mockCustomRole: Role = {
+    id: 'role-custom',
+    name: 'Editor',
+    description: null,
+    isSystem: false,
+    organizationId: 'org-1',
+  }
+
+  const mockSystemRole: Role = {
+    id: 'role-admin',
+    name: 'ADMIN',
+    description: null,
+    isSystem: true,
+    organizationId: null,
+  }
+
+  const mockPermission: Permission = {
+    id: 'perm-1',
+    action: 'read',
+    subject: 'Contact',
+    conditions: null,
+    fields: [],
+    inverted: false,
+    organizationId: 'org-1',
+  }
+
+  const principal: RequestPrincipal = {
+    type: 'jwt',
+    sub: 'user-1',
+    email: 'admin@example.com',
+    systemRole: SystemRole.User,
+    organizationId: 'org-1',
+    aclVersion: 0,
+  }
+
+  beforeEach(() => {
+    prisma = mockDeep<PrismaClient>()
+    prisma.$queryRaw.mockResolvedValue([{ id: 'org-1', aclVersion: 0 }])
+    orgsService = {
+      bumpAclVersion: jest.fn().mockResolvedValue(undefined),
+      bumpAclVersionTx: jest.fn().mockResolvedValue(undefined),
+      invalidateAclVersion: jest.fn().mockResolvedValue(undefined),
+    }
+    audit = { record: jest.fn().mockResolvedValue(undefined) }
+    service = new RoleService(
+      prisma as unknown as PrismaService,
+      orgsService as unknown as OrganizationsService,
+      audit as unknown as AuditLogService
+    )
+    // OA-12: deleteRole / assignPermission / removePermission all
+    // wrap their DB writes + bump in a $transaction. Delegate tx to
+    // the same prisma mock so the callback runs and the existing
+    // per-call mocks remain reusable inside.
+    ;(prisma.$transaction as unknown as jest.Mock).mockImplementation(
+      async (cb: (tx: typeof prisma) => Promise<unknown>) => cb(prisma)
+    )
+  })
+
+  describe('listRoles', () => {
+    it('returns paginated envelope with system and org-specific roles (OB-05)', async () => {
+      prisma.role.findMany.mockResolvedValue([
+        { ...mockSystemRole, permissions: [] },
+        { ...mockCustomRole, permissions: [] },
+      ] as never)
+      prisma.role.count.mockResolvedValue(2)
+
+      const result = await service.listRoles('org-1', principal, 1, 20)
+
+      expect(result.total).toBe(2)
+      expect(result.page).toBe(1)
+      expect(result.limit).toBe(20)
+      expect(result.data).toHaveLength(2)
+      expect(prisma.role.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          include: expect.objectContaining({ permissions: expect.anything() }),
+        })
+      )
+    })
+
+    it('applies skip/take and `isSystem DESC, name ASC, id ASC` order (ADR-036 — Role has no createdAt)', async () => {
+      prisma.role.findMany.mockResolvedValue([])
+      prisma.role.count.mockResolvedValue(0)
+
+      await service.listRoles('org-1', principal, 2, 10)
+
+      const arg = prisma.role.findMany.mock.calls[0]![0]!
+      expect(arg.skip).toBe(10)
+      expect(arg.take).toBe(10)
+      expect(arg.orderBy).toEqual([{ isSystem: 'desc' }, { name: 'asc' }, { id: 'asc' }])
+    })
+
+    // OA-06: listRoles previously took only orgId — the function-level
+    // @CheckPolicies on the controller proved the caller had manage
+    // on Organization *somewhere*, but did not bind that decision to
+    // the URL :orgId. A switched-in admin of org A could call
+    // GET /organizations/{orgB}/roles and read org B's role/permission
+    // catalogue (OWASP API1:2023 BOLA). The service now requires the
+    // principal and rejects mismatching org context before any
+    // Prisma read.
+    it('OA-06: throws ForbiddenException when principal.organizationId does not match the requested orgId', async () => {
+      const switchedIntoAnotherOrg: RequestPrincipal = {
+        ...principal,
+        organizationId: 'org-other',
+      }
+
+      await expect(service.listRoles('org-1', switchedIntoAnotherOrg, 1, 20)).rejects.toThrow(
+        ForbiddenException
+      )
+      // Critical: rejection must fire before the catalogue read. A
+      // pre-read 403 is what makes this a *boundary* fix; a post-read
+      // 403 would still leak through e.g. timing channels.
+      expect(prisma.role.findMany).not.toHaveBeenCalled()
+    })
+
+    it('OA-06: throws ForbiddenException when principal has no org-context', async () => {
+      const noOrgPrincipal: RequestPrincipal = {
+        ...principal,
+        organizationId: undefined,
+        aclVersion: undefined,
+      }
+
+      await expect(service.listRoles('org-1', noOrgPrincipal, 1, 20)).rejects.toThrow(
+        ForbiddenException
+      )
+      expect(prisma.role.findMany).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('createRole', () => {
+    const dto: CreateRoleDto = { name: 'Editor', description: 'Can edit content' } as CreateRoleDto
+
+    it('creates custom role in the org', async () => {
+      prisma.role.findFirst.mockResolvedValue(null)
+      // Arc C: createRole includes permissions and returns the mapped
+      // OrgRoleResponse (a fresh role has an empty permissions list).
+      prisma.role.create.mockResolvedValue({ ...mockCustomRole, permissions: [] } as never)
+
+      const result = await service.createRole('org-1', dto, principal)
+
+      expect(result).toEqual({
+        id: mockCustomRole.id,
+        name: mockCustomRole.name,
+        description: mockCustomRole.description,
+        isSystem: mockCustomRole.isSystem,
+        organizationId: mockCustomRole.organizationId,
+        permissions: [],
+      })
+      expect(prisma.role.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ isSystem: false, organizationId: 'org-1' }),
+        })
+      )
+    })
+
+    it('throws ForbiddenException when org context mismatches', async () => {
+      const wrongPrincipal = { ...principal, organizationId: 'org-other' }
+      await expect(service.createRole('org-1', dto, wrongPrincipal)).rejects.toThrow(
+        ForbiddenException
+      )
+    })
+
+    it('throws ConflictException when role name already exists in org', async () => {
+      prisma.role.findFirst.mockResolvedValue(mockCustomRole)
+      await expect(service.createRole('org-1', dto, principal)).rejects.toThrow(ConflictException)
+    })
+  })
+
+  describe('updateRole', () => {
+    const dto: UpdateRoleDto = { name: 'Senior Editor' } as UpdateRoleDto
+
+    it('updates custom role', async () => {
+      prisma.role.findFirst.mockResolvedValueOnce(mockCustomRole) // findCustomRole
+      prisma.role.findFirst.mockResolvedValueOnce(null) // no name conflict
+      prisma.role.update.mockResolvedValue({
+        ...mockCustomRole,
+        name: 'Senior Editor',
+        permissions: [],
+      } as never)
+
+      const result = await service.updateRole('org-1', 'role-custom', dto, principal)
+
+      expect(result.name).toBe('Senior Editor')
+    })
+
+    it('returns the stored role without any write for an unchanged or empty patch', async () => {
+      prisma.role.findFirst.mockResolvedValue(mockCustomRole)
+      prisma.role.findUniqueOrThrow.mockResolvedValue({
+        ...mockCustomRole,
+        permissions: [],
+      } as never)
+
+      for (const patch of [{ name: 'Editor' }, { description: undefined }, {}] as UpdateRoleDto[]) {
+        const result = await service.updateRole('org-1', 'role-custom', patch, principal)
+        expect(result.name).toBe('Editor')
+      }
+      expect(prisma.role.update).not.toHaveBeenCalled()
+      expect(orgsService.bumpAclVersionTx).not.toHaveBeenCalled()
+      expect(audit.record).not.toHaveBeenCalled()
+    })
+
+    it('throws NotFoundException when custom role not found', async () => {
+      prisma.role.findFirst.mockResolvedValue(null)
+      await expect(service.updateRole('org-1', 'role-custom', dto, principal)).rejects.toThrow(
+        NotFoundException
+      )
+    })
+
+    it('throws ForbiddenException when trying to modify a system role', async () => {
+      prisma.role.findFirst.mockResolvedValue(mockSystemRole) // isSystem: true
+      await expect(service.updateRole('org-1', 'role-admin', dto, principal)).rejects.toThrow(
+        ForbiddenException
+      )
+    })
+  })
+
+  describe('deleteRole', () => {
+    it('deletes custom role and bumps aclVersion', async () => {
+      prisma.role.findFirst.mockResolvedValue(mockCustomRole)
+      prisma.rolePermission.findMany.mockResolvedValue([])
+      prisma.role.delete.mockResolvedValue(mockCustomRole)
+
+      await service.deleteRole('org-1', 'role-custom', principal)
+
+      expect(prisma.role.delete).toHaveBeenCalledWith({ where: { id: 'role-custom' } })
+      expect(orgsService.bumpAclVersionTx).toHaveBeenCalled()
+      expect(orgsService.bumpAclVersionTx.mock.calls[0]?.[0]).toBe('org-1')
+      expect(orgsService.invalidateAclVersion).toHaveBeenCalledWith('org-1')
+    })
+
+    it('throws ForbiddenException when trying to delete a system role', async () => {
+      prisma.role.findFirst.mockResolvedValue(mockSystemRole)
+      await expect(service.deleteRole('org-1', 'role-admin', principal)).rejects.toThrow(
+        ForbiddenException
+      )
+    })
+
+    /**
+     * OA-10: org-scoped permissions linked exclusively to a custom
+     * role were leaked when the role was deleted (Role has no FK at
+     * Permission; cascade only clears the join table). GC is narrow:
+     * collected IDs only, defense-in-depth filters keep system perms
+     * and shared perms intact.
+     */
+    describe('OA-10: orphan permission GC', () => {
+      it('garbage-collects permissions linked exclusively to the deleted role', async () => {
+        prisma.role.findFirst.mockResolvedValue(mockCustomRole)
+        prisma.rolePermission.findMany.mockResolvedValue([
+          { roleId: 'role-custom', permissionId: 'perm-1' },
+          { roleId: 'role-custom', permissionId: 'perm-2' },
+        ] as never)
+        prisma.role.delete.mockResolvedValue(mockCustomRole)
+        prisma.permission.deleteMany.mockResolvedValue({ count: 2 })
+
+        await service.deleteRole('org-1', 'role-custom', principal)
+
+        expect(prisma.permission.deleteMany).toHaveBeenCalledTimes(1)
+        expect(prisma.permission.deleteMany).toHaveBeenCalledWith({
+          where: {
+            id: { in: ['perm-1', 'perm-2'] },
+            organizationId: 'org-1',
+            roles: { none: {} },
+          },
+        })
+      })
+
+      it('does not call deleteMany when the role had no permissions linked', async () => {
+        prisma.role.findFirst.mockResolvedValue(mockCustomRole)
+        prisma.rolePermission.findMany.mockResolvedValue([])
+        prisma.role.delete.mockResolvedValue(mockCustomRole)
+
+        await service.deleteRole('org-1', 'role-custom', principal)
+
+        expect(prisma.permission.deleteMany).not.toHaveBeenCalled()
+      })
+
+      it('filters by organizationId and roles:none so shared/system permissions cannot be deleted', async () => {
+        // Defense-in-depth assertion: even with a malformed input we
+        // produce the right `where` shape. The Prisma engine then
+        // filters out system perms (organizationId === null) and
+        // shared perms (roles.length > 0) by predicate, never by the
+        // caller's discipline.
+        prisma.role.findFirst.mockResolvedValue(mockCustomRole)
+        prisma.rolePermission.findMany.mockResolvedValue([
+          { roleId: 'role-custom', permissionId: 'perm-shared' },
+          { roleId: 'role-custom', permissionId: 'perm-system' },
+        ] as never)
+        prisma.role.delete.mockResolvedValue(mockCustomRole)
+        prisma.permission.deleteMany.mockResolvedValue({ count: 0 })
+
+        await service.deleteRole('org-1', 'role-custom', principal)
+
+        const arg = prisma.permission.deleteMany.mock.calls[0]![0]!
+        expect(arg.where).toMatchObject({
+          organizationId: 'org-1',
+          roles: { none: {} },
+        })
+        expect((arg.where as { id?: { in: string[] } }).id?.in).toEqual([
+          'perm-shared',
+          'perm-system',
+        ])
+      })
+
+      it('collects permission IDs before role.delete (so cascade does not race the read)', async () => {
+        prisma.role.findFirst.mockResolvedValue(mockCustomRole)
+        prisma.rolePermission.findMany.mockResolvedValue([
+          { roleId: 'role-custom', permissionId: 'perm-1' },
+        ] as never)
+        prisma.role.delete.mockResolvedValue(mockCustomRole)
+        prisma.permission.deleteMany.mockResolvedValue({ count: 1 })
+
+        await service.deleteRole('org-1', 'role-custom', principal)
+
+        const findOrder = prisma.rolePermission.findMany.mock.invocationCallOrder[0]
+        const deleteOrder = prisma.role.delete.mock.invocationCallOrder[0]
+        const gcOrder = prisma.permission.deleteMany.mock.invocationCallOrder[0]
+        expect(findOrder).toBeDefined()
+        expect(deleteOrder).toBeDefined()
+        expect(gcOrder).toBeDefined()
+        expect(findOrder!).toBeLessThan(deleteOrder!)
+        expect(deleteOrder!).toBeLessThan(gcOrder!)
+      })
+    })
+  })
+
+  describe('assignPermission', () => {
+    const dto: AssignPermissionDto = { action: 'read', subject: 'User' } as AssignPermissionDto
+
+    it('creates permission and links it to the role', async () => {
+      prisma.role.findFirst.mockResolvedValue(mockCustomRole)
+      prisma.permission.create.mockResolvedValue(mockPermission)
+      prisma.rolePermission.create.mockResolvedValue({
+        roleId: 'role-custom',
+        permissionId: 'perm-1',
+      })
+
+      const result = await service.assignPermission('org-1', 'role-custom', dto, principal)
+
+      expect(result).toEqual(mockPermission)
+      expect(prisma.rolePermission.create).toHaveBeenCalled()
+      expect(orgsService.bumpAclVersionTx).toHaveBeenCalled()
+      expect(orgsService.bumpAclVersionTx.mock.calls[0]?.[0]).toBe('org-1')
+      expect(orgsService.invalidateAclVersion).toHaveBeenCalledWith('org-1')
+    })
+
+    it('throws ForbiddenException when org context mismatches', async () => {
+      const wrongPrincipal = { ...principal, organizationId: 'org-other' }
+      await expect(
+        service.assignPermission('org-1', 'role-custom', dto, wrongPrincipal)
+      ).rejects.toThrow(ForbiddenException)
+    })
+  })
+
+  describe('removePermission', () => {
+    beforeEach(() => {
+      prisma.role.findFirst.mockResolvedValue(mockCustomRole)
+    })
+    it('detaches only this role link, collects an unshared permission and bumps aclVersion', async () => {
+      prisma.rolePermission.findUnique.mockResolvedValue({
+        roleId: 'role-custom',
+        permissionId: 'perm-1',
+        permission: {
+          organizationId: 'org-1',
+          subject: 'Contact',
+          action: 'read',
+          inverted: false,
+        },
+      } as never)
+
+      await service.removePermission('org-1', 'role-custom', 'perm-1', principal)
+
+      // A shared Permission row must keep serving its other roles: only this link is deleted.
+      expect(prisma.rolePermission.delete).toHaveBeenCalledWith({
+        where: { roleId_permissionId: { roleId: 'role-custom', permissionId: 'perm-1' } },
+      })
+      expect(prisma.permission.delete).not.toHaveBeenCalled()
+      expect(prisma.permission.deleteMany).toHaveBeenCalledWith({
+        where: { id: 'perm-1', organizationId: 'org-1', roles: { none: {} } },
+      })
+      expect(orgsService.bumpAclVersionTx).toHaveBeenCalled()
+      expect(orgsService.bumpAclVersionTx.mock.calls[0]?.[0]).toBe('org-1')
+      expect(orgsService.invalidateAclVersion).toHaveBeenCalledWith('org-1')
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'org.role_updated', organizationId: 'org-1' }),
+        { tx: prisma }
+      )
+    })
+
+    it('throws NotFoundException when permission link not found', async () => {
+      prisma.rolePermission.findUnique.mockResolvedValue(null)
+      await expect(
+        service.removePermission('org-1', 'role-custom', 'perm-1', principal)
+      ).rejects.toThrow(NotFoundException)
+    })
+
+    it('throws ForbiddenException when trying to remove a system-level permission', async () => {
+      prisma.rolePermission.findUnique.mockResolvedValue({
+        roleId: 'role-custom',
+        permissionId: 'perm-sys',
+        permission: { organizationId: null }, // system-level
+      } as never)
+
+      await expect(
+        service.removePermission('org-1', 'role-custom', 'perm-sys', principal)
+      ).rejects.toThrow(ForbiddenException)
+    })
+  })
+})

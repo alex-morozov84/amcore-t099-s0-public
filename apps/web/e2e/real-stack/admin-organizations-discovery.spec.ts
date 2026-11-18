@@ -1,0 +1,143 @@
+import { ADMIN_CONSOLE_SETTINGS } from '@amcore/shared'
+import { expect, type Page, test } from '@playwright/test'
+
+import { expectNoAxeViolations } from '../shared/axe'
+import {
+  consolePath,
+  isProductHome,
+  messages,
+  sortColumnPattern,
+  translate,
+} from '../shared/product-settings'
+
+import { createOrganization, setSystemRole } from './admin-helpers'
+import { loginViaUi, registerViaUi, uniqueEmail } from './helpers'
+
+test.skip(
+  ADMIN_CONSOLE_SETTINGS.mode !== 'path',
+  'Requires configured path Console; isolated-host scenarios run in the host family'
+)
+
+async function signInAsPathAdmin(page: Page, prefix: string) {
+  const email = uniqueEmail(prefix)
+  await registerViaUi(page, email)
+  setSystemRole(email, 'SUPER_ADMIN')
+  await page.context().clearCookies()
+  await loginViaUi(page, email)
+  await expect(page).toHaveURL(isProductHome)
+}
+
+test('Organizations search filters real data, resets page, and clears', async ({ page }) => {
+  await signInAsPathAdmin(page, 'admin-orgs-search')
+  const token = uniqueEmail('org-search-token').split('@')[0]
+  const orgName = `Findable ${token}`
+  createOrganization(orgName, `${token}-slug`)
+
+  await page.goto(consolePath('/organizations?page=2'))
+  const total = page.locator('p[aria-live="polite"]')
+  const baselineTotal = await total.textContent()
+  await page.getByLabel(messages.console.organizationsSearchLabel).fill(token)
+
+  await expect(page).toHaveURL(new RegExp(`[?&]search=${token}\\b`))
+  await expect(page).not.toHaveURL(/[?&]page=/)
+  await expect(page.getByRole('cell', { name: orgName })).toBeVisible()
+  await expect(total).toHaveText(translate('console.organizationsTotal', { total: 1 }))
+
+  await page.getByRole('button', { name: messages.console.organizationsSearchClear }).click()
+  await expect(page).not.toHaveURL(/[?&]search=/)
+  await expect(total).toHaveText(baselineTotal ?? '')
+})
+
+test('Organizations sort-by-name orders real rows and toggles aria-sort', async ({ page }) => {
+  await signInAsPathAdmin(page, 'admin-orgs-sort')
+  const token = uniqueEmail('org-sort-token').split('@')[0]
+  const now = new Date()
+  createOrganization(`AAA-${token}`, `${token}-a`, now)
+  createOrganization(`ZZZ-${token}`, `${token}-b`, now)
+
+  await page.goto(consolePath(`/organizations?search=${token}`))
+  const nameHeader = page.getByRole('columnheader', {
+    name: sortColumnPattern(messages.console.organizationsColumnName),
+  })
+  await nameHeader.getByRole('link').click()
+  await expect(nameHeader).toHaveAttribute('aria-sort', 'ascending')
+  let rows = page.getByRole('row').filter({ hasText: token })
+  await expect(rows.first()).toContainText(`AAA-${token}`)
+  await expect(rows.last()).toContainText(`ZZZ-${token}`)
+
+  await nameHeader.getByRole('link').click()
+  await expect(page).toHaveURL(/[?&]sortOrder=desc\b/)
+  await expect(nameHeader).toHaveAttribute('aria-sort', 'descending')
+  rows = page.getByRole('row').filter({ hasText: token })
+  await expect(rows.first()).toContainText(`ZZZ-${token}`)
+  await expect(rows.last()).toContainText(`AAA-${token}`)
+})
+
+test('Organizations out-of-range recovery preserves search and sort', async ({ page }) => {
+  await signInAsPathAdmin(page, 'admin-orgs-oor')
+  const token = uniqueEmail('org-oor-token').split('@')[0]
+  createOrganization(`Solo ${token}`, `${token}-solo`)
+
+  await page.goto(consolePath(`/organizations?search=${token}&sortBy=name&sortOrder=desc&page=2`))
+  await expect(page.getByText(messages.console.organizationsPageOutOfRangeTitle)).toBeVisible()
+  const recoveryLink = page.getByRole('link', {
+    name: messages.console.organizationsPageOutOfRangeAction,
+  })
+  await expect(recoveryLink).toHaveAttribute(
+    'href',
+    consolePath(`/organizations?search=${token}&sortBy=name&sortOrder=desc`)
+  )
+  await recoveryLink.click()
+  await expect(page).not.toHaveURL(/[?&]page=/)
+  await expect(page.getByRole('cell', { name: `Solo ${token}` })).toBeVisible()
+})
+
+test('Organizations search input resyncs from the URL on browser Back', async ({ page }) => {
+  await signInAsPathAdmin(page, 'admin-orgs-back')
+  const tokenA = uniqueEmail('org-back-token-a').split('@')[0]
+  const tokenB = uniqueEmail('org-back-token-b').split('@')[0]
+
+  await page.goto(consolePath(`/organizations?search=${tokenA}`))
+  await expect(page.getByLabel(messages.console.organizationsSearchLabel)).toHaveValue(tokenA)
+  await page.goto(consolePath(`/organizations?search=${tokenB}`))
+  await expect(page.getByLabel(messages.console.organizationsSearchLabel)).toHaveValue(tokenB)
+  await page.goBack()
+  await expect(page.getByLabel(messages.console.organizationsSearchLabel)).toHaveValue(tokenA)
+})
+
+test('Organizations discovery states have no axe violations', async ({ page }) => {
+  await signInAsPathAdmin(page, 'axe-orgs-discovery')
+  const token = uniqueEmail('axe-org-search-token').split('@')[0]
+  const fixture = uniqueEmail('axe-org-row').split('@')[0]
+  createOrganization(`Accessible ${fixture}`, `${fixture}-slug`)
+
+  await page.goto(consolePath(`/organizations?search=${token}`))
+  await expect(page.getByText(messages.console.organizationsNoSearchResultsTitle)).toBeVisible()
+  await expect(
+    page.getByRole('button', { name: messages.console.organizationProvisioning.start, exact: true })
+  ).toBeEnabled()
+  await expect(
+    page.getByRole('button', {
+      name: messages.console.organizationAdministration.attentionRefresh,
+      exact: true,
+    })
+  ).toBeEnabled()
+  await expectNoAxeViolations(page)
+
+  await page.goto(consolePath('/organizations?sortBy=name&sortOrder=desc'))
+  await expect(
+    page.getByRole('columnheader', {
+      name: sortColumnPattern(messages.console.organizationsColumnName),
+    })
+  ).toHaveAttribute('aria-sort', 'descending')
+  await expect(
+    page.getByRole('button', { name: messages.console.organizationProvisioning.start, exact: true })
+  ).toBeEnabled()
+  await expect(
+    page.getByRole('button', {
+      name: messages.console.organizationAdministration.attentionRefresh,
+      exact: true,
+    })
+  ).toBeEnabled()
+  await expectNoAxeViolations(page)
+})

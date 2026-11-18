@@ -1,0 +1,21 @@
+import type { SystemRole } from '../enums/roles'
+
+import type { SessionAuthorityClaims } from './jwt'
+
+// Unified identity on request.user — populated by any auth strategy
+// Validated pattern: "IdentityBill" in @eropple/nestjs-auth, request.user in Passport
+export interface RequestPrincipal extends SessionAuthorityClaims {
+  type: 'jwt' | 'api_key'
+  sub: string // userId
+  email?: string // always present for JWT; undefined for API keys
+  systemRole: SystemRole
+  organizationId?: string
+  aclVersion?: number
+  scopes?: string[] // API key only: ['contact:read', 'deal:create']
+  // undefined = no restriction (JWT users)
+  sid?: string // JWT only: session id, for @RequireFreshAuth step-up checks (OB-06b)
+  exp?: number // JWT only: access-token expiry (epoch seconds); bounds long-lived SSE streams (ADR-053)
+}
+// Effective permissions = userRolePermissions ∩ scopes (Auth0 validated pattern)
+// JWT:     scopes = undefined → full role permissions
+// API key: scopes = ['x:y']  → only permissions present in BOTH role AND scopes

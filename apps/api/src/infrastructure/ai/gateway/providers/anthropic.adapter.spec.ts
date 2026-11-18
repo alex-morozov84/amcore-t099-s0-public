@@ -1,0 +1,305 @@
+import { z } from 'zod'
+
+import type { AiAdapterCall } from '../ai-gateway.types'
+import { providerReceipt } from '../provider-receipt'
+
+import { AnthropicAdapter } from './anthropic.adapter'
+
+import { AiProviderType } from '@/generated/prisma/client'
+
+/**
+ * Anthropic adapter against a fake provider via an injected `fetch` (Track C — ADR-054, Arc B):
+ * no network, no live key. Verifies the request shape (URL + `x-api-key`) and the mapping of a
+ * canned Messages-API response to our `AiTextResult`, plus error normalization by HTTP status.
+ */
+
+interface CapturedRequest {
+  url: string
+  headers: Headers
+  body: unknown
+  redirect: RequestInit['redirect']
+}
+
+function fakeFetch(
+  body: unknown,
+  status = 200
+): typeof globalThis.fetch & { calls: CapturedRequest[] } {
+  const calls: CapturedRequest[] = []
+  const fn = (async (input: string | URL | Request, init?: RequestInit) => {
+    calls.push({
+      url: String(input),
+      headers: new Headers(init?.headers),
+      body: typeof init?.body === 'string' ? JSON.parse(init.body) : undefined,
+      redirect: init?.redirect,
+    })
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: { 'content-type': 'application/json' },
+    })
+  }) as typeof globalThis.fetch & { calls: CapturedRequest[] }
+  fn.calls = calls
+  return fn
+}
+
+function call(baseUrl: string | null = null): AiAdapterCall {
+  return {
+    model: {
+      id: 'model-fixture',
+      slug: 'claude-default',
+      providerModelName: 'claude-opus-4-8',
+      capabilities: { text: true },
+      contextLimit: null,
+      maxOutputTokens: null,
+      isDefault: true,
+      provider: {
+        id: 'provider-fixture',
+        slug: 'anthropic',
+        type: AiProviderType.ANTHROPIC,
+        baseUrl,
+        credentialSlot: 'default',
+        dataRetentionClass: 'provider_default',
+        config: null,
+      },
+    },
+    credential: 'sk-aB0_-Zz9',
+    messages: [{ role: 'user', content: 'hello' }],
+    timeoutMs: 60000,
+  }
+}
+
+const MESSAGES_RESPONSE = {
+  id: 'msg_1',
+  type: 'message',
+  role: 'assistant',
+  model: 'claude-opus-4-8',
+  content: [{ type: 'text', text: 'hi from claude' }],
+  stop_reason: 'end_turn',
+  stop_sequence: null,
+  usage: { input_tokens: 10, output_tokens: 5 },
+}
+
+describe('AnthropicAdapter', () => {
+  it('calls the Messages API with x-api-key and maps the result', async () => {
+    const fetchImpl = fakeFetch(MESSAGES_RESPONSE)
+    const adapter = new AnthropicAdapter(fetchImpl)
+
+    const result = await adapter.generateText(call())
+
+    expect(result.text).toBe('hi from claude')
+    expect(result.finishReason).toBe('stop')
+    expect(result.usage).toEqual({
+      totalDerived: true,
+      source: 'reported',
+      availability: 'complete',
+      inputTokens: 10,
+      outputTokens: 5,
+      totalTokens: 15,
+    })
+    expect(result.providerType).toBe(AiProviderType.ANTHROPIC)
+    expect(fetchImpl.calls[0]!.url).toContain('/messages')
+    expect(fetchImpl.calls[0]!.headers.get('x-api-key')).toBe('sk-aB0_-Zz9')
+  })
+
+  it('ignores a malicious catalog baseUrl (base URL is code-owned)', async () => {
+    const fetchImpl = fakeFetch(MESSAGES_RESPONSE)
+    const adapter = new AnthropicAdapter(fetchImpl)
+
+    await adapter.generateText(call('https://evil.example/v1'))
+
+    expect(fetchImpl.calls[0]!.url).toContain('https://api.anthropic.com/v1/messages')
+    expect(fetchImpl.calls[0]!.url).not.toContain('evil.example')
+  })
+
+  it('round-trips a tool call provider-agnostically: maps a tool_use block to toolCalls (Arc E)', async () => {
+    const toolUse = {
+      id: 'msg_2',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-opus-4-8',
+      content: [{ type: 'tool_use', id: 'toolu_1', name: 'current_time', input: {} }],
+      stop_reason: 'tool_use',
+      stop_sequence: null,
+      usage: { input_tokens: 10, output_tokens: 5 },
+    }
+    const adapter = new AnthropicAdapter(fakeFetch(toolUse))
+
+    const result = await adapter.generateText({
+      ...call(),
+      tools: [
+        {
+          name: 'current_time',
+          description: 'Returns the time.',
+          parameters: z.object({}).strict(),
+        },
+      ],
+    })
+
+    expect(result.finishReason).toBe('tool_calls')
+    expect(result.toolCalls).toEqual([
+      { toolCallId: 'toolu_1', toolName: 'current_time', input: {} },
+    ])
+  })
+
+  it('normalizes a 5xx to a retryable provider_unavailable', async () => {
+    const adapter = new AnthropicAdapter(fakeFetch({ error: 'overloaded' }, 503))
+    await expect(adapter.generateText(call())).rejects.toMatchObject({
+      code: 'provider_unavailable',
+      retryable: true,
+    })
+  })
+
+  it('normalizes a 4xx to a non-retryable provider_rejected', async () => {
+    const adapter = new AnthropicAdapter(fakeFetch({ error: 'bad request' }, 400))
+    await expect(adapter.generateText(call())).rejects.toMatchObject({
+      code: 'provider_rejected',
+      retryable: false,
+    })
+  })
+})
+
+describe('AnthropicAdapter caller abort', () => {
+  /** A provider that never answers; it only rejects when the request signal aborts. */
+  function hangingFetch(): typeof globalThis.fetch {
+    return ((_input: string | URL | Request, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        const signal = init?.signal
+        if (signal?.aborted) return reject(signal.reason)
+        // Like real `fetch`: reject with the signal's own reason (TimeoutError / AbortError).
+        signal?.addEventListener('abort', () => reject(signal.reason))
+      })) as typeof globalThis.fetch
+  }
+
+  it('surfaces a caller abort as the non-retryable `aborted` error', async () => {
+    const controller = new AbortController()
+    const adapter = new AnthropicAdapter(hangingFetch())
+    const pending = adapter.generateText({ ...call(), abortSignal: controller.signal })
+    controller.abort()
+
+    await expect(pending).rejects.toMatchObject({ code: 'aborted', retryable: false })
+  })
+
+  it('keeps an ordinary per-call timeout retryable and distinct from a caller abort', async () => {
+    const adapter = new AnthropicAdapter(hangingFetch())
+
+    await expect(
+      adapter.generateText({ ...call(), timeoutMs: 20, abortSignal: new AbortController().signal })
+    ).rejects.toMatchObject({ retryable: true, code: expect.not.stringMatching(/^aborted$/) })
+  })
+
+  it('makes no provider request when the caller signal is already aborted', async () => {
+    const fetchImpl = fakeFetch(MESSAGES_RESPONSE)
+    const adapter = new AnthropicAdapter(fetchImpl)
+
+    await expect(
+      adapter.generateText({ ...call(), abortSignal: AbortSignal.abort() })
+    ).rejects.toMatchObject({ code: 'aborted' })
+    expect(fetchImpl.calls).toHaveLength(0)
+  })
+})
+
+describe('Anthropic fixed endpoint and ambient credentials', () => {
+  it.each([undefined, 'https://poisoned.invalid/v1'])(
+    'ignores ambient endpoint %s',
+    async (ambient) => {
+      const old = process.env.ANTHROPIC_BASE_URL
+      try {
+        if (ambient === undefined) delete process.env.ANTHROPIC_BASE_URL
+        else process.env.ANTHROPIC_BASE_URL = ambient
+        const fetchImpl = fakeFetch(MESSAGES_RESPONSE)
+        await new AnthropicAdapter(fetchImpl).generateText(call('https://catalogue.invalid/v1'))
+        expect(fetchImpl.calls).toHaveLength(1)
+        expect(fetchImpl.calls[0]?.url).toBe('https://api.anthropic.com/v1/messages')
+        expect(fetchImpl.calls[0]?.headers.get('x-api-key')).toBe('sk-aB0_-Zz9')
+      } finally {
+        if (old === undefined) delete process.env.ANTHROPIC_BASE_URL
+        else process.env.ANTHROPIC_BASE_URL = old
+      }
+    }
+  )
+
+  it('refuses an absent injected key even when ambient credentials exist', async () => {
+    const oldKey = process.env.ANTHROPIC_API_KEY
+    const oldToken = process.env.ANTHROPIC_AUTH_TOKEN
+    try {
+      process.env.ANTHROPIC_API_KEY = '<ambient-key>'
+      process.env.ANTHROPIC_AUTH_TOKEN = '<ambient-token>'
+      const request = call()
+      request.credential = null
+      const fetchImpl = fakeFetch(MESSAGES_RESPONSE)
+      await expect(new AnthropicAdapter(fetchImpl).generateText(request)).rejects.toMatchObject({
+        code: 'model_not_configured',
+      })
+      expect(fetchImpl.calls).toHaveLength(0)
+    } finally {
+      if (oldKey === undefined) delete process.env.ANTHROPIC_API_KEY
+      else process.env.ANTHROPIC_API_KEY = oldKey
+      if (oldToken === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN
+      else process.env.ANTHROPIC_AUTH_TOKEN = oldToken
+    }
+  })
+})
+
+describe('Anthropic structured transport', () => {
+  it.each(['valid', 'invalid'] as const)(
+    'proves native schema format and %s output accounting',
+    async (mode) => {
+      const fetchImpl = fakeFetch({
+        ...MESSAGES_RESPONSE,
+        content: [{ type: 'text', text: mode === 'valid' ? '{"answer":"ok"}' : '{"answer":42}' }],
+      })
+      const request = call('https://poisoned.invalid/v1')
+      request.system = 'Trusted Anthropic structured instructions'
+      request.model.capabilities.structured_output = true
+      const outcome = await new AnthropicAdapter(fetchImpl)
+        .generateObject(request, z.object({ answer: z.string() }))
+        .then(
+          (value) => ({
+            object: value.object,
+            receipt: value.receipt,
+            usage: value.usage,
+            error: undefined,
+          }),
+          (error: unknown) => ({
+            object: undefined,
+            receipt: providerReceipt(error),
+            usage: providerReceipt(error)?.usage,
+            error,
+          })
+        )
+      const expected =
+        mode === 'valid'
+          ? { object: { answer: 'ok' }, error: undefined }
+          : { object: undefined, error: { code: 'output_validation_failed', retryable: false } }
+      expect(outcome).toMatchObject(expected)
+      expect(outcome.receipt?.usage).toMatchObject({
+        inputTokens: 10,
+        outputTokens: 5,
+        totalTokens: 15,
+        totalDerived: true,
+      })
+      expect(outcome.usage).toMatchObject({ inputTokens: 10, outputTokens: 5, totalTokens: 15 })
+      expect(fetchImpl.calls).toHaveLength(1)
+      expect(fetchImpl.calls[0]).toMatchObject({
+        url: 'https://api.anthropic.com/v1/messages',
+        redirect: 'error',
+      })
+      expect(fetchImpl.calls[0]?.headers.get('x-api-key')).toBe('sk-aB0_-Zz9')
+      expect(fetchImpl.calls[0]?.body).toMatchObject({
+        model: 'claude-opus-4-8',
+        system: [{ type: 'text', text: 'Trusted Anthropic structured instructions' }],
+        output_config: {
+          format: {
+            type: 'json_schema',
+            schema: {
+              type: 'object',
+              properties: { answer: { type: 'string' } },
+              required: ['answer'],
+            },
+          },
+        },
+      })
+      expect(fetchImpl.calls[0]?.body).not.toHaveProperty('tools')
+      expect(fetchImpl.calls[0]?.body).not.toHaveProperty('stream')
+    }
+  )
+})

@@ -1,0 +1,482 @@
+# Notifications
+
+AMCore ships a reusable, per-user notification subsystem on its own
+`notifications` Postgres schema: an **in-app feed**, per-user **preferences**
+with mandatory channels, a transaction-aware **producer**, durable worker-driven
+**email** and **Telegram** channels, and a realtime **SSE** fan-out. External
+channels and realtime are purely additive over the producer/feed/preferences
+contract. See [delivery control](control.md), [versioning and replay](versioning.md) and [channel registration](channels.md).
+
+Endpoint shapes (paths, bodies, status codes) live in the Swagger/OpenAPI
+document at `/docs` in development — the source of truth. This guide covers the
+model, the extension points, and the invariants OpenAPI does not express.
+
+## When to use this vs EmailService
+
+Use `NotificationsService` when the event belongs in the notification feed, must
+respect user preferences / mandatory channels, or needs Postgres-owned retry and
+attempt history. Use [`EmailService`](../email/README.md) for transactional email
+infrastructure (secret-bearing links, queued non-secret mail). The notification
+**email channel** is built _on top of_ `EmailService.sendPreparedNotification()` — see
+[Delivery](#how-delivery-works).
+
+## What it provides
+
+- **In-app feed** — cursor-paginated (`createdAt DESC, id DESC`), plus an exact
+  unread count. Inserted `DELIVERED` in the same transaction as the notification,
+  so the feed never depends on a healthy worker.
+- **Preferences** — a per-user master toggle plus per-`(category, channel)`
+  overrides; **mandatory channels** bypass the toggle and cannot be disabled.
+- **Producer** — trusted server code calls `notify()` / `notifyTx()`. There is
+  **no public create endpoint**; a bearer user cannot manufacture a type,
+  payload, recipient, or channel. The HTTP surface is read/update only.
+- **Durable external channels** — email and Telegram, worker-driven, with
+  Postgres-owned retry, leases, immutable attempt history, and retention.
+- **Realtime** — a bearer-authenticated SSE stream of content-free "refetch"
+  hints, fanned out across replicas via Redis Pub/Sub.
+- **Language-neutral payloads** — the database stores a structured, bounded
+  payload; `title` / `body` are rendered server-side in the recipient's
+  `User.locale` at read time. External delivery request bodies are separately frozen
+  in private storage; they never enter the feed response or diagnostics.
+
+```
+Trusted backend module (security event, profile change, …)
+  └── NotificationsService.notify(input)          // owns its transaction
+      or .notifyTx(tx, input)                      // joins the caller's transaction
+          validate definition + payload + idempotency key
+          resolve preferences + channels + recipient locale
+          INSERT Notification + DELIVERED in-app delivery   [one transaction]
+          + one PENDING delivery per external target (drained by the worker)
+
+HTTP (bearer, recipient-scoped): feed, mark/archive, preferences, capabilities, SSE stream
+```
+
+Endpoint semantics not obvious from OpenAPI: mark/archive are idempotent and
+recipient-scoped (a foreign id is a silent no-op, no information leak); the feed
+uses **cursor** pagination (the documented exception to the project's offset
+envelope — the feed is append-heavy, so offsets would skip/duplicate rows);
+`GET /notifications/capabilities` advertises only currently active channels.
+
+**What is in the feed.** A notification is feed-visible only if it has a
+`DELIVERED` `in_app` delivery — that is, the in-app channel was selected when it
+was produced (mandatory, or optional with the master toggle and the category
+preference on). A notification delivered only externally, or produced while in-app
+was off, keeps its canonical record (and its external deliveries) but is never
+listed, counted, marked read or archived through the feed. The list, the unread
+count, mark-read, read-all and archive all use this one rule, so they cannot
+disagree, and pages are filtered **before** the limit (`hasMore`/`nextCursor`
+describe feed items only). Eligibility is fixed at produce time: switching a
+preference later neither hides earlier items nor reveals ones that were never
+delivered in-app. Mark-read on an archived or ineligible id is a `204` no-op with
+no realtime hint.
+
+## Add a notification definition
+
+A definition is a code-owned record — identifier, payload schema, default and
+mandatory channels, content classification, and localized renderers. Live
+definitions are in
+[`core/notifications/definitions/`](../../apps/api/src/core/notifications/definitions/).
+
+```ts
+// core/notifications/definitions/your-event.definition.ts
+import { z } from 'zod'
+import {
+  NotificationCategory,
+  NotificationChannel,
+  NotificationContentClass,
+} from '../notification.constants'
+import type { NotificationDefinition } from '../notification-definition.types'
+
+// Allowlisted, bounded payload — durable rows and renderers see this shape, so
+// keep it small, language-neutral, and free of secrets.
+const payloadSchema = z.object({
+  updatedFields: z.array(z.enum(['name', 'email', 'locale'])).min(1),
+})
+type Payload = z.infer<typeof payloadSchema>
+
+export const yourEventDefinition: NotificationDefinition<Payload> = {
+  type: 'your_area.your_event',
+  category: NotificationCategory.ACCOUNT,
+  schemaVersion: 1,
+  contentClass: NotificationContentClass.PUBLIC,
+  supportedChannels: [NotificationChannel.IN_APP],
+  defaultChannels: [NotificationChannel.IN_APP],
+  mandatoryChannels: [],
+  externalModeByChannel: {},
+  payloadSchema,
+  safePayload: (p) => ({ updatedFields: p.updatedFields }),
+  renderInApp: (p, locale) =>
+    locale === 'en'
+      ? { title: 'Your event', body: `${p.updatedFields.length} field(s) changed.` }
+      : { title: 'Ваше событие', body: `Изменено полей: ${p.updatedFields.length}.` },
+}
+```
+
+Register it in
+[`definitions/index.ts`](../../apps/api/src/core/notifications/definitions/index.ts).
+Add `{ definition: yourEventDefinition, current: true }` to the inventory.
+The registry requires one current definition per type and rejects duplicate
+`(type, schemaVersion)` registrations. See [versioning](versioning.md).
+
+**Payload migration rule.** Changing the durable payload shape requires **bumping
+`schemaVersion` and keeping a renderer for older versions** until no retained rows or active deliveries reference them — historical feed rows
+must still render, and active work can outlive ordinary retention. An unknown `type`, an
+unsupported `schemaVersion`, an invalid stored payload, or a throwing renderer
+falls back to a **neutral feed item for that row**, never failing the feed page.
+
+## Produce a notification
+
+Inject `NotificationsService` and pick the variant that matches the caller's
+transaction story:
+
+```ts
+// Free-standing: informational, the business write already committed.
+await this.notifications.notify({
+  recipientUserId: user.id,
+  type: 'your_area.your_event',
+  payload: { updatedFields: ['name'] },
+  idempotencyKey: `your_area.your_event:${eventId}`,
+})
+
+// Atomic with a business mutation: rolls back if the outer transaction does.
+await this.prisma.$transaction(async (tx) => {
+  await tx.thing.update({/* ... */})
+  await this.notifications.notifyTx(tx, {
+    recipientUserId: user.id,
+    type: 'your_area.your_event',
+    payload: { updatedFields: ['name'] },
+    idempotencyKey: `your_area.your_event:${eventId}`,
+  })
+})
+```
+
+Use `notifyTx` when the notification is semantically part of the mutation
+(security state changes, payments, org transitions); use `notify` for derived
+events that are not part of the business invariant.
+
+**Idempotency.** `idempotencyKey` is **required** and follows the grammar
+`dotted.namespace:occurrence-id` (e.g. `account.password_changed:<sessionId>`,
+never a bare `password-changed`). The producer fingerprints the immutable dedupe
+intent (`type` + `schemaVersion` + `category` + `payload` + `action` +
+`organizationId` + `occurredAt`) and stores it beside the key:
+
+- **Same key + matching fingerprint** → existing row returned (`created: false`),
+  no duplicate written.
+- **Same key + different fingerprint** → `NotificationIdempotencyConflictError`
+  (a caller bug, not a safe replay).
+
+Insertion uses `INSERT … ON CONFLICT DO NOTHING RETURNING`. A producer
+conflict throws; let it escape the `notifyTx` caller callback to roll back the
+whole business transaction. Existing-key replay uses the stored version
+and preserves delivery targets; see [versioning and replay](versioning.md). This is the producer's
+own dedupe — separate from the HTTP
+[idempotency primitive](../operations/idempotency.md).
+
+## How delivery works
+
+**In-app** is written `DELIVERED` synchronously inside the producer transaction.
+
+**External** deliveries (email, Telegram) are durable and worker-driven. The
+producer writes one `PENDING` `NotificationDelivery` per resolved external target
+in its transaction, then best-effort enqueues a BullMQ **wake job** carrying
+**only the `notificationId`** — never the payload or any secret. `notifyTx`
+writes the rows but enqueues nothing (the caller owns commit timing). Contract:
+
+- **Postgres owns retry, leases, and attempts** — not BullMQ. The worker claims
+  due rows with `FOR UPDATE SKIP LOCKED`, leases the row (`PROCESSING` with a TTL),
+  records an immutable attempt, and finalizes with a compare-and-set on the lease
+  token so a stale holder can never overwrite newer state.
+- **A recovery `@Cron`** drains due deliveries on every replica, so a **lost wake**
+  (Redis blip) or a `notifyTx` delivery is still delivered — at-least-once with
+  provider-side idempotency.
+- **Transient** failures retry with exponential backoff (capped, jittered) up to a
+  budget, then dead-letter as `FAILED`; **permanent** failures fail immediately. A
+  crashed worker's expired lease is reclaimed and the attempt marked abandoned.
+
+Channels:
+
+| Channel    | Status                  | Notes                                                         |
+| ---------- | ----------------------- | ------------------------------------------------------------- |
+| `in_app`   | shipped, in-transaction | Always available; feed never depends on the worker.           |
+| `email`    | shipped, durable        | Worker-only adapter over prepared email requests (see below). |
+| `telegram` | shipped, durable        | Direct Bot API client + secret-header webhook (see below).    |
+
+**Email channel.** A worker-only adapter that calls
+[`EmailService.sendPreparedNotification()`](../../apps/api/src/infrastructure/email/) directly with a
+stable provider idempotency key `notification-delivery:<deliveryId>` — it **never
+uses the email queue** (secret-bearing mail keeps its own direct path). Delivery
+is to a **verified destination only**: an unverified account email is recorded
+`SKIPPED` (`destination_unverified`), never `PENDING`, and the mandatory in-app
+delivery still guarantees the user sees the event. Mail targets the produce-time
+canonical verified-address snapshot, not the display address.
+
+**Telegram channel.** Opt-in via config (see
+[webhooks](../operations/webhooks.md) and `.env.example`), additive over the same
+dispatcher contract. Linking (`POST /notifications/telegram/link`) returns a
+one-time `t.me/<bot>?start=<token>` deep link; only the token's SHA-256 is stored.
+The inbound `POST /webhooks/telegram` is `AuthType.None` and verified by a
+constant-time `X-Telegram-Bot-Api-Secret-Token` header (excluded from the client
+OpenAPI document); a durable `update_id` receipt makes the bind **effect-once**
+under Telegram's retries, and a chat already owned by another account is never
+silently moved. Delivery is plain text (no `parse_mode`). Outcomes are distinct
+and observable: unlinked → `SKIPPED telegram_not_linked`; a permanent destination
+error (`403` / chat-not-found) → terminal `FAILED` and the connection is fenced
+`BLOCKED` (user must relink); a `429 retry_after` is honored as a retry floor. No
+chat/user id, provider text, or token ever appears in an attempt or log.
+
+**Telegram relay (blocked regions).** Telegram's Bot API (`api.telegram.org`) is
+blocked at the network level in some deployment regions, independent of the bot
+token or account. `TELEGRAM_API_BASE_URL` (see `.env.example`) overrides the Bot
+API origin that the workers (sending and the reachability check) and the
+`telegram:setup` CLI call — set it to a relay you run instead of the default
+public API. A web-only API server (`PROCESS_ROLE=web`) makes no Bot API call; it
+reads the same token and address only to match the workers' check results to the
+current settings. A process with `PROCESS_ROLE=all` serves HTTP and also sends and
+runs the check, so treat it as a worker (its network path matters too). Set both
+variables identically on every process. Every request the client makes is built as
+`<TELEGRAM_API_BASE_URL>/bot<token>/<method>`
+([`telegram-bot-api.client.ts`](../../apps/api/src/core/notifications/channels/telegram/telegram-bot-api.client.ts)),
+and the `telegram:setup` CLI's `setWebhook` call honors the same override, so
+both outbound sends and webhook registration go through the relay consistently.
+The relay itself is just a reverse proxy that forwards `/bot*` requests
+unmodified to the real `https://api.telegram.org` (nginx/Caddy or similar) —
+AMCore doesn't ship one.
+
+**Is Telegram reachable?** Every worker with a token asks `getMe` once a minute
+through the same `TELEGRAM_API_BASE_URL`, so a blocked network, a refused token
+or a broken relay shows up before users notice missing messages. The result is
+the `amcore_telegram_reachability_state` metric with example alerts
+([Telegram runbook](../operations/runbooks/telegram.md)) and, with the optional
+Console, the **Telegram** row on **Integrations**. The check sends nothing and
+does not cover the incoming webhook.
+
+**Removing the Telegram channel** from `NOTIFICATION_CHANNELS` also removes its
+check: delete `telegram-reachability.service.ts` (with its import and provider line in
+`notification-delivery.modules.ts`) and the `TELEGRAM_REACHABILITY_JOB` entry in
+`scheduled-jobs.catalogue.ts`, in the same change. `test/process-role.e2e-spec.ts`
+fails while the catalogue still lists the job but no worker registers it; the source scan
+in `scheduled-jobs.catalogue.spec.ts` fails for a decorated method without its entry.
+
+**Only point this at infrastructure you control.** The bot token travels in the
+URL path of every request, so whoever terminates TLS on the relay gets full
+control of the bot (read/send messages, change the webhook). Never point it at
+a third-party or public Bot API mirror.
+
+If the token was ever sent to such a mirror, treat it as leaked, together with the
+webhook secret (`setWebhook` sent it through the same address) and the messages that
+passed through it (handle those under your incident process). Do these steps in this
+order, and start nothing with the new token before step 2 is done everywhere:
+
+1. In BotFather, revoke the token and generate a new one
+   ([Telegram: generating a token](https://core.telegram.org/bots/features#generating-an-authentication-token)).
+2. Replace the untrusted `TELEGRAM_API_BASE_URL` with the official API (remove the
+   variable; the default is `https://api.telegram.org`) or a relay you control, in every
+   place that uses it: the API server, every worker or `all` process, and the one-shot job
+   or container that runs `telegram:setup`. If your hosting blocks Telegram, have your own
+   relay running before this step. If your platform restarts a process as soon as a
+   variable changes, change the address first: a restart with the old, revoked token is
+   harmless.
+3. Set the new `TELEGRAM_BOT_TOKEN` and a new `WEBHOOK_TELEGRAM_SECRET` in the same places,
+   in one change where your platform allows it; a restart between the two is harmless,
+   because the address is already trusted.
+4. Start or restart those processes.
+5. If you use the webhook, register it again
+   ([Telegram webhook registration](../operations/deployment.md#telegram-webhook-registration-one-shot-optional)).
+
+The check itself sends the token once a minute from every worker, so keeping the old
+address even for a few minutes sends the new token to the same recipient.
+
+## Delivery guarantees and operating limits
+
+These are the current guarantees of the worker-side dispatcher (a worker process
+runs both the BullMQ wake path and the recovery cron through the same code).
+
+**At-least-once, never exactly-once.** A send can be accepted by the provider and
+the worker can still lose its lease or time out before recording it, so a
+recipient can occasionally receive a message twice. Email sends carry the stable
+idempotency key `notification-delivery:<deliveryId>` (Resend honors it for 24 h);
+Telegram has no equivalent, so its duplicate risk is real. A timeout is an
+**ambiguous** outcome — the message may have been sent — and is retried.
+
+**Capacity is per process.** A worker runs at most `NOTIFICATION_DISPATCH_CONCURRENCY`
+(default 2, a code constant in `notification-dispatch.constants.ts`) deliveries at
+once, shared by the wake job and the cron. A row is claimed only when a slot can
+start it immediately, so a lease never ages while a row waits behind others, and a
+slot stays occupied until the provider call has actually ended (even after its
+attempt timed out). This is **not** a rate limiter and not a fairness guarantee:
+replicas multiply it, one hung call still occupies a slot, and a provider's quota
+(for example Resend's per-team limit) is account-wide.
+
+**Start fence.** Immediately before each provider call the attempt is admitted in
+one short database transaction: the delivery lease must still belong to this
+worker (checked with fresh database time, after any lock wait) and, for Telegram,
+the connection must still exist as the same generation, owner, chat and `ACTIVE`
+status. A holder whose lease expired, a reaped-and-reclaimed attempt, an attempt
+whose timeout already fired, or a revoked target makes **no provider call**. The
+limit that remains: after a successful admission a process pause can still
+delay the request, and a call already admitted or on the wire is not recalled
+(see at-least-once above).
+
+**Revoked Telegram targets.** Unlinking, relinking, or a permanent destination
+error cancels every active delivery of that connection — `PENDING`,
+`RETRY_SCHEDULED` and the one being processed — with a bounded reason, closing its
+open attempt. A retry or the lease reaper therefore cannot send to the old chat,
+and a freshly linked connection is never disabled by a late failure of the old
+one. The producer reads the connection under a share lock, so a notification
+produced at the same instant as an unlink is either cancelled with it or skipped
+(`telegram_not_linked`). `notifyTx` callers: the default `READ COMMITTED`
+isolation is assumed; do not pre-lock delivery rows or lock several recipients in
+inconsistent order. Under stricter isolation a concurrent unlink may surface a
+serialization failure to your transaction.
+
+**Retry-After.** A provider's retry delay (Telegram `retry_after`, Resend
+`Retry-After` on a rate-limit response) is a floor: the next attempt is the later
+of the jittered backoff and the requested delay, and a delivery that runs out of
+attempts keeps that time in `nextAttemptAt` ("earliest permitted next attempt";
+status, not that date, decides whether a row is claimable). A delay longer than
+**24 hours is clamped to 24 hours** — a deliberate exception to "never earlier
+than the provider asked". An email transport that exposes no delay (the mock
+provider, other providers you add) simply uses the ordinary backoff; support for
+other providers is not promised. Quota-exhausted errors stay permanent.
+
+**Recovery and Redis.** Postgres owns state; a lost wake, a Redis outage or a
+missed realtime hint is recovered by the 30-second cron and by clients refetching.
+A crashed worker's lease expires and the reaper reclaims the row (the attempt is
+recorded `ABANDONED` and counts against the budget).
+
+**Graceful shutdown.** On `SIGTERM` the dispatcher first **closes** — no new
+claims, admissions or recovery passes — and lets work already in flight record its
+result. Within `NOTIFICATION_PROVIDER_TIMEOUT_MS + 5 s` (15 s), or earlier once
+the logical work finishes, it
+**seals**: nothing new starts, every wait on in-flight work is released, and a
+database transaction cut between two dependent writes is rolled back as a whole,
+never half-applied. This happens **before** the database pool is closed
+(`PrismaService` runs registered shutdown barriers first). A row whose result was
+not recorded after its claim committed is recovered through lease expiry and the
+reaper. An issued transaction may still commit or roll back after the seal: its
+outcome is unknown until it settles. A rolled-back claim stays pending; a committed
+finalize needs no reaper. Shutdown attempts to abort provider calls; adapters may
+ignore abort, and an already accepted message cannot be recalled. Calls still
+pending when the process terminates end with it, so the platform's termination
+grace must exceed this bound plus your
+other shutdown steps; see [Graceful shutdown](../operations/deployment.md#graceful-shutdown).
+
+## Preferences & mandatory channels
+
+Resolving which channels deliver a notification is **top wins**:
+
+1. The definition's `mandatoryChannels` — always on, never disabled by a user
+   preference or the master toggle.
+2. The master toggle (`UserSettings.notificationsEnabled`) — gates **all
+   optional** channels; mandatory channels are unaffected.
+3. The stored user override for `(category, channel)`.
+4. The definition's default.
+
+In the read response, `enabled: null` means no override is stored (definition
+defaults apply after the master gate) and `mandatory: true` means at least one
+definition in the category forces the channel. Editability comes from
+`GET /notifications/capabilities`: a pair can be updated only when its channel is
+in that category's `overridableChannels`. A mixed category can have both mandatory
+and optional definitions. Its override affects only optional delivery; mandatory
+delivery remains enabled. The server rejects an unsupported or non-overridable
+pair with `400`.
+
+`PUT /notifications/preferences` accepts a boolean override and returns `204`.
+It does not support resetting an override to null. If `notificationsEnabled` is
+false, optional delivery stays off even with a stored true override. A preferences
+editor should explain this while still allowing the override to be saved; it
+must not label the stored value as guaranteed effective delivery. See the
+[ordinary Query/form example](../frontend/api-consumption.md#start-with-an-ordinary-resource).
+
+The starter ships `account.profile_updated` (in-app only, best-effort, produced by
+`AuthService.updateProfile` — `PATCH /auth/me` — only when a field's value
+actually changed), `account.telegram_linked`, and `account.password_changed`
+(in-app **and** email mandatory), which exercises the resolver end-to-end.
+
+All three shipped definitions have real producers in the current backend:
+`account.profile_updated` from `PATCH /auth/me`, `account.password_changed`
+from a completed password reset, and `account.telegram_linked` from a
+completed Telegram link. None are demo-only.
+
+## Content & security rules
+
+- **Language-neutral, bounded payloads.** The durable `payload` is the allowlisted
+  schema shape — small, predictable, no free text. Rendering happens server-side.
+- **No secrets in the subsystem.** Each definition declares a `contentClass`
+  (`PUBLIC | PERSONAL | SENSITIVE`); `SECRET` content is **rejected at
+  registration**. Password-reset/verification tokens and credentials must never
+  appear in a `Notification.payload`, a queue job, or an attempt log — they stay
+  in the direct-email paths.
+- **External content uses a projection, not the raw payload.** When the content
+  policy resolves an external channel to `detailed`, the adapter renders **only**
+  the definition's `projectExternal(channel, payload)` allowlist (via `renderExternal[channelId]`). `PERSONAL` / `SENSITIVE` default to a neutral generic
+  summary; a definition may opt a channel into `detailed` (as
+  `account.password_changed` does for email, projecting only the non-secret change
+  time).
+- **Attempts store no sensitive data** — never a token, provider response body, or
+  sensitive payload; only a coded outcome.
+- **Retention never deletes active deliveries.** A daily worker-only sweep ages out
+  old rows (defaults: archived 30d, read 90d, unread 180d, finished attempts and
+  expired Telegram artifacts 30d) but never removes a notification with a
+  `PENDING` / `PROCESSING` / `RETRY_SCHEDULED` external delivery. Unknown effects,
+  legacy-unverified history and reserved manual grants also protect the parent.
+  Attempt pruning preserves compact certainty and grant-linked evidence. The feed is
+  **not** an audit log — durable security events live in `AuditLog`.
+
+## Realtime stream (SSE)
+
+`GET /notifications/stream` is a bearer-authenticated
+[Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)
+stream that pushes a **content-free hint** (`{ eventId, reason, notificationId? }`)
+whenever the recipient's feed changes. It is **not** a delivery channel — every
+event means _"refetch the feed and unread count"_; Postgres stays the source of
+truth. Contract:
+
+- **Cross-replica via Redis Pub/Sub**, on an environment- and version-namespaced
+  channel. **No sticky sessions**; **at-most-once** — a hint dropped in a Redis blip
+  is recovered by the next reconnect refetch, never replayed (no `Last-Event-ID`).
+- **Bearer only** — the token goes in the `Authorization` header, never the URL, so
+  clients use a fetch-stream reader, not `EventSource`. On (re)connect, establish
+  the stream **then** refetch to close the subscribe-vs-snapshot race; reconnect
+  with jittered backoff when the token expires.
+- **Backpressure & limits** — a slow consumer that overflows its buffer is
+  disconnected to resync; the per-user cap returns `429` and the global per-process
+  cap `503`. Operators tune it via `NOTIFICATIONS_REALTIME_*` env vars and **must
+  set a distinct `NOTIFICATIONS_REALTIME_NAMESPACE` per environment** when sharing
+  one Redis. Proxy/buffering/HTTP-2 guidance is in
+  [deployment](../operations/deployment.md).
+
+A Redis outage degrades realtime to "updates appear on your next refetch"; the
+feed is always correct without it.
+
+The starter's browser hooks use the same-origin BFF and require a confirmed
+user/session owner. Stream open/message hints cancel older feed/count reads before
+refreshing that owner's cache. Session replacement closes the old connection;
+preferences and the capability registry are separate dependencies. See the
+[frontend hook signatures and composition example](../frontend/api-consumption.md#notifications).
+A downstream feed UI still needs runtime verification; the starter ships hooks,
+not a ready feed screen. The direct bearer-client contract above is unchanged.
+
+## Add a channel
+
+Follow [channel registration](channels.md) for the complete reader/module/worker/HTTP
+contract, availability, target limits, generation fences, prepared request schema
+and executable downstream registration fixture.
+
+## What's not in the starter yet
+
+Intentional deferrals, additive over the contract above: **Web Push**, **organization recipients / fan-out / org-level preferences**,
+and **digests, quiet hours, timezone scheduling, and frequency caps**.
+
+## See also
+
+- [Email](../email/README.md) — `EmailService` and the notification email template.
+- [Webhooks](../operations/webhooks.md) — the secret-header verifier behind Telegram.
+- [Idempotency](../operations/idempotency.md) — the separate HTTP primitive.
+- [Deployment](../operations/deployment.md) — SSE proxy/buffering guidance.
+- [Frontend API consumption](../frontend/api-consumption.md) — the feed/
+  preferences hooks and why `apps/web` consumes the SSE stream with native
+  `EventSource` instead of the fetch-stream reader a direct consumer needs.
+- Source & tests — [`core/notifications/`](../../apps/api/src/core/notifications/)
+  (unit specs alongside the module; e2e in
+  [`apps/api/test/`](../../apps/api/test/) against real Postgres + Redis).

@@ -1,0 +1,197 @@
+import { z } from 'zod'
+
+import {
+  type AdminAuditResponse,
+  auditActionCodeSchema,
+  auditCommandDetailsSchema,
+  auditDisplayIdSchema,
+  auditMailSummarySchema,
+  auditSummarySchema,
+  isCorrelationId,
+  SUPPORT_MAIL_OUTCOMES,
+  SUPPORT_MAIL_REASONS,
+} from '@amcore/shared'
+
+type Item = AdminAuditResponse['items'][number]
+type User = { id: string; name: string | null; email: string }
+type Organization = { id: string; name: string; slug: string }
+export interface AuditProjectionRow {
+  id: string
+  requestId: string | null
+  createdAt: Date
+  actorType: Item['actorType']
+  actorId: string | null
+  action: string
+  targetType: Item['targetType']
+  targetId: string | null
+  organizationId: string | null
+  category: Item['category']
+  metadata: unknown
+}
+
+const CODE = /^[a-z][a-z0-9_]*$/
+
+function hasControl(value: string): boolean {
+  for (const char of value) if (char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127) return true
+  return false
+}
+
+export function safeAuditId(value: string | null): string | null {
+  return value && auditDisplayIdSchema.safeParse(value).success ? value : null
+}
+
+function safeText(value: unknown, max: number): string | undefined {
+  return typeof value === 'string' && value.length > 0 && value.length <= max && !hasControl(value)
+    ? value
+    : undefined
+}
+
+function safeCode(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length <= 64 && CODE.test(value) ? value : undefined
+}
+
+export function auditSummary(action: string, metadata: unknown): Item['summary'] {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return {}
+  const m = metadata as Record<string, unknown>
+  if (action === 'admin.runtime_setting.changed') {
+    const parsed = auditSummarySchema.safeParse({
+      beforeIntervalSeconds: m.beforeIntervalSeconds,
+      afterIntervalSeconds: m.afterIntervalSeconds,
+      beforeRevision: m.beforeRevision,
+      afterRevision: m.afterRevision,
+    })
+    return parsed.success ? parsed.data : {}
+  }
+  if (action === 'admin.user.system_role_changed') {
+    const role = (v: unknown): 'USER' | 'SUPER_ADMIN' | undefined =>
+      v === 'USER' || v === 'SUPER_ADMIN' ? v : undefined
+    return { beforeSystemRole: role(m.beforeSystemRole), afterSystemRole: role(m.afterSystemRole) }
+  }
+  if (action === 'admin.user.sessions_revoked') {
+    return {
+      count:
+        Number.isInteger(m.count) &&
+        typeof m.count === 'number' &&
+        m.count >= 0 &&
+        m.count <= 1_000_000
+          ? m.count
+          : undefined,
+    }
+  }
+  if (
+    ['requested', 'dispatching', 'settled', 'refused'].some(
+      (event) => action === `admin.user.support_mail_${event}`
+    )
+  ) {
+    const mail: Record<string, unknown> = {}
+    for (const [key, schema] of Object.entries(auditMailSummarySchema.shape)) {
+      const parsed = schema.safeParse(m[key])
+      if (parsed.success && parsed.data !== undefined) mail[key] = parsed.data
+    }
+    const outcomes: readonly string[] = ['claimed', 'dispatching', ...SUPPORT_MAIL_OUTCOMES]
+    const reasons: readonly string[] = SUPPORT_MAIL_REASONS
+    return {
+      mail: Object.keys(mail).length ? auditMailSummarySchema.parse(mail) : undefined,
+      outcome:
+        typeof m.outcome === 'string' && outcomes.includes(m.outcome) ? m.outcome : undefined,
+      reasonCode: typeof m.reason === 'string' && reasons.includes(m.reason) ? m.reason : undefined,
+    }
+  }
+  if (action.startsWith('background_work.command_')) {
+    const outcomes = ['prepared', 'dispatching', 'applied', 'rejected', 'not_attempted', 'unknown']
+    return {
+      outcome:
+        typeof m.outcome === 'string' && outcomes.includes(m.outcome) ? m.outcome : undefined,
+    }
+  }
+  if (
+    action.startsWith('ai.approval.') &&
+    ['ai.approval.approved', 'ai.approval.rejected', 'ai.approval.expired'].includes(action)
+  ) {
+    return { decision: safeCode(m.decision), reasonCode: safeCode(m.reasonCode) }
+  }
+  if (action === 'ai.tool.invoked') return { outcome: safeCode(m.outcome) }
+  return {}
+}
+
+/** Validate each allowlisted field independently so historical malformed fields remain hidden. */
+function commandDetails(action: string, metadata: unknown): Item['commandDetails'] {
+  if (
+    !action.startsWith('background_work.') ||
+    !metadata ||
+    typeof metadata !== 'object' ||
+    Array.isArray(metadata)
+  )
+    return undefined
+  const source = metadata as Record<string, unknown>
+  const result: Record<string, unknown> = {}
+  for (const [key, schema] of Object.entries(auditCommandDetailsSchema.shape)) {
+    const parsed = schema.safeParse(source[key])
+    if (parsed.success && parsed.data !== undefined) {
+      if (
+        key === 'reason' &&
+        (hasControl(parsed.data as string) ||
+          Buffer.byteLength(parsed.data as string, 'utf8') > 1024)
+      )
+        continue
+      result[key] = parsed.data
+    }
+  }
+  return Object.keys(result).length ? auditCommandDetailsSchema.parse(result) : undefined
+}
+
+function userIdentity(id: string | null, users: Map<string, User>): Item['actorIdentity'] {
+  if (!id) return undefined
+  const user = users.get(id)
+  if (!user) return { status: 'not_found' }
+  const email = safeText(user.email, 255)
+  return {
+    status: 'current',
+    name: safeText(user.name, 120),
+    email: email && z.email().safeParse(email).success ? email : undefined,
+  }
+}
+
+function organizationIdentity(
+  id: string | null,
+  organizations: Map<string, Organization>
+): Item['organizationIdentity'] {
+  if (!id) return undefined
+  const organization = organizations.get(id)
+  if (!organization) return { status: 'not_found' }
+  return {
+    status: 'current',
+    name: safeText(organization.name, 120),
+    slug: safeText(organization.slug, 120),
+  }
+}
+
+export function projectAuditRow(
+  row: AuditProjectionRow,
+  users: Map<string, User>,
+  organizations: Map<string, Organization>
+): Item {
+  const actorId = safeAuditId(row.actorId)
+  const targetId = safeAuditId(row.targetId)
+  const organizationId = safeAuditId(row.organizationId)
+  return {
+    id: safeAuditId(row.id),
+    // A value that is not a well-formed correlation ID is left out, never an error for the page.
+    requestId: isCorrelationId(row.requestId) ? row.requestId : undefined,
+    createdAt: row.createdAt.toISOString(),
+    actorType: row.actorType,
+    actorId,
+    actorIdentity: row.actorType === 'USER' ? userIdentity(actorId, users) : undefined,
+    action: auditActionCodeSchema.safeParse(row.action).success ? row.action : null,
+    targetType: row.targetType,
+    targetId,
+    targetIdentity: row.targetType === 'USER' ? userIdentity(targetId, users) : undefined,
+    targetOrganizationIdentity:
+      row.targetType === 'ORGANIZATION' ? organizationIdentity(targetId, organizations) : undefined,
+    organizationId,
+    organizationIdentity: organizationIdentity(organizationId, organizations),
+    category: row.category,
+    summary: auditSummary(row.action, row.metadata),
+    commandDetails: commandDetails(row.action, row.metadata),
+  }
+}

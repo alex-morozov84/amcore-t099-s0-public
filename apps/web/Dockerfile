@@ -1,0 +1,88 @@
+# ===========================================
+# Base — pinned runtime + package manager
+# ===========================================
+# Node 24 + pnpm 12.18.0 to match the repo's engines/packageManager (the root
+# package.json's `packageManager` drives the corepack version regardless of what
+# is prepared here, so they must agree — a Node 20 base broke pnpm 11).
+FROM node:24-alpine@sha256:a34ab6d7f6f4813f4d0c5469d74685604b962fbdbf5793a7bc7b4998ecb867c8 AS base
+
+RUN corepack enable && corepack prepare pnpm@12.18.0 --activate
+
+# pnpm store in a BuildKit cache mount shared with the api image and every other
+# build on the machine (see apps/api/Dockerfile for the rationale). Not baked
+# into an image layer.
+ENV pnpm_config_store_dir=/pnpm/store
+
+WORKDIR /app
+
+# ===========================================
+# Build — install (incl. dev) + build, one stage
+# ===========================================
+# A single stage avoids copying per-package `node_modules` across stages: pnpm
+# does not create a `node_modules` for dependency-less workspace packages
+# (e.g. packages/typescript-config), so the old cross-stage COPY failed. The
+# install layer still caches because manifests are copied before sources.
+FROM base AS build
+
+# pnpm may reinstall before scripts after COPY; every install must keep the lockfile frozen.
+ENV pnpm_config_frozen_lockfile=true
+
+COPY pnpm-lock.yaml pnpm-workspace.yaml package.json ./
+COPY patches ./patches
+COPY packages/typescript-config/package.json ./packages/typescript-config/
+COPY packages/eslint-config/package.json ./packages/eslint-config/
+COPY packages/shared/package.json ./packages/shared/
+COPY apps/web/package.json ./apps/web/
+
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
+    pnpm install --frozen-lockfile
+
+COPY packages ./packages
+COPY apps/web ./apps/web
+# Type checking includes lint contract tests that import the shared CLI helper.
+COPY scripts ./scripts
+# Source-only deployment validation. These files never enter the standalone runner.
+COPY docker/caddy/product-admin.generated.caddy ./docker/caddy/product-admin.generated.caddy
+COPY docker/nginx/product-admin*.conf ./docker/nginx/
+# The web build checks that the Console edge files match admin-console.json and locales.json.
+COPY docker/caddy/Caddyfile.console-host ./docker/caddy/Caddyfile.console-host
+COPY docker/nginx/operations-console.conf ./docker/nginx/operations-console.conf
+
+RUN pnpm --filter @amcore/shared build
+
+ENV NEXT_TELEMETRY_DISABLED=1
+ARG BUILD_SOURCE_COMMIT
+ARG NEXT_DEPLOYMENT_ID
+ENV NEXT_DEPLOYMENT_ID=${NEXT_DEPLOYMENT_ID}
+# Optional build-only Node options, e.g. --max-old-space-size=3072 on a small host with
+# swap: V8 sizes its default heap from physical RAM. Scoped to this RUN, never the runner.
+ARG BUILD_NODE_OPTIONS=""
+RUN BUILD_SOURCE_COMMIT="$BUILD_SOURCE_COMMIT" NODE_OPTIONS="$BUILD_NODE_OPTIONS" pnpm --filter web build
+
+# ===========================================
+# Runner — minimal, self-contained, non-root
+# ===========================================
+FROM node:24-alpine@sha256:a34ab6d7f6f4813f4d0c5469d74685604b962fbdbf5793a7bc7b4998ecb867c8 AS runner
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV PORT=3000
+ENV HOSTNAME="0.0.0.0"
+
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 nextjs
+
+# Next standalone output. With outputFileTracingRoot = repo root, the bundle is
+# monorepo-rooted: the server entrypoint is at apps/web/server.js and the traced
+# node_modules (incl. @amcore/shared) sit at the standalone root.
+COPY --from=build /app/apps/web/.next/standalone ./
+# Read-only audit provenance from the same production build; no new HTTP endpoint.
+COPY --from=build /app/apps/web/.next/app-path-routes-manifest.json ./apps/web/.next/app-path-routes-manifest.json
+COPY --from=build /app/apps/web/.next/static ./apps/web/.next/static
+COPY --from=build /app/apps/web/public ./apps/web/public
+
+USER nextjs
+
+EXPOSE 3000
+
+CMD ["node", "apps/web/server.js"]

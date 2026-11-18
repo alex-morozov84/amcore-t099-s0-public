@@ -1,0 +1,350 @@
+import { RequestMethod } from '@nestjs/common'
+import type { ClsService } from 'nestjs-cls'
+import type { Params } from 'nestjs-pino'
+import { hostname } from 'os'
+
+import { mfaCredentialPath } from '../utils/mfa-credential-path.js'
+
+export type TruncatedBody = {
+  _truncated: true
+  _originalBytes: number
+  _maxBytes: number
+  _topLevelKeys?: string[]
+}
+
+/**
+ * CLS keys a queued-job run sets (`workId`, `jobId`, `invocationId`); the mixin copies them onto
+ * every log line of that run. Request lines never set them. `trace_id`/`span_id` are reserved
+ * for tracing as sibling fields of `correlationId`, so adding tracing later renames nothing.
+ */
+export const WORKER_LOG_CONTEXT_KEYS = ['workId', 'jobId', 'invocationId'] as const
+
+/**
+ * Query-string keys whose value must never reach a log line in either
+ * representation a request carries it in: the structured `req.query`
+ * object (redacted below via Pino's path-based `redact.paths`) and the
+ * raw `req.url` string (sanitized by `sanitizeRequestUrl`, since Pino's
+ * path redaction cannot reach into a substring of a single string field).
+ * Kept as one list so the two representations can't drift out of sync —
+ * fixing only one of them still leaks the value through the other.
+ */
+const SENSITIVE_QUERY_PARAMS = [
+  'token',
+  'ticket',
+  'code',
+  'state',
+  'apiKey',
+  'search',
+  'actorId',
+  'targetId',
+  'organizationId',
+  'userId',
+  'id',
+  'cursor',
+]
+
+/**
+ * Replaces the value of every {@link SENSITIVE_QUERY_PARAMS} key in a
+ * request's raw URL with a redaction marker, preserving the path and every
+ * other query key. Fails closed: an unparseable value never falls back to
+ * the original, possibly-sensitive string.
+ *
+ * `req.url` is a request-target (e.g. `/api/v1/admin/users?search=x`), not
+ * an absolute URL — `WHATWG URL` requires a base to parse one, hence the
+ * fixed dummy origin below; only `pathname`+`search` are ever read back out
+ * of it, so that origin never actually appears in the result.
+ */
+export function sanitizeRequestUrl(url: unknown): string {
+  if (typeof url !== 'string' || url.length === 0) return '[REDACTED]'
+  try {
+    const parsed = new URL(url, 'http://sanitize.invalid')
+    if (mfaCredentialPath(url)) {
+      return `${parsed.pathname}${parsed.search ? '?[REDACTED]' : ''}`
+    }
+    for (const key of SENSITIVE_QUERY_PARAMS) {
+      if (parsed.searchParams.has(key)) parsed.searchParams.set(key, '[REDACTED]')
+    }
+    return `${parsed.pathname}${parsed.search}`
+  } catch {
+    return '[REDACTED]'
+  }
+}
+
+// Caps body payloads put into request logs. Small bodies pass through
+// unchanged so Pino's path-based redaction still resolves `req.body.password`
+// etc. Over-cap bodies collapse to a marker with size + top-level keys —
+// keeps the log line bounded without leaking field values.
+export function truncateBody(body: unknown, maxBytes: number): unknown | TruncatedBody {
+  if (body === undefined || body === null) return body
+
+  let serialized: string
+  try {
+    serialized = JSON.stringify(body)
+  } catch {
+    return { _truncated: true, _originalBytes: 0, _maxBytes: maxBytes }
+  }
+
+  const byteLength = Buffer.byteLength(serialized, 'utf8')
+  if (byteLength <= maxBytes) return body
+
+  return {
+    _truncated: true,
+    _originalBytes: byteLength,
+    _maxBytes: maxBytes,
+    _topLevelKeys: typeof body === 'object' && !Array.isArray(body) ? Object.keys(body) : undefined,
+  }
+}
+
+function serializeRequestBody(
+  url: string | undefined,
+  body: unknown,
+  maxBodyBytes: number
+): unknown | TruncatedBody | '[REDACTED]' {
+  if (url?.includes('/webhooks/')) return '[REDACTED]'
+  // Validation may reject arbitrary extra fields; they must not reach logs first.
+  if (url && /\/ai\/approvals(?:\/|\?|$)/.test(url)) return '[REDACTED]'
+  if (url && mfaCredentialPath(url)) return '[REDACTED]'
+  return truncateBody(body, maxBodyBytes)
+}
+
+/**
+ * Pino logging configuration for nestjs-pino
+ * Includes: correlation ID, sensitive data redaction, request/response serializers, GDPR-compliant IP anonymization
+ */
+export function createLoggingConfig(cls: ClsService, maxBodyBytes: number): Params {
+  const isDevelopment = process.env.NODE_ENV !== 'production'
+  // pino-pretty runs in a worker thread, so the main thread cannot guarantee that a line it
+  // has handed over is written before the process dies (Nest re-emits the shutdown signal
+  // right after its hooks). Keep it for interactive development; tests and production log
+  // through pino's own destination, which the shutdown hook drains synchronously.
+  const prettyOutput = isDevelopment && process.env.NODE_ENV !== 'test'
+
+  return {
+    pinoHttp: {
+      // Mixin applies to ALL logs (including manual logger.warn/error calls in exception filters)
+      mixin() {
+        const context: Record<string, unknown> = { correlationId: cls.getId() }
+        for (const key of WORKER_LOG_CONTEXT_KEYS) {
+          const value: unknown = cls.get(key)
+          if (value !== undefined) context[key] = value
+        }
+        return context
+      },
+
+      // Pretty console output in interactive development only
+      transport: prettyOutput
+        ? {
+            target: 'pino-pretty',
+            options: {
+              colorize: true,
+              singleLine: true,
+              ignore: 'pid,hostname',
+            },
+          }
+        : undefined,
+
+      level: isDevelopment ? 'debug' : 'info',
+      autoLogging: true,
+      quietReqLogger: true,
+
+      // Sensitive data redaction (GDPR compliant)
+      redact: {
+        paths: [
+          // Passwords
+          'req.body.password',
+          'req.body.currentPassword',
+          'req.body.newPassword',
+          'req.body.confirmPassword',
+          'req.body.oldPassword',
+          'req.body.user.password',
+          'req.body.user.currentPassword',
+          'req.body.user.newPassword',
+          'req.body.user.confirmPassword',
+          'req.body.user.oldPassword',
+          '*.password',
+          '*.currentPassword',
+          '*.newPassword',
+
+          // Tokens & Secrets
+          'req.body.token',
+          'req.body.ticket',
+          'req.body.credential',
+          'req.body.cleanupKey',
+          'req.body.accessToken',
+          'req.body.refreshToken',
+          'req.body.apiKey',
+          'req.body.secret',
+          'req.body.user.token',
+          'req.body.user.accessToken',
+          'req.body.user.refreshToken',
+          'req.body.user.apiKey',
+          'req.body.user.secret',
+          'req.body.session.token',
+          'req.body.session.accessToken',
+          'req.body.session.refreshToken',
+          'req.body.session.secret',
+          'req.body.apiKey.token',
+          'req.body.apiKey.accessToken',
+          'req.body.apiKey.refreshToken',
+          'req.body.apiKey.secret',
+          'req.body.oauthAccount.accessToken',
+          'req.body.oauthAccount.refreshToken',
+          ...SENSITIVE_QUERY_PARAMS.map((key) => `req.query.${key}`),
+          '*.token',
+          '*.accessToken',
+          '*.refreshToken',
+          '*.apiKey',
+          '*.secret',
+          '*.passwordHash',
+          '*.tokenHash',
+          '*.credential',
+          '*.credentialHash',
+          '*.cleanupKeyHash',
+          'req.headers["x-invitation-continuation"]',
+          'req.headers["x-invitation-handoff-key"]',
+          '*.invitation.credential',
+          '*.invitation.cleanupKey',
+          '*.keyHash',
+          '*.salt',
+
+          // Token-bearing action URLs (EQS-02) — these embed a live
+          // reset/verification/invite token in their query string. They are
+          // sent via EmailService.sendNow and never enqueued, but redact them
+          // defensively in case an in-memory email payload is ever logged.
+          // (fast-redact matches whole key segments, so `*Url` would not work;
+          // enumerate the concrete keys with an intermediate wildcard.)
+          '*.resetUrl',
+          '*.verificationUrl',
+          '*.acceptUrl',
+
+          // Known nested hashes / credentials
+          'req.body.user.passwordHash',
+          'req.body.user.tokenHash',
+          'req.body.user.keyHash',
+          'req.body.user.salt',
+          'req.body.session.passwordHash',
+          'req.body.session.tokenHash',
+          'req.body.session.keyHash',
+          'req.body.session.salt',
+          'req.body.apiKey.passwordHash',
+          'req.body.apiKey.tokenHash',
+          'req.body.apiKey.keyHash',
+          'req.body.apiKey.salt',
+          'req.body.oauthAccount.passwordHash',
+          'req.body.oauthAccount.tokenHash',
+          'req.body.oauthAccount.keyHash',
+          'req.body.oauthAccount.salt',
+
+          // AI human-takeover / operator-review (Track C — ADR-054, Arc F.3): the operator reason /
+          // ticket ref (takeover/release/operator-message body + the transcript-read header) and the
+          // operator message `content` are user/transcript text — never emit them to access/error logs.
+          // (Audit records them separately, content-free / bounded.)
+          'req.body.reason',
+          'req.body.content',
+          'req.headers["x-amcore-operator-reason"]',
+
+          // Headers
+          'req.headers.authorization',
+          'req.headers["x-amcore-web-context-key"]',
+          'req.headers["x-amcore-browser-context-key"]',
+          'req.headers["x-amcore-browser-binding"]',
+          'req.headers["x-mfa-continuation"]',
+          'req.headers["x-mfa-vault-binding"]',
+          'req.headers["x-amcore-return-proof"]',
+          'req.body.receiptSecret',
+          'headers["x-amcore-browser-context-key"]',
+          'headers["x-amcore-browser-binding"]',
+          'headers["x-mfa-continuation"]',
+          'headers["x-mfa-vault-binding"]',
+          'headers["x-amcore-return-proof"]',
+          'receiptSecret',
+          'headers["x-amcore-web-context-key"]',
+          'WEB_FRONTEND_CONTEXT_KEY',
+          'req.headers.cookie',
+          'res.headers["set-cookie"]',
+          'res.headers.location',
+          'req.headers["x-api-key"]',
+          'req.headers["x-auth-token"]',
+          'req.headers["stripe-signature"]',
+          'req.headers["webhook-signature"]',
+          'req.headers["x-hub-signature-256"]',
+          'req.headers["x-telegram-bot-api-secret-token"]',
+
+          // Response tokens
+          'res.body.accessToken',
+          'res.body.refreshToken',
+
+          // Payment data
+          'req.body.creditCard',
+          'req.body.cardNumber',
+          'req.body.cvv',
+          'req.body.payment.card',
+          'req.body.payment.card.*',
+          '*.creditCard',
+          '*.cardNumber',
+          '*.cvv',
+
+          // Personal identifiers (optional - uncomment if needed)
+          // 'req.body.ssn',
+          // '*.ssn',
+        ],
+        censor: '[REDACTED]',
+      },
+
+      // Custom serializers to include request/response bodies (with redaction)
+      serializers: {
+        req(req) {
+          return {
+            id: req.id,
+            method: req.method,
+            url: sanitizeRequestUrl(req.url),
+            query:
+              typeof req.url === 'string' && mfaCredentialPath(req.url) ? '[REDACTED]' : req.query,
+            params: req.params,
+            headers: {
+              host: req.headers.host,
+              'user-agent': req.headers['user-agent'],
+              'content-type': req.headers['content-type'],
+              authorization: req.headers.authorization, // Will be redacted
+              cookie: req.headers.cookie, // Will be redacted
+            },
+            // Capped to `maxBodyBytes` (env LOG_BODY_MAX_BYTES, default 4096).
+            // Under the cap → object passes through so Pino redact paths apply.
+            // Over the cap → marker with original size + top-level keys.
+            body: serializeRequestBody(req.url, req.raw?.body || req.body, maxBodyBytes),
+            remoteAddress: req.socket?.remoteAddress,
+            remotePort: req.socket?.remotePort,
+          }
+        },
+        res(res) {
+          return {
+            statusCode: res.statusCode,
+            headers: res.getHeaders?.() || res.headers,
+          }
+        },
+      },
+
+      // Note: correlationId is added via mixin above (applies to ALL logs)
+      // Other fields (userId, ip, userAgent, nodeId) are added via customProps for HTTP logs only
+      customProps: () => ({
+        userId: cls.get('userId'),
+        ip: cls.get('ip'), // Anonymized IP (GDPR compliant)
+        userAgent: cls.get('userAgent'),
+        nodeId: process.env.NODE_ID || hostname(), // For multi-node deployment
+      }),
+    },
+
+    // Apply to all routes
+    forRoutes: [{ path: '{*path}', method: RequestMethod.ALL }],
+
+    // Exclude health check endpoints from logs to reduce noise
+    exclude: [
+      { path: 'api/v1/health', method: RequestMethod.GET },
+      { path: 'api/v1/health/startup', method: RequestMethod.GET },
+      { path: 'api/v1/health/ready', method: RequestMethod.GET },
+      { path: 'api/v1/health/live', method: RequestMethod.GET },
+      { path: 'api/v1/metrics', method: RequestMethod.GET },
+      { path: 'metrics', method: RequestMethod.GET },
+    ],
+  }
+}

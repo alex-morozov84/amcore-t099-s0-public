@@ -1,0 +1,302 @@
+import { createHash } from 'node:crypto'
+import { createReadStream, type Stats } from 'node:fs'
+import { copyFile, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+import { Readable } from 'node:stream'
+
+import { Injectable } from '@nestjs/common'
+
+import { InvalidObjectKeyError, normalizeObjectKey } from '../object-key.js'
+import {
+  type CopyObjectInput,
+  type FileInfo,
+  type FileMetadata,
+  type ListInput,
+  type ListResult,
+  type SignedDownloadInput,
+  type SignedUploadInput,
+  type StorageCapabilities,
+  StorageObjectNotFoundError,
+  type StorageProvider,
+  type UploadInput,
+  type UploadResult,
+} from '../storage.interface.js'
+import {
+  assertSameNamespace,
+  isPublicKey,
+  resolveUploadVisibility,
+  visibilityOf,
+} from '../storage-namespace.js'
+import { buildPublicRouteUrl } from '../storage-public-url.js'
+
+import { bufferFromBody } from './body.util.js'
+
+export interface LocalStorageConfig {
+  root: string
+  /** Absolute API /api/v1/storage/public endpoint; only `public/` copies are served. */
+  publicBaseUrl?: string
+}
+
+/** Sidecar JSON kept alongside each object so contentType/etag survive restarts. */
+interface SidecarMeta {
+  contentType?: string
+  etag: string
+  cacheControl?: string
+}
+
+const DEFAULT_MAX_KEYS = 1000
+// Objects and their metadata live under separate reserved subdirs of the root,
+// so no object key can ever collide with a metadata path (a key like
+// `foo.meta.json` is just `objects/foo.meta.json`; its metadata is
+// `meta/foo.meta.json.json`). The object key namespace stays clean.
+const OBJECTS_DIR = 'objects'
+const META_DIR = 'meta'
+
+/**
+ * Filesystem storage driver (dev default). Stores object bytes under
+ * `<root>/objects/<key>` and per-object metadata under `<root>/meta/<key>.json`,
+ * so the object key namespace is never shadowed by metadata. Keys under `public/`
+ * also get a copy under `<root>/public/<key>`, the only tree the API public route
+ * serves. Signed URLs are unsupported; `getPublicUrl` needs the public route base.
+ */
+@Injectable()
+export class LocalStorageProvider implements StorageProvider {
+  readonly capabilities: StorageCapabilities
+
+  constructor(private readonly config: LocalStorageConfig) {
+    this.capabilities = { signedUrls: false, publicUrls: Boolean(config.publicBaseUrl) }
+  }
+
+  async upload(input: UploadInput): Promise<UploadResult> {
+    const key = normalizeObjectKey(input.key)
+    resolveUploadVisibility(key, input.visibility)
+    const body = await bufferFromBody(input.body)
+    const etag = createHash('sha256').update(body).digest('hex')
+    // Drop any stale public bytes first so a rewrite never serves old content.
+    await rm(this.publicPath(key), { force: true })
+    await this.writeFileAt(this.objectPath(key), body)
+    const meta: SidecarMeta = {
+      contentType: input.contentType,
+      etag,
+      cacheControl: input.cacheControl,
+    }
+    await this.writeFileAt(this.metaPath(key), Buffer.from(JSON.stringify(meta)))
+    if (isPublicKey(key)) await this.writeFileAt(this.publicPath(key), body)
+    return { key, size: body.length, etag, contentType: input.contentType }
+  }
+
+  async download(key: string): Promise<Buffer> {
+    return readFile(await this.existingObjectPath(key))
+  }
+
+  async downloadStream(key: string): Promise<Readable> {
+    return createReadStream(await this.existingObjectPath(key))
+  }
+
+  async getMetadata(key: string): Promise<FileMetadata> {
+    const stats = await this.statFileOrThrow(this.objectPath(key), key)
+    const meta = await this.readSidecar(key)
+    return {
+      contentType: meta?.contentType,
+      contentLength: stats.size,
+      etag: meta?.etag,
+      lastModified: stats.mtime,
+      cacheControl: meta?.cacheControl,
+      visibility: visibilityOf(key),
+    }
+  }
+
+  async delete(key: string): Promise<void> {
+    const full = this.objectPath(key)
+    try {
+      if (!(await stat(full)).isFile()) return // prefix dir / non-object: no-op
+    } catch (err) {
+      if (this.isErrno(err, 'ENOENT')) return
+      throw err
+    }
+    await rm(this.publicPath(key), { force: true })
+    await rm(full, { force: true })
+    await rm(this.metaPath(key), { force: true })
+  }
+
+  async deleteMany(keys: string[]): Promise<void> {
+    // Local fs has no per-key partial-failure batch; the s3 provider throws
+    // StorageDeleteManyException for that case in a later stage.
+    for (const key of keys) await this.delete(key)
+  }
+
+  async exists(key: string): Promise<boolean> {
+    try {
+      return (await stat(this.objectPath(key))).isFile()
+    } catch (err) {
+      // Only a genuine "not found" means the object is absent. Real FS faults
+      // (EACCES, ENOTDIR, bad root) must propagate so callers — notably the
+      // health probe — don't read a broken filesystem as "object missing / ok".
+      if (this.isErrno(err, 'ENOENT')) return false
+      throw err
+    }
+  }
+
+  async list(input: ListInput): Promise<ListResult> {
+    return this.page(await this.collectFiles(), input)
+  }
+
+  getPublicUrl(key: string): string {
+    if (!this.config.publicBaseUrl) {
+      throw new Error(
+        'Public URLs are not configured for the local storage driver (set STORAGE_PUBLIC_BASE_URL)'
+      )
+    }
+    return buildPublicRouteUrl(this.config.publicBaseUrl, key)
+  }
+
+  async getSignedDownloadUrl(_input: SignedDownloadInput): Promise<string> {
+    throw new Error('Signed URLs are not supported by the local storage driver')
+  }
+
+  async getSignedUploadUrl(_input: SignedUploadInput): Promise<string> {
+    throw new Error('Signed URLs are not supported by the local storage driver')
+  }
+
+  async copy(input: CopyObjectInput): Promise<void> {
+    const sourceKey = normalizeObjectKey(input.source)
+    const destKey = normalizeObjectKey(input.destination)
+    assertSameNamespace(sourceKey, destKey)
+    await this.statFileOrThrow(this.objectPath(sourceKey), input.source)
+    await rm(this.publicPath(destKey), { force: true })
+    await this.copyFileAt(this.objectPath(sourceKey), this.objectPath(destKey))
+    try {
+      await this.copyFileAt(this.metaPath(sourceKey), this.metaPath(destKey))
+    } catch (err) {
+      if (!this.isErrno(err, 'ENOENT')) throw err
+    }
+    if (isPublicKey(destKey)) {
+      await this.copyFileAt(this.objectPath(sourceKey), this.publicPath(destKey))
+    }
+  }
+
+  async move(input: CopyObjectInput): Promise<void> {
+    const sourceKey = normalizeObjectKey(input.source)
+    const destKey = normalizeObjectKey(input.destination)
+    // Same-key move is a no-op: copy-then-delete would otherwise destroy it.
+    if (sourceKey === destKey) return
+    await this.copy(input)
+    await this.delete(input.source)
+  }
+
+  /**
+   * The absolute path of an existing object, resolved and checked against the objects root
+   * right here, so the path that is read is the path that was verified.
+   */
+  private async existingObjectPath(key: string): Promise<string> {
+    const root = path.resolve(this.config.root, OBJECTS_DIR) + path.sep
+    const file = path.resolve(root, normalizeObjectKey(key))
+    if (!file.startsWith(root)) throw new InvalidObjectKeyError('path outside object storage')
+    await this.statFileOrThrow(file, key)
+    return file
+  }
+
+  private objectPath(key: string): string {
+    return this.resolveUnder(OBJECTS_DIR, normalizeObjectKey(key))
+  }
+
+  private publicPath(key: string): string {
+    return this.resolveUnder('public', normalizeObjectKey(key))
+  }
+
+  private metaPath(key: string): string {
+    return `${this.resolveUnder(META_DIR, normalizeObjectKey(key))}.json`
+  }
+
+  private resolveUnder(subdir: string, normalizedKey: string): string {
+    const base = path.resolve(this.config.root, subdir)
+    const full = path.resolve(base, normalizedKey)
+    if (full !== base && !full.startsWith(base + path.sep)) {
+      throw new Error(`Object key resolves outside storage root: ${normalizedKey}`)
+    }
+    return full
+  }
+
+  private async writeFileAt(fullPath: string, body: Buffer): Promise<void> {
+    await mkdir(path.dirname(fullPath), { recursive: true })
+    await writeFile(fullPath, body)
+  }
+
+  private async copyFileAt(source: string, destination: string): Promise<void> {
+    await mkdir(path.dirname(destination), { recursive: true })
+    await copyFile(source, destination)
+  }
+
+  private async collectFiles(): Promise<FileInfo[]> {
+    const objectsRoot = path.resolve(this.config.root, OBJECTS_DIR)
+    let entries: string[]
+    try {
+      entries = await readdir(objectsRoot, { recursive: true })
+    } catch (err) {
+      if (this.isErrno(err, 'ENOENT')) return []
+      throw err
+    }
+    const files: FileInfo[] = []
+    for (const entry of entries) {
+      const stats = await stat(path.join(objectsRoot, entry))
+      if (!stats.isFile()) continue
+      files.push({
+        key: entry.split(path.sep).join('/'),
+        size: stats.size,
+        lastModified: stats.mtime,
+      })
+    }
+    return files
+  }
+
+  private page(all: FileInfo[], input: ListInput): ListResult {
+    const max = input.maxKeys ?? DEFAULT_MAX_KEYS
+    const token = input.continuationToken
+    const matching = all
+      .filter((f) => f.key.startsWith(input.prefix))
+      .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+    const found = token ? matching.findIndex((f) => f.key > token) : 0
+    const from = found === -1 ? matching.length : found
+    const files = matching.slice(from, from + max)
+    const isTruncated = from + max < matching.length
+    return {
+      files,
+      nextToken: isTruncated ? files[files.length - 1]?.key : undefined,
+      isTruncated,
+    }
+  }
+
+  private async statFileOrThrow(fullPath: string, key: string): Promise<Stats> {
+    const root = path.resolve(this.config.root, OBJECTS_DIR) + path.sep
+    const resolved = path.resolve(fullPath)
+    if (!resolved.startsWith(root)) throw new InvalidObjectKeyError('path outside object storage')
+    let stats: Stats
+    try {
+      stats = await stat(resolved)
+    } catch (err) {
+      throw this.toNotFound(err, key)
+    }
+    // A prefix directory (created by nested uploads) is not an object.
+    if (!stats.isFile()) throw new StorageObjectNotFoundError(key)
+    return stats
+  }
+
+  private async readSidecar(key: string): Promise<SidecarMeta | undefined> {
+    const fullPath = this.metaPath(key)
+    const root = path.resolve(this.config.root, META_DIR) + path.sep
+    if (!fullPath.startsWith(root)) throw new InvalidObjectKeyError('path outside metadata storage')
+    try {
+      return JSON.parse(await readFile(fullPath, 'utf8')) as SidecarMeta
+    } catch {
+      return undefined
+    }
+  }
+
+  private toNotFound(err: unknown, key: string): Error {
+    return this.isErrno(err, 'ENOENT') ? new StorageObjectNotFoundError(key) : (err as Error)
+  }
+
+  private isErrno(err: unknown, code: string): boolean {
+    return typeof err === 'object' && err !== null && (err as NodeJS.ErrnoException).code === code
+  }
+}

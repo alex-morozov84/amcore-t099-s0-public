@@ -1,0 +1,1285 @@
+import * as argon2 from 'argon2'
+import type { Request, Response } from 'express'
+import type { PinoLogger } from 'nestjs-pino'
+
+import type { LoginInput, RegisterInput } from '@amcore/shared'
+import {
+  AuthErrorCode,
+  coerceSupportedLocale,
+  DEFAULT_LOCALE,
+  localePathPrefix,
+  parseSupportedLocale,
+  SERVED_LOCALES,
+} from '@amcore/shared'
+
+import { AppException } from '../../common/exceptions'
+import { resolveTrustedWebPeers } from '../../common/utils/trusted-web-peer'
+import type { EnvService } from '../../env/env.service'
+import type { AuditLogService } from '../audit'
+
+import { AuthController } from './auth.controller'
+import { AuthService } from './auth.service'
+import {
+  createMockContext,
+  installOrdinaryPrimaryFixture,
+  type MockContext,
+  mockContextToPrisma,
+} from './auth-context.testkit'
+import { EmailIdentityService } from './email-identity.service'
+import { LoginRateLimiterService } from './login-rate-limiter.service'
+import { MfaPasswordIdentityService } from './mfa/mfa-password-identity.service'
+import { PasswordStepUpService } from './password-step-up.service'
+import { SessionService } from './session.service'
+import { TokenService } from './token.service'
+import { TokenManagerService } from './token-manager.service'
+
+import { SystemRole, type User } from '@/generated/prisma/client'
+
+// Mock email module to prevent TSX/ESM import issues (jest.mock is hoisted automatically)
+jest.mock('../../infrastructure/email', () => ({ EmailService: jest.fn() }))
+jest.mock('argon2')
+
+// The test user prefers `ru`. Links in its emails carry `/ru` only when the build serves several
+// locales; a build that does not serve `ru` falls back to its default, and one locale means no prefix.
+const USER_PREFIX = localePathPrefix(coerceSupportedLocale('ru'))
+
+describe('AuthService', () => {
+  let authService: AuthService
+  let mockCtx: MockContext
+  let mockTokenService: jest.Mocked<TokenService>
+  let mockTokenManager: jest.Mocked<TokenManagerService>
+  let mockSessionService: jest.Mocked<SessionService>
+  let mockEmailService: {
+    sendWelcomeEmail: jest.Mock
+    sendPasswordResetEmail: jest.Mock
+    sendEmailVerificationEmail: jest.Mock
+  }
+  let mockNotifications: { notify: jest.Mock }
+  let mockEnvService: { get: jest.Mock }
+  let mailLimiter: { reserve: jest.Mock }
+  let mockLoginRateLimiter: jest.Mocked<LoginRateLimiterService>
+  let mockAuditLog: jest.Mocked<Pick<AuditLogService, 'record'>>
+  let mockLogger: jest.Mocked<PinoLogger>
+
+  const mockUser: User = {
+    id: 'user-123',
+    email: 'test@example.com',
+    emailCanonical: 'test@example.com',
+    emailVerified: false,
+    passwordHash: 'hashed-password-123',
+    name: 'Test User',
+    avatarKey: null,
+    avatarGeneration: 0,
+    phone: null,
+    locale: 'ru',
+    timezone: 'Europe/Moscow',
+    createdAt: new Date('2024-01-01'),
+    updatedAt: new Date('2024-01-01'),
+    lastLoginAt: new Date('2024-01-01'),
+    systemRole: SystemRole.USER,
+  }
+
+  const mockCreateSessionResult = (refreshToken: string) => ({
+    session: { id: 'session-123' },
+    refreshToken,
+  })
+
+  beforeEach(() => {
+    mockCtx = createMockContext()
+    // Interactive transactions run their callback against the same mock client (the "tx").
+    mockCtx.prisma.$transaction.mockImplementation(((fn: (tx: unknown) => unknown) =>
+      fn(mockCtx.prisma)) as never)
+
+    mockTokenService = {
+      generateAccessToken: jest.fn(),
+      verifyAccessToken: jest.fn(),
+      generateRefreshToken: jest.fn(),
+      hashRefreshToken: jest.fn(),
+      getRefreshTokenExpiration: jest.fn(),
+    } as unknown as jest.Mocked<TokenService>
+
+    mockTokenManager = {
+      generatePasswordResetToken: jest.fn(),
+      verifyPasswordResetToken: jest.fn(),
+      generateEmailVerificationToken: jest.fn().mockResolvedValue({
+        token: 'default-verify-token',
+        expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
+      }),
+      verifyEmailVerificationToken: jest.fn(),
+      consumePasswordResetToken: jest.fn(),
+      consumeEmailVerificationToken: jest.fn(),
+      invalidateUserTokens: jest.fn(),
+      consumeLocked: jest.fn().mockResolvedValue({ id: 'reset-token-1', userId: mockUser.id }),
+    } as unknown as jest.Mocked<TokenManagerService>
+
+    mockSessionService = {
+      createSession: jest.fn(),
+      findByRefreshToken: jest.fn(),
+      rotateRefreshToken: jest.fn(),
+      deleteByRefreshToken: jest.fn(),
+      deleteRevokedByUserId: jest.fn(),
+      getUserSessions: jest.fn(),
+      deleteSession: jest.fn(),
+      deleteOtherSessions: jest.fn(),
+      cleanupExpired: jest.fn(),
+      touchLastAuth: jest.fn(),
+      hasLiveSession: jest.fn(),
+    } as unknown as jest.Mocked<SessionService>
+
+    mockEmailService = {
+      sendWelcomeEmail: jest.fn().mockResolvedValue(undefined),
+      sendPasswordResetEmail: jest.fn().mockResolvedValue(undefined),
+      sendEmailVerificationEmail: jest.fn().mockResolvedValue(undefined),
+    }
+
+    mockNotifications = {
+      notify: jest.fn().mockResolvedValue({ notificationId: 'n-1', created: true, channels: [] }),
+    }
+
+    mockEnvService = {
+      get: jest.fn((key: string) => {
+        const values: Record<string, string | number | boolean> = {
+          STEP_UP_MAX_AGE_SECONDS: 600,
+          AUTH_PUBLIC_SIGNUP_ENABLED: true,
+          FRONTEND_URL: 'https://app.example.com',
+          PASSWORD_RESET_EXPIRY_MINUTES: 15,
+          EMAIL_VERIFICATION_EXPIRY_HOURS: 48,
+          SUPPORT_EMAIL: 'support@example.com',
+        }
+        return values[key]
+      }),
+    }
+
+    mailLimiter = { reserve: jest.fn().mockResolvedValue(undefined) }
+
+    mockLoginRateLimiter = {
+      check: jest.fn().mockResolvedValue(undefined),
+      consume: jest.fn().mockResolvedValue(undefined),
+      reset: jest.fn().mockResolvedValue(undefined),
+    } as unknown as jest.Mocked<LoginRateLimiterService>
+    mockAuditLog = { record: jest.fn().mockResolvedValue(undefined) }
+
+    mockLogger = {
+      setContext: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+      debug: jest.fn(),
+    } as unknown as jest.Mocked<PinoLogger>
+
+    const prisma = mockContextToPrisma(mockCtx)
+    authService = new AuthService(
+      prisma,
+      mockTokenService,
+      mockTokenManager,
+      mailLimiter as never,
+      mockSessionService,
+      mockEmailService as never,
+      mockEnvService as never,
+      new EmailIdentityService(),
+      mockLoginRateLimiter,
+      mockNotifications as never,
+      mockLogger,
+      {} as never,
+      { getPublicUrl: (key: string) => `https://files.test/${key}` } as never,
+      new PasswordStepUpService(
+        prisma,
+        mockLoginRateLimiter,
+        mockTokenService,
+        mockAuditLog as unknown as AuditLogService,
+        mockEnvService as unknown as EnvService
+      )
+    )
+
+    jest.clearAllMocks()
+  })
+
+  describe('register', () => {
+    const registerInput: RegisterInput = {
+      email: 'newuser@example.com',
+      password: 'Password123',
+      name: 'New User',
+    }
+
+    const requestInfo = {
+      userAgent: 'Mozilla/5.0',
+      ipAddress: '192.168.1.1',
+    }
+
+    it('should register new user successfully', async () => {
+      mockCtx.prisma.user.findUnique.mockResolvedValue(null)
+      ;(argon2.hash as jest.Mock).mockResolvedValue('hashed-password')
+      mockCtx.prisma.user.create.mockResolvedValue(mockUser)
+      mockTokenService.generateAccessToken.mockReturnValue('access-token-123')
+      mockSessionService.createSession.mockResolvedValue(
+        mockCreateSessionResult('refresh-token-456') as never
+      )
+
+      const result = await authService.register(registerInput, requestInfo)
+
+      expect(mockCtx.prisma.user.findUnique).toHaveBeenCalledWith({
+        where: { emailCanonical: registerInput.email },
+      })
+      expect(argon2.hash).toHaveBeenCalledWith(registerInput.password)
+      expect(mockCtx.prisma.user.create).toHaveBeenCalledWith({
+        data: {
+          email: registerInput.email,
+          emailCanonical: registerInput.email,
+          passwordHash: 'hashed-password',
+          name: registerInput.name,
+          locale: DEFAULT_LOCALE,
+          lastLoginAt: expect.any(Date),
+        },
+      })
+      expect(result).toEqual({
+        user: expect.objectContaining({ id: mockUser.id, email: mockUser.email }),
+        accessToken: 'access-token-123',
+        refreshToken: 'refresh-token-456',
+      })
+    })
+
+    it('should register user without optional name', async () => {
+      const inputWithoutName = { email: 'test@example.com', password: 'Password123' }
+
+      mockCtx.prisma.user.findUnique.mockResolvedValue(null)
+      ;(argon2.hash as jest.Mock).mockResolvedValue('hashed')
+      mockCtx.prisma.user.create.mockResolvedValue({ ...mockUser, name: null })
+      mockTokenService.generateAccessToken.mockReturnValue('token')
+      mockSessionService.createSession.mockResolvedValue(
+        mockCreateSessionResult('refresh') as never
+      )
+
+      const result = await authService.register(inputWithoutName, requestInfo)
+
+      expect(result.user.name).toBeNull()
+    })
+
+    it('should preserve display email and store canonical email', async () => {
+      const mixedCaseInput = {
+        email: 'User@Example.COM',
+        password: 'Password123',
+      }
+
+      mockCtx.prisma.user.findUnique.mockResolvedValue(null)
+      ;(argon2.hash as jest.Mock).mockResolvedValue('hashed')
+      mockCtx.prisma.user.create.mockResolvedValue({ ...mockUser, email: mixedCaseInput.email })
+      mockTokenService.generateAccessToken.mockReturnValue('token')
+      mockSessionService.createSession.mockResolvedValue(
+        mockCreateSessionResult('refresh') as never
+      )
+
+      await authService.register(mixedCaseInput, requestInfo)
+
+      expect(mockCtx.prisma.user.findUnique).toHaveBeenCalledWith({
+        where: { emailCanonical: 'user@example.com' },
+      })
+      expect(mockCtx.prisma.user.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          email: 'User@Example.COM',
+          emailCanonical: 'user@example.com',
+        }),
+      })
+    })
+
+    it('should throw AppException if user already exists', async () => {
+      mockCtx.prisma.user.findUnique.mockResolvedValue(mockUser)
+
+      await expect(authService.register(registerInput, requestInfo)).rejects.toThrow(AppException)
+      expect(argon2.hash).not.toHaveBeenCalled()
+    })
+
+    it('should set lastLoginAt during registration', async () => {
+      mockCtx.prisma.user.findUnique.mockResolvedValue(null)
+      ;(argon2.hash as jest.Mock).mockResolvedValue('hashed')
+      mockCtx.prisma.user.create.mockResolvedValue(mockUser)
+      mockTokenService.generateAccessToken.mockReturnValue('token')
+      mockSessionService.createSession.mockResolvedValue(
+        mockCreateSessionResult('refresh') as never
+      )
+
+      const beforeRegister = new Date()
+      await authService.register(registerInput, requestInfo)
+      const afterRegister = new Date()
+
+      const createCall = mockCtx.prisma.user.create.mock.calls[0]![0]!
+      const lastLoginAt = createCall.data.lastLoginAt as Date
+
+      expect(lastLoginAt.getTime()).toBeGreaterThanOrEqual(beforeRegister.getTime())
+      expect(lastLoginAt.getTime()).toBeLessThanOrEqual(afterRegister.getTime())
+    })
+
+    describe('locale precedence', () => {
+      const setupRegisterMocks = () => {
+        mockCtx.prisma.user.findUnique.mockResolvedValue(null)
+        ;(argon2.hash as jest.Mock).mockResolvedValue('hashed')
+        mockCtx.prisma.user.create.mockResolvedValue(mockUser)
+        mockTokenService.generateAccessToken.mockReturnValue('token')
+        mockSessionService.createSession.mockResolvedValue(
+          mockCreateSessionResult('refresh') as never
+        )
+      }
+
+      it('uses the explicit body locale over the negotiated header', async () => {
+        setupRegisterMocks()
+
+        await authService.register(
+          { ...registerInput, locale: 'en' },
+          { ...requestInfo, acceptedLocale: 'ru' }
+        )
+
+        expect(mockCtx.prisma.user.create).toHaveBeenCalledWith({
+          data: expect.objectContaining({ locale: 'en' }),
+        })
+      })
+
+      it('falls back to the negotiated Accept-Language locale when the body omits it', async () => {
+        setupRegisterMocks()
+
+        await authService.register(registerInput, { ...requestInfo, acceptedLocale: 'en' })
+
+        expect(mockCtx.prisma.user.create).toHaveBeenCalledWith({
+          data: expect.objectContaining({ locale: 'en' }),
+        })
+      })
+
+      it('writes the build default locale explicitly when neither body nor header supplies one', async () => {
+        setupRegisterMocks()
+
+        await authService.register(registerInput, requestInfo)
+
+        const createArg = mockCtx.prisma.user.create.mock.calls[0]![0]!
+        expect(createArg.data).toHaveProperty('locale', DEFAULT_LOCALE)
+      })
+    })
+
+    /**
+     * Regression: register() must generate the verification token in-band so
+     * the row is committed before HTTP 201 returns. Earlier code did
+     * `void this.resendVerificationEmail(user.email).catch(...)` which is a
+     * race: its first step invalidates existing tokens, so a subsequent
+     * verify-email or resend-verification could be silently poisoned. The
+     * race was env-dependent (macOS won it, WSL2 lost it). Lock the
+     * behavior down.
+     */
+    describe('email verification token race fix', () => {
+      const setupRegisterMocks = () => {
+        mockCtx.prisma.user.findUnique.mockResolvedValue(null)
+        ;(argon2.hash as jest.Mock).mockResolvedValue('hashed')
+        mockCtx.prisma.user.create.mockResolvedValue(mockUser)
+        mockTokenService.generateAccessToken.mockReturnValue('token')
+        mockSessionService.createSession.mockResolvedValue(
+          mockCreateSessionResult('refresh') as never
+        )
+      }
+
+      it('generates verification token via tokenManager inside register()', async () => {
+        setupRegisterMocks()
+        mockTokenManager.generateEmailVerificationToken.mockResolvedValue({
+          id: 'mail-token-row',
+          token: 'verify-token-abc',
+          expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
+        })
+
+        await authService.register(registerInput, requestInfo)
+
+        expect(mockTokenManager.generateEmailVerificationToken).toHaveBeenCalledTimes(1)
+        // Third argument: the registration transaction client, so the token commits with the user.
+        expect(mockTokenManager.generateEmailVerificationToken).toHaveBeenCalledWith(
+          mockUser.id,
+          undefined,
+          mockCtx.prisma
+        )
+        expect(mockSessionService.createSession).toHaveBeenCalledWith(
+          expect.objectContaining({ userId: mockUser.id }),
+          mockCtx.prisma
+        )
+      })
+
+      describe('commit boundary', () => {
+        const prismaConflict = (target: string, index: string) =>
+          Object.assign(new Error('Unique constraint failed'), {
+            code: 'P2002',
+            meta: {
+              modelName: target,
+              driverAdapterError: { cause: { constraint: { index } } },
+            },
+          })
+
+        it('sends no email when session creation fails inside the transaction', async () => {
+          setupRegisterMocks()
+          mockSessionService.createSession.mockRejectedValue(new Error('session write failed'))
+
+          await expect(authService.register(registerInput, requestInfo)).rejects.toThrow(
+            'session write failed'
+          )
+          await new Promise((resolve) => setImmediate(resolve))
+
+          expect(mockEmailService.sendWelcomeEmail).not.toHaveBeenCalled()
+          expect(mockEmailService.sendEmailVerificationEmail).not.toHaveBeenCalled()
+        })
+
+        it('sends no email when token issuance fails inside the transaction', async () => {
+          setupRegisterMocks()
+          mockTokenManager.generateEmailVerificationToken.mockRejectedValue(
+            new Error('token write failed')
+          )
+
+          await expect(authService.register(registerInput, requestInfo)).rejects.toThrow(
+            'token write failed'
+          )
+          await new Promise((resolve) => setImmediate(resolve))
+
+          expect(mockTokenService.generateAccessToken).not.toHaveBeenCalled()
+          expect(mockEmailService.sendWelcomeEmail).not.toHaveBeenCalled()
+          expect(mockEmailService.sendEmailVerificationEmail).not.toHaveBeenCalled()
+        })
+
+        it('fails the transaction when the access token cannot be signed', async () => {
+          setupRegisterMocks()
+          mockTokenService.generateAccessToken.mockImplementation(() => {
+            throw new Error('signing key missing')
+          })
+
+          await expect(authService.register(registerInput, requestInfo)).rejects.toThrow(
+            'signing key missing'
+          )
+          await new Promise((resolve) => setImmediate(resolve))
+
+          expect(mockEmailService.sendEmailVerificationEmail).not.toHaveBeenCalled()
+        })
+
+        it('fails the transaction when the verification link cannot be built', async () => {
+          setupRegisterMocks()
+          mockEnvService.get.mockImplementation((key: string) => {
+            if (key === 'FRONTEND_URL') throw new Error('FRONTEND_URL is not configured')
+            return key === 'AUTH_PUBLIC_SIGNUP_ENABLED' ? true : 48
+          })
+
+          await expect(authService.register(registerInput, requestInfo)).rejects.toThrow(
+            'FRONTEND_URL is not configured'
+          )
+          await new Promise((resolve) => setImmediate(resolve))
+
+          expect(mockEmailService.sendWelcomeEmail).not.toHaveBeenCalled()
+        })
+
+        it('maps only a canonical-email unique violation to 409 EMAIL_ALREADY_EXISTS', async () => {
+          setupRegisterMocks()
+          mockCtx.prisma.user.create.mockRejectedValue(
+            prismaConflict('User', 'users_emailCanonical_key')
+          )
+
+          await expect(authService.register(registerInput, requestInfo)).rejects.toMatchObject({
+            status: 409,
+            errorCode: AuthErrorCode.EMAIL_ALREADY_EXISTS,
+          })
+        })
+
+        it('does not relabel another unique violation as an existing email', async () => {
+          setupRegisterMocks()
+          const other = prismaConflict(
+            'EmailVerificationToken',
+            'email_verification_tokens_hash_key'
+          )
+          mockTokenManager.generateEmailVerificationToken.mockRejectedValue(other)
+
+          await expect(authService.register(registerInput, requestInfo)).rejects.toBe(other)
+        })
+      })
+
+      it('does not call resendVerificationEmail from register()', async () => {
+        setupRegisterMocks()
+        mockTokenManager.generateEmailVerificationToken.mockResolvedValue({
+          id: 'mail-token-row',
+          token: 'verify-token-abc',
+          expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
+        })
+        const resendSpy = jest.spyOn(authService, 'resendVerificationEmail')
+
+        await authService.register(registerInput, requestInfo)
+
+        expect(resendSpy).not.toHaveBeenCalled()
+      })
+
+      it('passes the generated token in the email verification URL', async () => {
+        setupRegisterMocks()
+        mockTokenManager.generateEmailVerificationToken.mockResolvedValue({
+          id: 'mail-token-row',
+          token: 'verify-token-xyz',
+          expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
+        })
+
+        await authService.register(registerInput, requestInfo)
+
+        // Email send is fire-and-forget; let the microtask queue drain.
+        await new Promise((resolve) => setImmediate(resolve))
+
+        expect(mockEmailService.sendEmailVerificationEmail).toHaveBeenCalledTimes(1)
+        const [, payload] = mockEmailService.sendEmailVerificationEmail.mock.calls[0]!
+        expect(payload.verificationUrl).toContain('token=verify-token-xyz')
+        // Locale-prefixed when several locales are served: a bare path would be resolved by
+        // cookie/Accept-Language, which an emailed link cannot rely on. The user's locale is `ru`;
+        // a build that does not serve it uses its default, and one locale means a bare link.
+        expect(payload.verificationUrl).toContain(`${USER_PREFIX}/verify-email`)
+      })
+
+      it('awaits token generation before returning the auth response', async () => {
+        setupRegisterMocks()
+        let resolveToken!: (value: { id: string; token: string; expiresAt: Date }) => void
+        const pending = new Promise<{ id: string; token: string; expiresAt: Date }>((resolve) => {
+          resolveToken = resolve
+        })
+        mockTokenManager.generateEmailVerificationToken.mockReturnValue(pending)
+
+        let resolved = false
+        const registerPromise = authService.register(registerInput, requestInfo).then((res) => {
+          resolved = true
+          return res
+        })
+
+        // Let microtasks settle; register() must still be pending on the
+        // unresolved token generation.
+        await new Promise((resolve) => setImmediate(resolve))
+        expect(resolved).toBe(false)
+
+        resolveToken({
+          id: 'mail-token-row',
+          token: 'late-token',
+          expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
+        })
+        await expect(registerPromise).resolves.toBeDefined()
+        expect(resolved).toBe(true)
+      })
+
+      it('does not fail register() when the verification email send rejects', async () => {
+        setupRegisterMocks()
+        mockTokenManager.generateEmailVerificationToken.mockResolvedValue({
+          id: 'mail-token-row',
+          token: 'verify-token-abc',
+          expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
+        })
+        mockEmailService.sendEmailVerificationEmail.mockRejectedValue(new Error('SMTP unavailable'))
+
+        await expect(authService.register(registerInput, requestInfo)).resolves.toMatchObject({
+          accessToken: 'token',
+          refreshToken: 'refresh',
+        })
+
+        // Let the catch handler run on the rejected fire-and-forget send.
+        await new Promise((resolve) => setImmediate(resolve))
+        expect(mockLogger.warn).toHaveBeenCalledWith(
+          expect.objectContaining({ err: expect.any(Error) }),
+          'Failed to send verification email'
+        )
+      })
+
+      it('does not fail register() when the welcome email send rejects', async () => {
+        setupRegisterMocks()
+        mockTokenManager.generateEmailVerificationToken.mockResolvedValue({
+          id: 'mail-token-row',
+          token: 'verify-token-abc',
+          expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
+        })
+        mockEmailService.sendWelcomeEmail.mockRejectedValue(new Error('SMTP unavailable'))
+
+        await expect(authService.register(registerInput, requestInfo)).resolves.toMatchObject({
+          accessToken: 'token',
+          refreshToken: 'refresh',
+        })
+
+        await new Promise((resolve) => setImmediate(resolve))
+        expect(mockLogger.warn).toHaveBeenCalledWith(
+          expect.objectContaining({ err: expect.any(Error) }),
+          'Failed to send welcome email'
+        )
+      })
+    })
+  })
+
+  describe('password identity used by the real MFA-aware login', () => {
+    const input = { email: 'Test@Example.COM', password: 'Password123' }
+    const source = '192.168.1.1'
+    function identities() {
+      mockCtx.prisma.$queryRaw.mockResolvedValue([{ now: new Date() }])
+      return new MfaPasswordIdentityService(
+        mockContextToPrisma(mockCtx),
+        new EmailIdentityService(),
+        mockLoginRateLimiter
+      )
+    }
+    it('returns verified identity without creating a session or issuing tokens', async () => {
+      mockCtx.prisma.user.findUnique.mockResolvedValue(mockUser)
+      ;(argon2.verify as jest.Mock).mockResolvedValue(true)
+      const result = await identities().verify(input.email, input.password, source)
+      expect(result).toMatchObject({
+        userId: mockUser.id,
+        securityVersion: 0,
+        protectedAccount: false,
+      })
+      expect(mockLoginRateLimiter.check).toHaveBeenCalledWith('test@example.com', source)
+      expect(mockLoginRateLimiter.reset).toHaveBeenCalledWith('test@example.com', source)
+      expect(mockCtx.prisma.user.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { emailCanonical: 'test@example.com' } })
+      )
+      expect(mockSessionService.createSession).not.toHaveBeenCalled()
+      expect(mockTokenService.generateAccessToken).not.toHaveBeenCalled()
+    })
+    it.each(['missing-user', 'missing-hash', 'wrong-password'])(
+      'charges %s once and returns no identity',
+      async (failure) => {
+        mockCtx.prisma.user.findUnique.mockResolvedValue(
+          failure === 'missing-user'
+            ? null
+            : {
+                ...mockUser,
+                passwordHash: failure === 'missing-hash' ? null : mockUser.passwordHash,
+              }
+        )
+        ;(argon2.verify as jest.Mock).mockResolvedValue(false)
+        expect(await identities().verify(input.email, input.password, source)).toBeNull()
+        expect(mockLoginRateLimiter.consume).toHaveBeenCalledWith('test@example.com', source)
+        expect(mockLoginRateLimiter.reset).not.toHaveBeenCalled()
+      }
+    )
+    it('checks the password limiter before identity lookup or Argon2', async () => {
+      mockLoginRateLimiter.check.mockRejectedValue(new AppException('Limited', 429))
+      await expect(identities().verify(input.email, input.password, source)).rejects.toThrow(
+        AppException
+      )
+      expect(mockCtx.prisma.user.findUnique).not.toHaveBeenCalled()
+      expect(argon2.verify).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('logout', () => {
+    it('should logout user by invalidating refresh token', async () => {
+      const refreshTokenHash = 'hashed-refresh-token'
+
+      await authService.logout(refreshTokenHash)
+
+      expect(mockSessionService.deleteByRefreshToken).toHaveBeenCalledWith(refreshTokenHash)
+    })
+  })
+
+  describe('stepUp (OB-06b)', () => {
+    const principal = {
+      type: 'jwt' as const,
+      sub: 'user-123',
+      email: 'test@example.com',
+      systemRole: SystemRole.USER,
+      sid: 'session-123',
+    }
+
+    beforeEach(() => {
+      installOrdinaryPrimaryFixture(mockCtx, mockUser)
+      mockCtx.prisma.session.findUnique.mockResolvedValue({
+        id: 'session-123',
+        userId: principal.sub,
+        revokedAt: null,
+        expiresAt: new Date(Date.now() + 3600_000),
+        familyId: 'legacy-family',
+      } as never)
+      mockCtx.prisma.session.updateMany.mockResolvedValue({ count: 1 })
+    })
+
+    it('rejects a token without sid (STEP_UP_REQUIRED) without touching the session', async () => {
+      await expect(
+        authService.stepUp({ ...principal, sid: undefined }, 'pw', '1.2.3.4')
+      ).rejects.toMatchObject({ errorCode: AuthErrorCode.STEP_UP_REQUIRED })
+      expect(mockSessionService.hasLiveSession).not.toHaveBeenCalled()
+      expect(mockCtx.prisma.user.findUnique).not.toHaveBeenCalled()
+    })
+
+    it('rejects a non-live session BEFORE any password work (no password oracle)', async () => {
+      // Stolen-but-revoked/expired token: must fail closed before loading the
+      // user, hitting the limiter, or verifying the password.
+      mockCtx.prisma.session.findUnique.mockResolvedValue(null)
+
+      await expect(authService.stepUp(principal, 'pw', '1.2.3.4')).rejects.toMatchObject({
+        errorCode: AuthErrorCode.STEP_UP_REQUIRED,
+      })
+      expect(mockCtx.prisma.user.findUnique).not.toHaveBeenCalled()
+      expect(mockLoginRateLimiter.check).not.toHaveBeenCalled()
+      expect(argon2.verify).not.toHaveBeenCalled()
+      expect(mockSessionService.touchLastAuth).not.toHaveBeenCalled()
+    })
+
+    it('rejects a password-less (OAuth-only) account with STEP_UP_METHOD_UNAVAILABLE', async () => {
+      mockSessionService.hasLiveSession.mockResolvedValue(true)
+      mockCtx.prisma.user.findUnique.mockResolvedValue({ ...mockUser, passwordHash: null })
+
+      await expect(authService.stepUp(principal, 'pw', '1.2.3.4')).rejects.toMatchObject({
+        errorCode: AuthErrorCode.STEP_UP_METHOD_UNAVAILABLE,
+      })
+      expect(argon2.verify).not.toHaveBeenCalled()
+      expect(mockSessionService.touchLastAuth).not.toHaveBeenCalled()
+    })
+
+    it('rejects a wrong password with INVALID_CREDENTIALS and consumes the limiter', async () => {
+      mockSessionService.hasLiveSession.mockResolvedValue(true)
+      mockCtx.prisma.user.findUnique.mockResolvedValue(mockUser)
+      ;(argon2.verify as jest.Mock).mockResolvedValue(false)
+
+      await expect(authService.stepUp(principal, 'wrong', '1.2.3.4')).rejects.toMatchObject({
+        errorCode: AuthErrorCode.INVALID_CREDENTIALS,
+      })
+      expect(mockLoginRateLimiter.check).toHaveBeenCalledWith(mockUser.emailCanonical, '1.2.3.4')
+      expect(mockLoginRateLimiter.consume).toHaveBeenCalledWith(mockUser.emailCanonical, '1.2.3.4')
+      expect(mockAuditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'auth.step_up_failed',
+          actorId: mockUser.id,
+        })
+      )
+      expect(mockSessionService.touchLastAuth).not.toHaveBeenCalled()
+    })
+
+    it('fails closed when the session is revoked between precheck and bump (count 0)', async () => {
+      mockSessionService.hasLiveSession.mockResolvedValue(true)
+      mockCtx.prisma.user.findUnique.mockResolvedValue(mockUser)
+      ;(argon2.verify as jest.Mock).mockResolvedValue(true)
+      mockCtx.prisma.session.updateMany.mockResolvedValue({ count: 0 })
+
+      await expect(authService.stepUp(principal, 'right', '1.2.3.4')).rejects.toMatchObject({
+        errorCode: AuthErrorCode.STEP_UP_REQUIRED,
+      })
+    })
+
+    it('succeeds: bumps only the current session, resets limiter, returns a fresh sid token', async () => {
+      mockSessionService.hasLiveSession.mockResolvedValue(true)
+      mockCtx.prisma.user.findUnique.mockResolvedValue(mockUser)
+      ;(argon2.verify as jest.Mock).mockResolvedValue(true)
+      mockSessionService.touchLastAuth.mockResolvedValue(1)
+      mockTokenService.generateAccessToken.mockReturnValue('fresh-access-token')
+
+      const result = await authService.stepUp(principal, 'right', '1.2.3.4')
+
+      expect(result).toEqual({ accessToken: 'fresh-access-token' })
+      expect(mockCtx.prisma.session.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            id: 'session-123',
+            userId: 'user-123',
+            revokedAt: null,
+          }),
+          data: { lastAuthAt: expect.any(Date) },
+        })
+      )
+      expect(mockLoginRateLimiter.reset).toHaveBeenCalledWith(mockUser.emailCanonical, '1.2.3.4')
+      expect(mockTokenService.generateAccessToken).toHaveBeenCalledWith({
+        sub: 'user-123',
+        email: mockUser.email,
+        systemRole: mockUser.systemRole,
+        sid: 'session-123',
+      })
+      expect(mockAuditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'auth.step_up_succeeded',
+          actorId: mockUser.id,
+        }),
+        { tx: mockCtx.prisma }
+      )
+      // No new session, no rotation.
+      expect(mockSessionService.createSession).not.toHaveBeenCalled()
+      expect(mockSessionService.rotateRefreshToken).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('getUserById', () => {
+    it('should return user by id', async () => {
+      mockCtx.prisma.user.findUnique.mockResolvedValue(mockUser)
+
+      const result = await authService.getUserById('user-123')
+
+      expect(result).toEqual({
+        id: mockUser.id,
+        email: mockUser.email,
+        emailVerified: mockUser.emailVerified,
+        name: mockUser.name,
+        avatarUrl: null,
+        phone: mockUser.phone,
+        locale: parseSupportedLocale(mockUser.locale),
+        timezone: mockUser.timezone,
+        createdAt: mockUser.createdAt.toISOString(),
+        lastLoginAt: mockUser.lastLoginAt!.toISOString(),
+      })
+    })
+
+    it('should return null if user not found', async () => {
+      mockCtx.prisma.user.findUnique.mockResolvedValue(null)
+
+      expect(await authService.getUserById('non-existent-id')).toBeNull()
+    })
+
+    it('should not include passwordHash in response', async () => {
+      mockCtx.prisma.user.findUnique.mockResolvedValue(mockUser)
+
+      const result = await authService.getUserById('user-123')
+
+      expect(result).not.toHaveProperty('passwordHash')
+    })
+  })
+
+  describe('updateProfile', () => {
+    beforeEach(() => {
+      // The "previous" read the profile-updated diff compares against — individual
+      // tests override this when they need a specific before/after pair.
+      mockCtx.prisma.user.findUniqueOrThrow.mockResolvedValue(mockUser)
+    })
+
+    it('writes only the supplied fields and invalidates the user cache', async () => {
+      // A new choice must be a served locale, so the test picks one the build serves.
+      const locale = SERVED_LOCALES.at(-1) ?? DEFAULT_LOCALE
+      const updated = { ...mockUser, name: 'Renamed', locale }
+      mockCtx.prisma.user.update.mockResolvedValue(updated)
+
+      const result = await authService.updateProfile('user-123', { name: 'Renamed', locale })
+
+      expect(mockCtx.prisma.user.update).toHaveBeenCalledWith({
+        where: { id: 'user-123' },
+        data: { name: 'Renamed', locale },
+      })
+      expect(result).toMatchObject({ name: 'Renamed', locale })
+    })
+
+    it('does not write fields that were not supplied', async () => {
+      mockCtx.prisma.user.update.mockResolvedValue(mockUser)
+
+      await authService.updateProfile('user-123', { timezone: 'America/New_York' })
+
+      const updateArg = mockCtx.prisma.user.update.mock.calls[0]![0]!
+      expect(updateArg.data).toEqual({ timezone: 'America/New_York' })
+      expect(updateArg.data).not.toHaveProperty('name')
+      expect(updateArg.data).not.toHaveProperty('locale')
+    })
+
+    it('returns the canonical profile shape without passwordHash', async () => {
+      mockCtx.prisma.user.update.mockResolvedValue(mockUser)
+
+      const result = await authService.updateProfile('user-123', { name: 'X' })
+
+      expect(result).not.toHaveProperty('passwordHash')
+    })
+
+    it('emits account.profile_updated when a field actually changes', async () => {
+      mockCtx.prisma.user.update.mockResolvedValue({ ...mockUser, name: 'Renamed' })
+
+      await authService.updateProfile('user-123', { name: 'Renamed' })
+
+      // Idempotency key is a generated occurrence id, not `user.updatedAt` — see the
+      // dedicated collision test below for why.
+      expect(mockNotifications.notify).toHaveBeenCalledWith({
+        recipientUserId: 'user-123',
+        type: 'account.profile_updated',
+        payload: { updatedFields: ['name'] },
+        idempotencyKey: expect.stringMatching(/^account\.profile_updated:[0-9a-f-]{36}$/),
+      })
+    })
+
+    it('gives two real edits landing in the same updatedAt millisecond distinct idempotency keys', async () => {
+      // `user.updatedAt` is TIMESTAMP(3) (millisecond precision) — two genuine edits can
+      // share the same stored timestamp. If that timestamp were the idempotency key,
+      // the second notify() would collide on a *different* payload/fingerprint, which
+      // `NotificationsService.notify()` treats as a real conflict
+      // (`NotificationIdempotencyConflictError`) — and this best-effort `catch` would
+      // swallow it as a warning, silently dropping the second alert.
+      const sameInstant = new Date('2024-06-01T00:00:00.001Z')
+      mockCtx.prisma.user.update
+        .mockResolvedValueOnce({ ...mockUser, name: 'First Edit', updatedAt: sameInstant })
+        .mockResolvedValueOnce({ ...mockUser, name: 'Second Edit', updatedAt: sameInstant })
+
+      await authService.updateProfile('user-123', { name: 'First Edit' })
+      await authService.updateProfile('user-123', { name: 'Second Edit' })
+
+      const keys = mockNotifications.notify.mock.calls.map(
+        (call) => (call[0] as { idempotencyKey: string }).idempotencyKey
+      )
+      expect(keys).toHaveLength(2)
+      expect(keys[0]).not.toBe(keys[1])
+    })
+
+    it('only includes fields whose value actually changed in the payload', async () => {
+      // `locale` is supplied but set to the same value the user already has (`mockUser.locale`
+      // is 'ru') — only `name` genuinely changed.
+      mockCtx.prisma.user.update.mockResolvedValue({ ...mockUser, name: 'Renamed' })
+
+      await authService.updateProfile('user-123', { name: 'Renamed', locale: 'ru' })
+
+      expect(mockNotifications.notify).toHaveBeenCalledWith(
+        expect.objectContaining({ payload: { updatedFields: ['name'] } })
+      )
+    })
+
+    it('does not emit a notification when the PATCH changes nothing', async () => {
+      // Re-submitting the current name: `data` is non-empty, but nothing differs.
+      mockCtx.prisma.user.update.mockResolvedValue(mockUser)
+
+      await authService.updateProfile('user-123', { name: mockUser.name! })
+
+      expect(mockNotifications.notify).not.toHaveBeenCalled()
+    })
+
+    it('still resolves when the profile-updated notification fails (best-effort)', async () => {
+      mockCtx.prisma.user.update.mockResolvedValue({ ...mockUser, name: 'Renamed' })
+      mockNotifications.notify.mockRejectedValue(new Error('db down'))
+
+      await expect(
+        authService.updateProfile('user-123', { name: 'Renamed' })
+      ).resolves.toMatchObject({ name: 'Renamed' })
+
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'user-123' }),
+        expect.stringContaining('Failed to emit profile-updated notification')
+      )
+    })
+  })
+
+  describe('forgotPassword', () => {
+    it('should silently succeed for unknown email', async () => {
+      mockCtx.prisma.user.findUnique.mockResolvedValue(null)
+
+      await expect(authService.forgotPassword('unknown@example.com')).resolves.not.toThrow()
+
+      expect(mockCtx.prisma.user.findUnique).toHaveBeenCalledWith({
+        where: { emailCanonical: 'unknown@example.com' },
+      })
+      expect(mockEmailService.sendPasswordResetEmail).not.toHaveBeenCalled()
+    })
+
+    it('should queue reset email for known user', async () => {
+      mockCtx.prisma.user.findUnique.mockResolvedValue(mockUser)
+      mockTokenManager.generatePasswordResetToken.mockResolvedValue({
+        id: 'mail-token-row',
+        token: 'a'.repeat(64),
+        expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+      })
+
+      await authService.forgotPassword(mockUser.email)
+
+      expect(mockTokenManager.generatePasswordResetToken).toHaveBeenCalledWith(
+        mockUser.id,
+        undefined
+      )
+      expect(mockEmailService.sendPasswordResetEmail).toHaveBeenCalledWith(
+        mockUser.email,
+        expect.objectContaining({
+          // Full prefixed path when several locales are served — asserting only
+          // 'reset-password?token=' would still pass if the locale prefix regressed away.
+          resetUrl: expect.stringContaining(`${USER_PREFIX}/reset-password?token=`),
+          expiresInMinutes: 15,
+        })
+      )
+    })
+
+    it('should lookup password reset by canonical email but send to display email', async () => {
+      mockCtx.prisma.user.findUnique.mockResolvedValue({ ...mockUser, email: 'Test@Example.COM' })
+      mockTokenManager.generatePasswordResetToken.mockResolvedValue({
+        id: 'mail-token-row',
+        token: 'a'.repeat(64),
+        expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+      })
+
+      await authService.forgotPassword(' test@example.com ')
+
+      expect(mockCtx.prisma.user.findUnique).toHaveBeenCalledWith({
+        where: { emailCanonical: 'test@example.com' },
+      })
+      expect(mockEmailService.sendPasswordResetEmail).toHaveBeenCalledWith(
+        'Test@Example.COM',
+        expect.objectContaining({ name: 'Test User' })
+      )
+    })
+
+    it('should throw if rate limit exceeded', async () => {
+      mailLimiter.reserve.mockRejectedValue(
+        new AppException('Limit reached', 429, AuthErrorCode.RATE_LIMIT_EXCEEDED)
+      )
+
+      await expect(authService.forgotPassword(mockUser.email)).rejects.toThrow(AppException)
+    })
+
+    it('does not throw when the direct send fails (no enumeration oracle — EQS-02)', async () => {
+      // sendNow throws on provider failure; for a KNOWN email that must not
+      // become a 500 while unknown emails return 200.
+      mockCtx.prisma.user.findUnique.mockResolvedValue(mockUser)
+      mockTokenManager.generatePasswordResetToken.mockResolvedValue({
+        id: 'mail-token-row',
+        token: 'a'.repeat(64),
+        expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+      })
+      mockEmailService.sendPasswordResetEmail.mockRejectedValue(new Error('provider down'))
+
+      await expect(authService.forgotPassword(mockUser.email)).resolves.not.toThrow()
+    })
+  })
+
+  describe('resetPassword', () => {
+    // `consumeCount` is the atomic CAS result: 1 = this call won the single-use token,
+    // 0 = a racing reset already consumed it.
+    const arrangeResetMocks = (consumeCount = 1): void => {
+      mockTokenManager.verifyPasswordResetToken.mockResolvedValue({
+        id: 'reset-token-1',
+        userId: mockUser.id,
+        tokenHash: 'a'.repeat(64),
+      })
+      ;(argon2.hash as jest.Mock).mockResolvedValue('new-hashed-password')
+      ;(mockCtx.prisma.$transaction as jest.Mock).mockImplementation(
+        (fn: (tx: typeof mockCtx.prisma) => Promise<unknown>) => fn(mockCtx.prisma)
+      )
+      if (consumeCount === 0)
+        mockTokenManager.consumeLocked.mockRejectedValue(
+          new AppException('Invalid token', 401, AuthErrorCode.TOKEN_INVALID)
+        )
+      mockCtx.prisma.user.update.mockResolvedValue(mockUser)
+      mockCtx.prisma.$queryRaw.mockResolvedValue([{ now: new Date() }])
+      mockCtx.prisma.mfaAccount.upsert.mockResolvedValue({
+        userId: mockUser.id,
+        securityVersion: 1,
+        required: false,
+        setupComplete: false,
+        emergencyRequired: false,
+        codeGeneration: 0,
+      })
+      mockSessionService.deleteRevokedByUserId.mockResolvedValue(undefined)
+    }
+
+    it('should reset password, promote emailVerified, and emit the security notification', async () => {
+      arrangeResetMocks()
+
+      await authService.resetPassword('a'.repeat(64), 'NewPassword123')
+
+      expect(mockTokenManager.verifyPasswordResetToken).toHaveBeenCalled()
+      expect(mockTokenManager.consumeLocked).toHaveBeenCalledWith(
+        mockCtx.prisma,
+        'a'.repeat(64),
+        'password-reset',
+        undefined
+      )
+      expect(mockSessionService.deleteRevokedByUserId).toHaveBeenCalledWith(mockUser.id)
+      // The reset transaction promotes emailVerified (proves mailbox control).
+      expect(mockCtx.prisma.user.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: mockUser.id },
+          data: expect.objectContaining({ emailVerified: true }),
+        })
+      )
+      // The password-changed alert is produced via the durable subsystem, keyed by the
+      // consumed reset-token id (retry-safe, not the secret token hash).
+      expect(mockNotifications.notify).toHaveBeenCalledWith(
+        expect.objectContaining({
+          recipientUserId: mockUser.id,
+          type: 'account.password_changed',
+          idempotencyKey: 'account.password_changed:reset-token-1',
+        })
+      )
+    })
+
+    it('still resolves when the password-changed notification fails (best-effort)', async () => {
+      arrangeResetMocks()
+      // Simulate a notifications-subsystem hiccup after the reset has committed.
+      mockNotifications.notify.mockRejectedValue(new Error('db down'))
+
+      // Best-effort: the already-committed reset must NOT reject.
+      await expect(
+        authService.resetPassword('a'.repeat(64), 'NewPassword123')
+      ).resolves.toBeUndefined()
+
+      expect(mockCtx.prisma.user.update).toHaveBeenCalled()
+      expect(mockSessionService.deleteRevokedByUserId).toHaveBeenCalledWith(mockUser.id)
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: mockUser.id }),
+        expect.stringContaining('Failed to emit password-changed notification')
+      )
+    })
+
+    it('preserves the committed password when the sessions follow-up fails', async () => {
+      arrangeResetMocks()
+      const error = new Error('follow-up unavailable')
+      mockSessionService.deleteRevokedByUserId.mockRejectedValue(error)
+
+      await expect(authService.resetPassword('a'.repeat(64), 'NewPassword123')).rejects.toBe(error)
+
+      expect(mockTokenManager.consumeLocked).toHaveBeenCalledTimes(1)
+      expect(mockCtx.prisma.user.update).toHaveBeenCalledWith({
+        where: { id: mockUser.id },
+        data: { passwordHash: 'new-hashed-password', emailVerified: true },
+      })
+      expect(mockCtx.prisma.$transaction).toHaveBeenCalledTimes(1)
+      expect(mockCtx.prisma.authSessionFamily.updateMany).toHaveBeenCalledWith({
+        where: { userId: mockUser.id, revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      })
+      expect(mockCtx.prisma.mfaAccount.upsert).toHaveBeenCalledTimes(1)
+      expect(mockNotifications.notify).not.toHaveBeenCalled()
+    })
+
+    it('rejects a token already consumed by a racing reset (CAS matched 0 rows)', async () => {
+      arrangeResetMocks(0)
+
+      await expect(authService.resetPassword('a'.repeat(64), 'NewPassword123')).rejects.toThrow(
+        AppException
+      )
+
+      // The losing reset must not change the password, drop sessions, or emit the alert.
+      expect(mockCtx.prisma.user.update).not.toHaveBeenCalled()
+      expect(mockSessionService.deleteRevokedByUserId).not.toHaveBeenCalled()
+      expect(mockNotifications.notify).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('verifyEmail', () => {
+    it('should verify email', async () => {
+      const tokenHash = 'a'.repeat(64)
+      mockTokenManager.verifyEmailVerificationToken.mockResolvedValue({
+        userId: mockUser.id,
+        tokenHash,
+      })
+      ;(mockCtx.prisma.$transaction as jest.Mock).mockImplementation(
+        (fn: (tx: typeof mockCtx.prisma) => Promise<unknown>) => fn(mockCtx.prisma)
+      )
+      mockCtx.prisma.emailVerificationToken.update.mockResolvedValue({} as never)
+      mockCtx.prisma.user.update.mockResolvedValue({ ...mockUser, emailVerified: true })
+
+      await authService.verifyEmail('a'.repeat(64))
+
+      expect(mockTokenManager.verifyEmailVerificationToken).toHaveBeenCalled()
+      expect(mockCtx.prisma.user.update).toHaveBeenCalledWith({
+        where: { id: mockUser.id },
+        data: { emailVerified: true },
+      })
+    })
+  })
+
+  describe('resendVerificationEmail', () => {
+    it('should silently succeed for already-verified user', async () => {
+      mockCtx.prisma.user.findUnique.mockResolvedValue({ ...mockUser, emailVerified: true })
+
+      await expect(authService.resendVerificationEmail(mockUser.email)).resolves.not.toThrow()
+
+      expect(mockCtx.prisma.user.findUnique).toHaveBeenCalledWith({
+        where: { emailCanonical: mockUser.emailCanonical },
+      })
+      expect(mockEmailService.sendEmailVerificationEmail).not.toHaveBeenCalled()
+    })
+
+    it('should queue verification email for unverified user', async () => {
+      mockCtx.prisma.user.findUnique.mockResolvedValue(mockUser)
+      mockTokenManager.generateEmailVerificationToken.mockResolvedValue({
+        id: 'mail-token-row',
+        token: 'b'.repeat(64),
+        expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
+      })
+
+      await authService.resendVerificationEmail(mockUser.email)
+
+      expect(mockEmailService.sendEmailVerificationEmail).toHaveBeenCalledWith(
+        mockUser.email,
+        expect.objectContaining({
+          verificationUrl: expect.stringContaining(`${USER_PREFIX}/verify-email?token=`),
+          expiresInHours: 48,
+        })
+      )
+    })
+
+    it('does not throw when the direct send fails (no enumeration oracle — EQS-02)', async () => {
+      mockCtx.prisma.user.findUnique.mockResolvedValue(mockUser)
+      mockTokenManager.generateEmailVerificationToken.mockResolvedValue({
+        id: 'mail-token-row',
+        token: 'b'.repeat(64),
+        expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
+      })
+      mockEmailService.sendEmailVerificationEmail.mockRejectedValue(new Error('provider down'))
+
+      await expect(authService.resendVerificationEmail(mockUser.email)).resolves.not.toThrow()
+    })
+  })
+  describe('login controller/service metadata boundary', () => {
+    it.each([
+      ['trusted', 'success'],
+      ['trusted', 'wrong-password'],
+      ['trusted', 'missing-user'],
+      ['trusted', 'missing-hash'],
+      ['disabled', 'success'],
+      ['disabled', 'wrong-password'],
+      ['untrusted', 'success'],
+      ['untrusted', 'wrong-password'],
+      ['trusted', 'limited'],
+      ['no-req-ip', 'success'],
+    ])('%s / %s preserves password limiter identity', async (trust, outcome) => {
+      mockEnvService.get.mockImplementation((key: string) =>
+        key === 'TRUSTED_WEB_PEERS' && trust !== 'disabled'
+          ? resolveTrustedWebPeers('172.20.0.5')
+          : undefined
+      )
+      const req = {
+        ip: trust === 'no-req-ip' ? undefined : '172.20.0.5',
+        socket: { remoteAddress: trust === 'untrusted' ? '172.20.0.6' : '172.20.0.5' },
+        headers: { 'user-agent': 'Visitor browser', 'x-amcore-client-ip': '8.8.8.8' },
+      } as unknown as Request
+      const identities = new MfaPasswordIdentityService(
+        mockContextToPrisma(mockCtx),
+        new EmailIdentityService(),
+        mockLoginRateLimiter
+      )
+      mockCtx.prisma.$queryRaw.mockResolvedValue([{ now: new Date() }])
+      const controller = new AuthController(
+        authService,
+        {} as never,
+        mockSessionService,
+        mockTokenService,
+        mockEnvService as unknown as EnvService,
+        {
+          begin: async (
+            input: LoginInput,
+            metadata: { source: string; ipAddress: string; userAgent: string }
+          ) => {
+            const identity = await identities.verify(input.email, input.password, metadata.source)
+            if (!identity) throw new AppException('Invalid password', 401)
+            // This test isolates identity/metadata; actual durable issuance is covered through HTTP.
+            return {
+              kind: 'complete',
+              body: { user: {}, accessToken: 'test-access' },
+              refreshToken: 'test-refresh',
+            }
+          },
+        } as never
+      )
+      mockCtx.prisma.user.findUnique.mockResolvedValue(
+        outcome === 'missing-user'
+          ? null
+          : { ...mockUser, passwordHash: outcome === 'missing-hash' ? null : mockUser.passwordHash }
+      )
+      ;(argon2.verify as jest.Mock).mockResolvedValue(outcome !== 'wrong-password')
+      mockSessionService.createSession.mockResolvedValue(
+        mockCreateSessionResult('refresh') as never
+      )
+      if (outcome === 'limited') mockLoginRateLimiter.check.mockRejectedValue(new Error('limited'))
+      const result = await controller
+        .login({ email: 'Test@Example.COM', password: 'Password123' }, req, {
+          cookie: jest.fn(),
+        } as unknown as Response)
+        .then(
+          () => 'success',
+          () => 'failure'
+        )
+      const success = outcome === 'success',
+        limited = outcome === 'limited'
+      const limiterIp = ['disabled', 'untrusted'].includes(trust)
+        ? (req.ip ?? req.socket?.remoteAddress ?? '')
+        : '8.8.8.8'
+      expect(result).toBe(success ? 'success' : 'failure')
+      expect(mockLoginRateLimiter.check.mock.calls).toEqual([['test@example.com', limiterIp]])
+      expect(mockLoginRateLimiter.reset.mock.calls).toEqual(
+        success ? [['test@example.com', limiterIp]] : []
+      )
+      expect(mockLoginRateLimiter.consume.mock.calls).toEqual(
+        !success && !limited ? [['test@example.com', limiterIp]] : []
+      )
+      expect(mockSessionService.createSession).not.toHaveBeenCalled()
+      expect(mockCtx.prisma.user.findUnique).toHaveBeenCalledTimes(limited ? 0 : 1)
+      expect(argon2.verify).toHaveBeenCalledTimes(
+        ['limited', 'missing-user', 'missing-hash'].includes(outcome) ? 0 : 1
+      )
+    })
+  })
+})

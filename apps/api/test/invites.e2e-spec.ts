@@ -1,0 +1,924 @@
+import { createHash, randomBytes } from 'node:crypto'
+
+import { jest } from '@jest/globals'
+import type { INestApplication } from '@nestjs/common'
+import request from 'supertest'
+
+import { createInvitationOperationId } from '@amcore/shared'
+
+import { InviteService } from '../src/core/organizations/invite.service'
+import { InviteAcceptLimiterService } from '../src/core/organizations/invite-accept-limiter.service'
+import { EmailService } from '../src/infrastructure/email'
+import {
+  AbuseCounterError,
+  AbuseCounterStore,
+  AuthRedis,
+  BOUNDED_REDIS_CAPACITY,
+} from '../src/infrastructure/redis'
+import type { PrismaService } from '../src/prisma'
+
+import {
+  cleanDatabase,
+  cleanOrgData,
+  type E2ETestContext,
+  seedOrgMember,
+  seedSystemRoles,
+  setupE2ETest,
+  teardownE2ETest,
+} from './helpers'
+import { invitationAcceptBody, invitationSeedRole } from './helpers/invitation-contract'
+
+/** Invitation HTTP contracts: personal manager authority, stable recipient consent,
+ * versioned commands and non-enumerating fresh issuance. */
+
+const INVITE_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000
+
+function hashToken(raw: string): string {
+  return createHash('sha256').update(raw).digest('hex')
+}
+
+interface SeedInviteOptions {
+  orgId: string
+  email: string
+  emailCanonical?: string
+  roleId: string | null
+  invitedById: string
+  expiresAt?: Date
+  acceptedAt?: Date | null
+  acceptedByUserId?: string | null
+  revokedAt?: Date | null
+  revokedById?: string | null
+}
+
+async function seedInvite(
+  prisma: PrismaService,
+  opts: SeedInviteOptions
+): Promise<{ inviteId: string; rawToken: string }> {
+  const rawToken = randomBytes(32).toString('base64url')
+  const tokenHash = hashToken(rawToken)
+  const created = await prisma.orgInvite.create({
+    data: {
+      organizationId: opts.orgId,
+      email: opts.email,
+      emailCanonical: opts.emailCanonical ?? opts.email.toLowerCase().trim(),
+      ...(await invitationSeedRole(prisma, opts.roleId)),
+      invitedById: opts.invitedById,
+      tokenHash,
+      expiresAt: opts.expiresAt ?? new Date(Date.now() + INVITE_EXPIRY_MS),
+      acceptedAt: opts.acceptedAt ?? null,
+      acceptedByUserId: opts.acceptedByUserId ?? null,
+      revokedAt: opts.revokedAt ?? null,
+      revokedById: opts.revokedById ?? null,
+    },
+    select: { id: true },
+  })
+  return { inviteId: created.id, rawToken }
+}
+
+describe('Invites (e2e — OB-02 Stage C)', () => {
+  let app: INestApplication
+  let prisma: PrismaService
+  let context: E2ETestContext
+
+  beforeAll(async () => {
+    context = await setupE2ETest()
+    app = context.app
+    prisma = context.prisma
+    await seedSystemRoles(prisma)
+  }, 120000)
+
+  afterAll(async () => {
+    await teardownE2ETest(context)
+  }, 120000)
+
+  beforeEach(async () => {
+    await cleanOrgData(prisma)
+    await cleanDatabase(prisma, context.cache, context.throttlerStorage)
+  })
+
+  async function registerAndLogin(email: string, password = 'StrongP@ss123'): Promise<string> {
+    const res = await request(app.getHttpServer())
+      .post('/auth/register')
+      .send({ email, password })
+      .expect(201)
+    return res.body.accessToken as string
+  }
+
+  async function setupAdminOrg(email = 'admin@example.com'): Promise<{
+    adminToken: string
+    adminOrgToken: string
+    orgId: string
+    adminUserId: string
+  }> {
+    const adminToken = await registerAndLogin(email)
+    const orgRes = await request(app.getHttpServer())
+      .post('/organizations')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ name: 'Acme Corp' })
+      .expect(201)
+    const orgId = orgRes.body.id as string
+
+    const switchRes = await request(app.getHttpServer())
+      .post(`/organizations/${orgId}/switch`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .expect(200)
+    const adminOrgToken = switchRes.body.accessToken as string
+
+    const me = await request(app.getHttpServer())
+      .get('/auth/me')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .expect(200)
+
+    return { adminToken, adminOrgToken, orgId, adminUserId: me.body.user.id as string }
+  }
+
+  async function verifyEmail(emailCanonical: string): Promise<void> {
+    await prisma.user.update({ where: { emailCanonical }, data: { emailVerified: true } })
+  }
+
+  /**
+   * Uniform 202 across the create-invite branches that the recipient
+   * could otherwise infer from response shape or status code:
+   *
+   *   - Branch A: target is already a member → silent no-op
+   *   - Branch B: target is a registered user, not yet a member → pending
+   *   - Branch C: target email has no account → pending
+   *
+   * All three must return the same `{ status: 'invited' }` body.
+   */
+  describe('POST /organizations/:orgId/invites — uniform 202 (non-enumeration)', () => {
+    it('returns 202 {status:invited} when the email has no account', async () => {
+      const { adminOrgToken, orgId } = await setupAdminOrg()
+      const res = await request(app.getHttpServer())
+        .post(`/organizations/${orgId}/invites`)
+        .set('X-Invitation-Operation-Id', createInvitationOperationId())
+        .set('Authorization', `Bearer ${adminOrgToken}`)
+        .send({ email: 'unknown@example.com' })
+        .expect(202)
+      expect(res.body).toEqual({ status: 'invited' })
+    })
+
+    it('returns 202 {status:invited} when the email belongs to a registered non-member', async () => {
+      const { adminOrgToken, orgId } = await setupAdminOrg()
+      await registerAndLogin('member@example.com')
+
+      const res = await request(app.getHttpServer())
+        .post(`/organizations/${orgId}/invites`)
+        .set('X-Invitation-Operation-Id', createInvitationOperationId())
+        .set('Authorization', `Bearer ${adminOrgToken}`)
+        .send({ email: 'member@example.com' })
+        .expect(202)
+      expect(res.body).toEqual({ status: 'invited' })
+
+      const invite = await prisma.orgInvite.findFirst({
+        where: { organizationId: orgId, emailCanonical: 'member@example.com' },
+      })
+      expect(invite).not.toBeNull()
+    })
+
+    it('returns 202 {status:invited} when the email is already a member (silent no-op)', async () => {
+      const { adminOrgToken, orgId, adminUserId } = await setupAdminOrg('owner@example.com')
+
+      const res = await request(app.getHttpServer())
+        .post(`/organizations/${orgId}/invites`)
+        .set('X-Invitation-Operation-Id', createInvitationOperationId())
+        .set('Authorization', `Bearer ${adminOrgToken}`)
+        .send({ email: 'owner@example.com' })
+        .expect(202)
+      expect(res.body).toEqual({ status: 'invited' })
+
+      // No invite row materialized for the existing member — silent no-op.
+      const invites = await prisma.orgInvite.findMany({ where: { organizationId: orgId } })
+      expect(invites).toHaveLength(0)
+
+      // And membership topology is unchanged.
+      const members = await prisma.orgMember.findMany({ where: { organizationId: orgId } })
+      expect(members).toHaveLength(1)
+      expect(members[0]?.userId).toBe(adminUserId)
+    })
+
+    it('rejects duplicate issuance; explicit reissue rotates the token', async () => {
+      const { adminOrgToken, orgId } = await setupAdminOrg()
+
+      await request(app.getHttpServer())
+        .post(`/organizations/${orgId}/invites`)
+        .set('X-Invitation-Operation-Id', createInvitationOperationId())
+        .set('Authorization', `Bearer ${adminOrgToken}`)
+        .send({ email: 'target@example.com' })
+        .expect(202)
+
+      const firstRow = await prisma.orgInvite.findFirstOrThrow({
+        where: { organizationId: orgId, emailCanonical: 'target@example.com' },
+        select: { id: true, tokenHash: true },
+      })
+
+      await request(app.getHttpServer())
+        .post(`/organizations/${orgId}/invites/${firstRow.id}/reissue`)
+        .set('X-Invitation-Operation-Id', createInvitationOperationId())
+        .set('Authorization', `Bearer ${adminOrgToken}`)
+        .send({ mode: 'repeat', expectedGeneration: 1 })
+        .expect(202)
+
+      const rows = await prisma.orgInvite.findMany({
+        where: { organizationId: orgId, emailCanonical: 'target@example.com' },
+        select: { id: true, tokenHash: true },
+      })
+      expect(rows).toHaveLength(1) // same row, rotated in place
+      expect(rows[0]?.id).toBe(firstRow.id)
+      expect(rows[0]?.tokenHash).not.toBe(firstRow.tokenHash)
+    })
+
+    it('accepts invite with a personal JWT and an API-verified path organization without switch', async () => {
+      const { adminToken, orgId } = await setupAdminOrg()
+      await request(app.getHttpServer())
+        .post(`/organizations/${orgId}/invites`)
+        .set('X-Invitation-Operation-Id', createInvitationOperationId())
+        .set('Authorization', `Bearer ${adminToken}`) // no /switch
+        .send({ email: 'target@example.com' })
+        .expect(202)
+    })
+  })
+
+  describe('POST /auth/invites/accept', () => {
+    async function inviteFor(
+      orgId: string,
+      adminUserId: string,
+      roleId: string | null,
+      email: string,
+      overrides: Partial<Omit<SeedInviteOptions, 'orgId' | 'email' | 'invitedById' | 'roleId'>> = {}
+    ): Promise<{ inviteId: string; rawToken: string }> {
+      return seedInvite(prisma, {
+        orgId,
+        email,
+        invitedById: adminUserId,
+        roleId,
+        ...overrides,
+      })
+    }
+
+    it('attaches complete membership and returns its settlement identity', async () => {
+      const { orgId, adminUserId } = await setupAdminOrg()
+      const memberRoleRow = await prisma.role.findFirstOrThrow({
+        where: { name: 'MEMBER', isSystem: true, organizationId: null },
+      })
+
+      const inviteeToken = await registerAndLogin('invitee@example.com')
+      await verifyEmail('invitee@example.com')
+
+      const { rawToken } = await inviteFor(
+        orgId,
+        adminUserId,
+        memberRoleRow.id,
+        'invitee@example.com'
+      )
+
+      const res = await request(app.getHttpServer())
+        .post('/auth/invites/accept')
+        .set('X-Invitation-Operation-Id', createInvitationOperationId())
+        .set('Authorization', `Bearer ${inviteeToken}`)
+        .send(await invitationAcceptBody(prisma, rawToken))
+        .expect(200)
+
+      expect(res.body).toEqual({
+        status: 'accepted',
+        organizationId: orgId,
+        memberId: expect.any(String),
+      })
+
+      const inviteeUser = await prisma.user.findUniqueOrThrow({
+        where: { emailCanonical: 'invitee@example.com' },
+      })
+      const member = await prisma.orgMember.findUnique({
+        where: {
+          userId_organizationId: { userId: inviteeUser.id, organizationId: orgId },
+        },
+      })
+      expect(member).not.toBeNull()
+    })
+
+    type NegativeScenario = 'missing' | 'expired' | 'accepted' | 'revoked' | 'mismatch'
+    it.each<[string, NegativeScenario]>([
+      ['token does not exist', 'missing'],
+      ['token expired', 'expired'],
+      ['token already accepted', 'accepted'],
+      ['token revoked', 'revoked'],
+      ['email mismatch with current principal', 'mismatch'],
+    ])('returns 400 INVITE_INVALID_OR_EXPIRED when %s', async (_label, scenario) => {
+      const { orgId, adminUserId } = await setupAdminOrg()
+      const memberRoleRow = await prisma.role.findFirstOrThrow({
+        where: { name: 'MEMBER', isSystem: true, organizationId: null },
+      })
+
+      const inviteeToken = await registerAndLogin('invitee@example.com')
+      await verifyEmail('invitee@example.com')
+
+      let tokenToSend: string
+
+      if (scenario === 'missing') {
+        tokenToSend = randomBytes(32).toString('base64url')
+      } else if (scenario === 'mismatch') {
+        const { rawToken } = await inviteFor(
+          orgId,
+          adminUserId,
+          memberRoleRow.id,
+          'someone-else@example.com'
+        )
+        tokenToSend = rawToken
+      } else {
+        const overrides: Partial<SeedInviteOptions> = {}
+        if (scenario === 'expired') {
+          overrides.expiresAt = new Date(Date.now() - 1000)
+        } else if (scenario === 'accepted') {
+          overrides.acceptedAt = new Date()
+          overrides.acceptedByUserId = adminUserId
+        } else if (scenario === 'revoked') {
+          overrides.revokedAt = new Date()
+          overrides.revokedById = adminUserId
+        }
+        const { rawToken } = await inviteFor(
+          orgId,
+          adminUserId,
+          memberRoleRow.id,
+          'invitee@example.com',
+          overrides
+        )
+        tokenToSend = rawToken
+      }
+
+      const res = await request(app.getHttpServer())
+        .post('/auth/invites/accept')
+        .set('X-Invitation-Operation-Id', createInvitationOperationId())
+        .set('Authorization', `Bearer ${inviteeToken}`)
+        .send(await invitationAcceptBody(prisma, tokenToSend))
+        .expect(400)
+      expect(res.body.errorCode).toBe('INVITE_INVALID_OR_EXPIRED')
+    })
+
+    it('returns 403 INVITE_EMAIL_NOT_VERIFIED when the accepting user has an unverified email', async () => {
+      const { orgId, adminUserId } = await setupAdminOrg()
+      const memberRoleRow = await prisma.role.findFirstOrThrow({
+        where: { name: 'MEMBER', isSystem: true, organizationId: null },
+      })
+
+      const inviteeToken = await registerAndLogin('invitee@example.com')
+      // Intentionally do NOT verify email.
+      const { rawToken } = await inviteFor(
+        orgId,
+        adminUserId,
+        memberRoleRow.id,
+        'invitee@example.com'
+      )
+
+      const res = await request(app.getHttpServer())
+        .post('/auth/invites/accept')
+        .set('X-Invitation-Operation-Id', createInvitationOperationId())
+        .set('Authorization', `Bearer ${inviteeToken}`)
+        .send(await invitationAcceptBody(prisma, rawToken))
+        .expect(403)
+      expect(res.body.errorCode).toBe('INVITE_EMAIL_NOT_VERIFIED')
+    })
+
+    it('rejects accept without bearer token (401)', async () => {
+      await request(app.getHttpServer())
+        .post('/auth/invites/accept')
+        .set('X-Invitation-Operation-Id', createInvitationOperationId())
+        .send({ token: randomBytes(32).toString('base64url') })
+        .expect(401)
+    })
+
+    describe('failure counters (OB-02)', () => {
+      afterEach(() => {
+        jest.restoreAllMocks()
+      })
+
+      async function inviteeWithInvite(): Promise<{ inviteeToken: string; rawToken: string }> {
+        const { orgId, adminUserId } = await setupAdminOrg()
+        const memberRoleRow = await prisma.role.findFirstOrThrow({
+          where: { name: 'MEMBER', isSystem: true, organizationId: null },
+        })
+        const inviteeToken = await registerAndLogin('invitee@example.com')
+        await verifyEmail('invitee@example.com')
+        const { rawToken } = await inviteFor(
+          orgId,
+          adminUserId,
+          memberRoleRow.id,
+          'invitee@example.com'
+        )
+        return { inviteeToken, rawToken }
+      }
+
+      const accept = async (inviteeToken: string, token: string): Promise<request.Response> =>
+        request(app.getHttpServer())
+          .post('/auth/invites/accept')
+          .set('X-Invitation-Operation-Id', createInvitationOperationId())
+          .set('Authorization', `Bearer ${inviteeToken}`)
+          .send(await invitationAcceptBody(prisma, token))
+
+      it('answers 503 SERVICE_UNAVAILABLE before any invitation work when the counters cannot be read', async () => {
+        const { inviteeToken, rawToken } = await inviteeWithInvite()
+        jest
+          .spyOn(app.get(AbuseCounterStore), 'read')
+          .mockRejectedValueOnce(new AbuseCounterError('unavailable', 'not_sent'))
+
+        const res = await accept(inviteeToken, rawToken)
+
+        expect(res.status).toBe(503)
+        expect(res.body.errorCode).toBe('SERVICE_UNAVAILABLE')
+        const invite = await prisma.orgInvite.findFirstOrThrow({
+          where: { tokenHash: hashToken(rawToken) },
+        })
+        expect(invite.acceptedAt).toBeNull()
+        expect(
+          await prisma.orgMember.count({
+            where: { user: { emailCanonical: 'invitee@example.com' } },
+          })
+        ).toBe(0)
+      })
+
+      it.each(['not_sent', 'unknown'] as const)(
+        'keeps the original 400 INVITE_INVALID_OR_EXPIRED when recording the failure is %s',
+        async (outcome) => {
+          const { inviteeToken } = await inviteeWithInvite()
+          jest
+            .spyOn(app.get(AbuseCounterStore), 'increment')
+            .mockRejectedValueOnce(new AbuseCounterError('unavailable', outcome))
+
+          const res = await accept(inviteeToken, randomBytes(32).toString('base64url'))
+
+          expect(res.status).toBe(400)
+          expect(res.body.errorCode).toBe('INVITE_INVALID_OR_EXPIRED')
+        }
+      )
+
+      // Whatever an accepted attempt would change: the invitation, memberships, sessions.
+      const effects = async (rawToken: string): Promise<unknown> => ({
+        invite: (
+          await prisma.orgInvite.findFirstOrThrow({ where: { tokenHash: hashToken(rawToken) } })
+        ).acceptedAt,
+        invites: await prisma.orgInvite.count(),
+        members: await prisma.orgMember.count({
+          where: { user: { emailCanonical: 'invitee@example.com' } },
+        }),
+        sessions: await prisma.session.count(),
+      })
+      const limiterLogger = (): { warn: (...args: unknown[]) => void } =>
+        (app.get(InviteAcceptLimiterService) as unknown as { logger: { warn: () => void } }).logger
+      const recordFailures = (warn: { mock: { calls: unknown[][] } }): unknown[] =>
+        warn.mock.calls
+          .map(([payload]) => payload as { event?: string })
+          .filter((payload) => payload.event === 'abuse_counter.record_failed')
+
+      it('refuses the record at capacity after a successful check: original 400, not_sent, no effects', async () => {
+        const { inviteeToken, rawToken } = await inviteeWithInvite()
+        const store = app.get(AbuseCounterStore)
+        const bounded = app.get(AuthRedis)
+        const warn = jest.spyOn(limiterLogger(), 'warn')
+        const held: Array<() => void> = []
+        const read = store.read.bind(store)
+        // The check really succeeds; only then is every helper slot taken, so the record
+        // that follows is refused by the real helper. No timing between requests is used.
+        jest.spyOn(store, 'read').mockImplementationOnce(async (ipKey, subjectKey) => {
+          const counts = await read(ipKey, subjectKey)
+          for (let i = 0; i < BOUNDED_REDIS_CAPACITY; i++)
+            void bounded
+              .run(() => new Promise<void>((resolve) => held.push(resolve)), 60_000)
+              .catch(() => undefined)
+          return counts
+        })
+        const before = await effects(rawToken)
+
+        try {
+          const res = await accept(inviteeToken, randomBytes(32).toString('base64url'))
+
+          expect(res.status).toBe(400)
+          expect(res.body.errorCode).toBe('INVITE_INVALID_OR_EXPIRED')
+          expect(recordFailures(warn)).toEqual([
+            expect.objectContaining({ case: 'not_sent', keyClass: 'invite_accept' }),
+          ])
+          expect(await effects(rawToken)).toEqual(before)
+        } finally {
+          for (const release of held) release()
+          await new Promise((resolve) => setImmediate(resolve))
+        }
+      })
+
+      it('keeps the original 400 for several already-admitted failures; each record is unknown; no effects', async () => {
+        const { inviteeToken, rawToken } = await inviteeWithInvite()
+        const store = app.get(AbuseCounterStore)
+        const warn = jest.spyOn(limiterLogger(), 'warn')
+        const admitted = 6
+        let arrived = 0
+        let open!: () => void
+        const gate = new Promise<void>((resolve) => (open = resolve))
+        // Every request must reach the record step, having passed its check, before any
+        // record outcome exists. That is the "already admitted" condition, by construction.
+        jest.spyOn(store, 'increment').mockImplementation(async () => {
+          if (++arrived === admitted) open()
+          await gate
+          throw new AbuseCounterError('unavailable', 'unknown')
+        })
+        const before = await effects(rawToken)
+
+        const responses = await Promise.all(
+          Array.from({ length: admitted }, () =>
+            accept(inviteeToken, randomBytes(32).toString('base64url'))
+          )
+        )
+
+        expect(arrived).toBe(admitted)
+        for (const res of responses) {
+          expect(res.status).toBe(400)
+          expect(res.body.errorCode).toBe('INVITE_INVALID_OR_EXPIRED')
+        }
+        const failures = recordFailures(warn)
+        expect(failures).toHaveLength(admitted)
+        for (const failure of failures)
+          expect(failure).toMatchObject({ case: 'unknown', keyClass: 'invite_accept' })
+        expect(await effects(rawToken)).toEqual(before)
+      })
+
+      it('counts failures in v2 integer keys; a successful accept clears only its own fingerprint', async () => {
+        const { inviteeToken, rawToken } = await inviteeWithInvite()
+        const wrong = randomBytes(32).toString('base64url')
+        await accept(inviteeToken, wrong).then((res) => expect(res.status).toBe(400))
+        await accept(inviteeToken, wrong).then((res) => expect(res.status).toBe(400))
+
+        const redis = context.cache.connection
+        const [ipKey] = await redis.keys('rate:v2:invite_accept_fail_ip:*')
+        expect(await redis.get(ipKey!)).toBe('2')
+        const wrongKey = `rate:v2:invite_accept_fail_token:${InviteAcceptLimiterService.fingerprint(wrong)}`
+        expect(await redis.get(wrongKey)).toBe('2')
+        expect(await redis.keys('rate:invite_accept_fail_*')).toEqual([])
+
+        await accept(inviteeToken, rawToken).then((res) => expect(res.status).toBe(200))
+
+        // Success removes only the accepted token's counter: the IP debt and the other
+        // fingerprint are untouched.
+        expect(await redis.get(ipKey!)).toBe('2')
+        expect(await redis.get(wrongKey)).toBe('2')
+        expect(
+          await redis.exists(
+            `rate:v2:invite_accept_fail_token:${InviteAcceptLimiterService.fingerprint(rawToken)}`
+          )
+        ).toBe(0)
+      })
+    })
+  })
+
+  describe('GET /organizations/:orgId/invites', () => {
+    it('returns canonical paginated envelope with active invites only', async () => {
+      const { adminOrgToken, orgId, adminUserId } = await setupAdminOrg()
+      const memberRoleRow = await prisma.role.findFirstOrThrow({
+        where: { name: 'MEMBER', isSystem: true, organizationId: null },
+      })
+
+      await seedInvite(prisma, {
+        orgId,
+        email: 'active@example.com',
+        invitedById: adminUserId,
+        roleId: memberRoleRow.id,
+      })
+      await seedInvite(prisma, {
+        orgId,
+        email: 'expired@example.com',
+        invitedById: adminUserId,
+        roleId: memberRoleRow.id,
+        expiresAt: new Date(Date.now() - 1000),
+      })
+      await seedInvite(prisma, {
+        orgId,
+        email: 'revoked@example.com',
+        invitedById: adminUserId,
+        roleId: memberRoleRow.id,
+        revokedAt: new Date(),
+        revokedById: adminUserId,
+      })
+      await seedInvite(prisma, {
+        orgId,
+        email: 'accepted@example.com',
+        invitedById: adminUserId,
+        roleId: memberRoleRow.id,
+        acceptedAt: new Date(),
+        acceptedByUserId: adminUserId,
+      })
+
+      const res = await request(app.getHttpServer())
+        .get(`/organizations/${orgId}/invites`)
+        .set('Authorization', `Bearer ${adminOrgToken}`)
+        .expect(200)
+
+      expect(res.body.data).toHaveLength(1)
+      expect(res.body.total).toBe(1)
+      expect(res.body.page).toBe(1)
+      expect(res.body.limit).toBe(20)
+      expect(res.body.data[0]).toMatchObject({ email: 'active@example.com' })
+      // No raw token or hash should leak in the list response.
+      expect(res.body.data[0]).not.toHaveProperty('token')
+      expect(res.body.data[0]).not.toHaveProperty('tokenHash')
+    })
+
+    it('returns 403 when the principal is switched to a different org (path mismatch)', async () => {
+      const { orgId: orgA, adminToken: tokenA } = await setupAdminOrg('user-a@example.com')
+      const { adminToken: tokenB } = await setupAdminOrg('user-b@example.com')
+
+      // Switch tokenB into their own org so principal.organizationId !== orgA.
+      const orgBRes = await request(app.getHttpServer())
+        .get('/organizations')
+        .set('Authorization', `Bearer ${tokenB}`)
+        .expect(200)
+      const orgB = orgBRes.body.data[0].id as string
+      const switchB = await request(app.getHttpServer())
+        .post(`/organizations/${orgB}/switch`)
+        .set('Authorization', `Bearer ${tokenB}`)
+        .expect(200)
+      const orgBToken = switchB.body.accessToken as string
+
+      // tokenA is not relevant to the path-mismatch assertion; sanity-only.
+      expect(typeof tokenA).toBe('string')
+
+      await request(app.getHttpServer())
+        .get(`/organizations/${orgA}/invites`)
+        .set('Authorization', `Bearer ${orgBToken}`)
+        .expect(403)
+    })
+  })
+
+  describe('DELETE /organizations/:orgId/invites/:inviteId', () => {
+    it('revokes a pending invite (204) and lookups marked revoked', async () => {
+      const { adminOrgToken, orgId, adminUserId } = await setupAdminOrg()
+      const { inviteId } = await seedInvite(prisma, {
+        orgId,
+        email: 'target@example.com',
+        invitedById: adminUserId,
+        roleId: null,
+      })
+
+      await request(app.getHttpServer())
+        .delete(`/organizations/${orgId}/invites/${inviteId}?expectedGeneration=1`)
+        .set('X-Invitation-Operation-Id', createInvitationOperationId())
+        .set('Authorization', `Bearer ${adminOrgToken}`)
+        .expect(204)
+
+      const row = await prisma.orgInvite.findUniqueOrThrow({ where: { id: inviteId } })
+      expect(row.revokedAt).not.toBeNull()
+      expect(row.revokedById).toBe(adminUserId)
+    })
+
+    it('is idempotent — revoking an already-revoked invite returns 204', async () => {
+      const { adminOrgToken, orgId, adminUserId } = await setupAdminOrg()
+      const { inviteId } = await seedInvite(prisma, {
+        orgId,
+        email: 'target@example.com',
+        invitedById: adminUserId,
+        roleId: null,
+        revokedAt: new Date(),
+        revokedById: adminUserId,
+      })
+
+      await request(app.getHttpServer())
+        .delete(`/organizations/${orgId}/invites/${inviteId}?expectedGeneration=1`)
+        .set('X-Invitation-Operation-Id', createInvitationOperationId())
+        .set('Authorization', `Bearer ${adminOrgToken}`)
+        .expect(204)
+    })
+
+    it('returns 409 INVITE_SETTLED when revoking an accepted invite', async () => {
+      const { adminOrgToken, orgId, adminUserId } = await setupAdminOrg()
+      const { inviteId } = await seedInvite(prisma, {
+        orgId,
+        email: 'target@example.com',
+        invitedById: adminUserId,
+        roleId: null,
+        acceptedAt: new Date(),
+        acceptedByUserId: adminUserId,
+      })
+
+      const res = await request(app.getHttpServer())
+        .delete(`/organizations/${orgId}/invites/${inviteId}?expectedGeneration=1`)
+        .set('X-Invitation-Operation-Id', createInvitationOperationId())
+        .set('Authorization', `Bearer ${adminOrgToken}`)
+        .expect(409)
+      expect(res.body.errorCode).toBe('INVITE_SETTLED')
+    })
+
+    it('returns 404 when inviteId belongs to a different organization (current org context)', async () => {
+      const { adminOrgToken: tokenA, orgId: orgA } = await setupAdminOrg('user-a@example.com')
+      const { orgId: orgB, adminUserId: adminBId } = await setupAdminOrg('user-b@example.com')
+      const { inviteId } = await seedInvite(prisma, {
+        orgId: orgB,
+        email: 'target@example.com',
+        invitedById: adminBId,
+        roleId: null,
+      })
+
+      await request(app.getHttpServer())
+        .delete(`/organizations/${orgA}/invites/${inviteId}?expectedGeneration=1`)
+        .set('X-Invitation-Operation-Id', createInvitationOperationId())
+        .set('Authorization', `Bearer ${tokenA}`)
+        .expect(404)
+    })
+  })
+
+  describe('OB-02: credential boundary on the invite surface', () => {
+    it('POST /organizations/:orgId/invites rejects an API key even with full manager scope', async () => {
+      const { adminToken, orgId } = await setupAdminOrg()
+      const keyRes = await request(app.getHttpServer())
+        .post('/api-keys')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          name: 'Invite key',
+          organizationId: orgId,
+          scopes: ['manage:TeamAccess'],
+        })
+        .expect(201)
+      const apiKey = keyRes.body.key as string
+
+      const res = await request(app.getHttpServer())
+        .post(`/organizations/${orgId}/invites`)
+        .set('X-Invitation-Operation-Id', createInvitationOperationId())
+        .set('Authorization', `Bearer ${apiKey}`)
+        .send({ email: 'target@example.com' })
+        .expect(401)
+      expect(res.body.errorCode).toBe('UNAUTHORIZED')
+    })
+
+    it('GET /organizations/:orgId/invites rejects API keys with 401', async () => {
+      const { adminToken, orgId } = await setupAdminOrg()
+      const keyRes = await request(app.getHttpServer())
+        .post('/api-keys')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          name: 'List attempt',
+          organizationId: orgId,
+          scopes: ['manage:TeamAccess'],
+        })
+        .expect(201)
+      const apiKey = keyRes.body.key as string
+
+      await request(app.getHttpServer())
+        .get(`/organizations/${orgId}/invites`)
+        .set('Authorization', `Bearer ${apiKey}`)
+        .expect(401)
+    })
+
+    it('DELETE /organizations/:orgId/invites/:inviteId rejects API keys with 401', async () => {
+      const { adminToken, orgId, adminUserId } = await setupAdminOrg()
+      const { inviteId } = await seedInvite(prisma, {
+        orgId,
+        email: 'target@example.com',
+        invitedById: adminUserId,
+        roleId: null,
+      })
+
+      const keyRes = await request(app.getHttpServer())
+        .post('/api-keys')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          name: 'Revoke attempt',
+          organizationId: orgId,
+          scopes: ['manage:TeamAccess'],
+        })
+        .expect(201)
+      const apiKey = keyRes.body.key as string
+
+      await request(app.getHttpServer())
+        .delete(`/organizations/${orgId}/invites/${inviteId}?expectedGeneration=1`)
+        .set('X-Invitation-Operation-Id', createInvitationOperationId())
+        .set('Authorization', `Bearer ${apiKey}`)
+        .expect(401)
+    })
+
+    it('POST /auth/invites/accept rejects API keys with 401', async () => {
+      const { adminToken, orgId } = await setupAdminOrg()
+      const keyRes = await request(app.getHttpServer())
+        .post('/api-keys')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          name: 'Accept attempt',
+          organizationId: orgId,
+          scopes: ['read:all'],
+        })
+        .expect(201)
+      const apiKey = keyRes.body.key as string
+
+      await request(app.getHttpServer())
+        .post('/auth/invites/accept')
+        .set('X-Invitation-Operation-Id', createInvitationOperationId())
+        .set('Authorization', `Bearer ${apiKey}`)
+        .send({ token: randomBytes(32).toString('base64url') })
+        .expect(401)
+    })
+
+    it.each([false, true])(
+      'Stage B invite key denial before writes/mail (owner veto=%s)',
+      async (ownerVeto) => {
+        const { adminToken, orgId, adminUserId } = await setupAdminOrg()
+        const key = await request(app.getHttpServer())
+          .post('/api-keys')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            name: 'Denied invite key',
+            organizationId: orgId,
+            scopes: [ownerVeto ? 'manage:TeamAccess' : 'manage:Organization'],
+          })
+          .expect(201)
+        if (ownerVeto) {
+          const role = await prisma.role.create({
+            data: { name: 'Owner veto', organizationId: orgId },
+          })
+          const permission = await prisma.permission.create({
+            data: {
+              action: 'read',
+              subject: 'Role',
+              inverted: true,
+              fields: ['name'],
+              conditions: { id: 'impossible' },
+              organizationId: orgId,
+            },
+          })
+          await prisma.rolePermission.create({
+            data: { roleId: role.id, permissionId: permission.id },
+          })
+          const member = await prisma.orgMember.findUniqueOrThrow({
+            where: { userId_organizationId: { userId: adminUserId, organizationId: orgId } },
+          })
+          await prisma.memberRole.create({ data: { memberId: member.id, roleId: role.id } })
+          await prisma.organization.update({
+            where: { id: orgId },
+            data: { aclVersion: { increment: 1 } },
+          })
+        }
+        const create = jest.spyOn(app.get(InviteService), 'createInvite')
+        const delivery = jest.spyOn(app.get(EmailService), 'sendOrgInviteEmail')
+        try {
+          await request(app.getHttpServer())
+            .post(`/organizations/${orgId}/invites`)
+            .set('X-Invitation-Operation-Id', createInvitationOperationId())
+            .set('Authorization', `Bearer ${key.body.key}`)
+            .send({ email: 'denied-invite@example.com' })
+            .expect(401)
+          expect(await prisma.orgInvite.count({ where: { organizationId: orgId } })).toBe(0)
+          expect(create).not.toHaveBeenCalled()
+          expect(delivery).not.toHaveBeenCalled()
+        } finally {
+          create.mockRestore()
+          delivery.mockRestore()
+        }
+      }
+    )
+
+    /**
+     * A key bound to A cannot target B even when its owner belongs to B.
+     * The scoped resolver rejects the bound target before TeamAccess construction
+     * and before InviteService; exact manage:TeamAccess scope does not retarget it.
+     */
+    it('POST /organizations/:orgId/invites rejects an API key bound to a different org with 401', async () => {
+      // userA — admin of org A.
+      const {
+        adminToken: tokenA,
+        orgId: orgA,
+        adminUserId: userAId,
+      } = await setupAdminOrg('user-a@example.com')
+
+      // userB — owns org B.
+      const tokenB = await registerAndLogin('user-b@example.com')
+      const orgBRes = await request(app.getHttpServer())
+        .post('/organizations')
+        .set('Authorization', `Bearer ${tokenB}`)
+        .send({ name: 'Org B' })
+        .expect(201)
+      const orgB = orgBRes.body.id as string
+
+      // Seed userA into org B as MEMBER directly — a membership-only check
+      // would now pass, so the 401 below comes from the personal-credential boundary.
+      const memberRole = await prisma.role.findFirstOrThrow({
+        where: { name: 'MEMBER', isSystem: true, organizationId: null },
+      })
+      await seedOrgMember(prisma, { orgId: orgB, userId: userAId, roleId: memberRole.id })
+      const orgBMembers = await prisma.orgMember.findMany({ where: { organizationId: orgB } })
+      expect(orgBMembers).toHaveLength(2)
+
+      // userA creates an API key bound to org A only.
+      const keyRes = await request(app.getHttpServer())
+        .post('/api-keys')
+        .set('Authorization', `Bearer ${tokenA}`)
+        .send({ name: 'Bound to A', organizationId: orgA, scopes: ['manage:TeamAccess'] })
+        .expect(201)
+      const apiKey = keyRes.body.key as string
+
+      // Cross-org invite — rejected with 401 (credential bound to org A).
+      await request(app.getHttpServer())
+        .post(`/organizations/${orgB}/invites`)
+        .set('X-Invitation-Operation-Id', createInvitationOperationId())
+        .set('Authorization', `Bearer ${apiKey}`)
+        .send({ email: 'cross-org-target@example.com' })
+        .expect(401)
+
+      // No partial write: the rejected call created no invite row in org B.
+      const leaked = await prisma.orgInvite.findFirst({
+        where: { organizationId: orgB, emailCanonical: 'cross-org-target@example.com' },
+      })
+      expect(leaked).toBeNull()
+    })
+  })
+})

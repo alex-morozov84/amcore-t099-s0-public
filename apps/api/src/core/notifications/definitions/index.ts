@@ -1,0 +1,23 @@
+import type { NotificationDefinitionRegistration } from '../notification-definition.types.js'
+
+import { accountMfaBackupCodesChangedDefinition } from './account-mfa-backup-codes-changed.definition.js'
+import { accountMfaBackupUsedDefinition } from './account-mfa-backup-used.definition.js'
+import { accountMfaFactorChangedDefinition } from './account-mfa-factor-changed.definition.js'
+import { accountPasswordChangedDefinition } from './account-password-changed.definition.js'
+import { accountProfileUpdatedDefinition } from './account-profile-updated.definition.js'
+import { accountTelegramLinkedDefinition } from './account-telegram-linked.definition.js'
+
+/**
+ * The starter notification definitions registered at bootstrap. Forks add their
+ * own here; the registry rejects duplicate types. `account.password_changed` is the
+ * first definition with an external (email) channel and mandatory deliveries — the
+ * dispatcher (Arc B) drains its email delivery via the worker-only adapter.
+ */
+export const NOTIFICATION_DEFINITIONS: readonly NotificationDefinitionRegistration[] = [
+  { definition: accountMfaBackupCodesChangedDefinition, current: true },
+  { definition: accountMfaFactorChangedDefinition, current: true },
+  { definition: accountMfaBackupUsedDefinition, current: true },
+  { definition: accountProfileUpdatedDefinition, current: true },
+  { definition: accountPasswordChangedDefinition, current: true },
+  { definition: accountTelegramLinkedDefinition, current: true },
+]

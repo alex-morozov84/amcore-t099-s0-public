@@ -1,0 +1,182 @@
+# Capability catalogue and access hints
+
+The catalogue describes operations the starter actually implements. It is
+code-declared metadata for the role editor (see the
+[role definitions API](../product-admin/role-definitions.md)), not a role grant or a route
+authorization decision. A descriptor may carry `risk: 'fullControl'` (today
+`teamAccess.manage`): an editor must confirm that grant, and the server requires
+`acknowledgeFullControl` when a save adds it. Declare `risk` in `CAPABILITY_CATALOGUE`, the
+strict response schema and the matching `CapabilityRegistry` adapter, whose startup check
+fails when they differ. The server recognizes a stored rule as a managed preset only when its
+action, subject, inverted flag, **uninterpolated** condition template and field set equal the
+adapter's preset output exactly (key and field order do not matter; `[]` all-fields never
+equals a restricted list); every other rule is advanced and is shown read-only, never
+rewritten. Current entries cover full team-access management and
+organization read, update and delete. A product adds its own resources through
+the shared/API extension points below.
+
+## Three different answers
+
+| Answer                                | API surface                                                                            | Meaning                                                                                                                                                                                                                        |
+| ------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| What can this product author?         | Bearer-only `GET /organizations/:orgId/capabilities`, full TeamAccess required         | Stable operation IDs, supported presets, fields and credential eligibility. No current employee permissions or raw conditions.                                                                                                 |
+| What might I do in this organization? | Bearer-only `GET /organizations/:id/context` → `actorAffordances`                      | Effective current employee and verified organization. `allowed` requires unconditional prerequisites; `recordRequired` means an actual trusted record is needed, with no promise that one exists; `denied` has no viable path. |
+| What can I do with this record?       | The same context response → `recordAffordances` for its server-loaded organization row | Read, update and delete decisions with relevant fields for this actual record. A later write checks authority again. Downstream domain lists attach equivalent hints to rows they already fetched.                             |
+
+The selected-context response keeps `canManageTeamAccess` for existing callers;
+its value equals the named `teamAccess.manage` actor decision. The two-card
+organization overview uses only this verified team decision. The separate ready Members, Roles and Invitations screens provide their own controls.
+
+The ready role editor uses typed same-origin catalogue and role operations with
+session and Origin checks. See the [role editor](../product-admin/role-definitions.md#ready-role-screens).
+
+## Author a permission
+
+`POST /organizations/:orgId/roles/:roleId/permissions/presets` accepts exactly
+`{ "capabilityId": "organization.update", "presetId": "own" }` for a
+registered pair. It is bearer-only, requires verified matching organization
+context, full TeamAccess and a custom role in that organization. The server
+stores `${user.organizationId}` or `${user.sub}` **as a template for the future
+permission holder**. It interpolates only when that holder's ability is built;
+the author never becomes the rule's owner or assignee. A new catalogue entry
+does not grant an existing role anything.
+
+The older `POST /organizations/:orgId/roles/:roleId/permissions` still accepts
+valid advanced allow and DENY rules for known model subjects even when the
+subject/action is absent from the UI catalogue. New writes are checked before
+the Permission row, role link or ACL version changes. Unknown model fields,
+unsupported operators and principal placeholders receive distinct 400 codes:
+`PERMISSION_RULE_UNSUPPORTED`, `PERMISSION_FIELD_UNSUPPORTED` and
+`PERMISSION_PLACEHOLDER_UNSUPPORTED`. The preset route additionally returns
+`CAPABILITY_UNSUPPORTED` for an unknown capability/preset pair. Existing valid
+stored rules keep their IDs and meaning; a future editor must display custom
+rules read-only rather than silently replacing them. An incompatible historical
+rule fails ability construction closed and needs privileged audit and controlled
+repair. Do not repair by deleting or ignoring a DENY during a request.
+
+Condition paths are known public scalar fields of User, Organization, Role and
+Permission. Direct typed equality, `not`, `in`, `notIn`, numeric/date
+`gt/gte/lt/lte`, string `contains/startsWith/endsWith` and bounded nonempty
+`AND/OR/NOT` are supported. Relation, JSON/list and unknown fields/operators
+are rejected. The only template paths admitted for new rules are whole values
+`${user.sub}` and `${user.organizationId}` on compatible String fields. Stored
+DateTime comparisons use **integer epoch milliseconds** within JavaScript
+`Date`'s range; evaluation converts a fresh copy to `Date` before CASL and
+Prisma parsing. ISO strings and fractional dates are rejected because their
+record and SQL behavior would differ. `User.lastLoginAt` is nullable and
+accepts `null` equality; `Organization.aclVersion` conditions accept the full
+signed 32-bit integer range, including negative comparison thresholds such as
+`{ gte: -1 }`. The stored ACL counter itself normally starts at zero. Top-level
+`{}` is an unconditional condition, including in
+actor hints. These limits are checked separately
+from the route's tenant, immutable-field and response-field policy.
+
+| Subject        | Accepted condition and field names                                                                                                        |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `User`         | `id`, `email`, `emailVerified`, `name`, `avatarUrl`, `phone`, `locale`, `timezone`, `createdAt`, `updatedAt`, `lastLoginAt`, `systemRole` |
+| `Organization` | `id`, `name`, `slug`, `aclVersion`, `createdAt`, `updatedAt`                                                                              |
+| `Role`         | `id`, `name`, `description`, `isSystem`, `organizationId`                                                                                 |
+| `Permission`   | `id`, `action`, `subject`, `inverted`, `organizationId`                                                                                   |
+
+For these four subjects, `fields` may also be omitted, `[]` or `['*']` for all
+fields. `TeamAccess` supports only `manage` with no condition and unrestricted
+fields. Subject `all` supports DENY only; any condition or field restriction
+must be valid for every model subject. Logical nesting is limited to four
+levels and 64 condition nodes; `in` and `notIn` accept at most 64 values. An
+empty nested branch, unknown field, relation path or unsupported operator is
+rejected before a permission is saved.
+
+## What a person sees: catalogued or not
+
+A stored permission rule is shown, explained and edited by the product screens **only if a developer has
+explicitly registered the operation it belongs to** in `CAPABILITY_CATALOGUE` and `CapabilityRegistry`
+(steps below). Nothing is discovered automatically: a rule that merely exists in a role keeps working, but it is
+not part of the screens' vocabulary.
+
+| The rule is…                                                                                    | Role editor                                           | Member **Access** view                                                                                                        |
+| ----------------------------------------------------------------------------------------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| A catalogued operation at a preset level (own, assigned, all)                                   | Editable checkbox with its label                      | Listed under its area as **configured**: the areas the roles configure, each with its roles and the reading it needs          |
+| A catalogued operation's field limits, a condition, or an explicit deny                         | Read-only under **Advanced rules**, preserved on save | Explained by cause: a field limit, a custom condition, a deny that may exclude records, a deny that blocks fields or the item |
+| A catalogued operation whose adapter sets `access: 'none'`                                      | Editable, as any catalogued operation                 | Listed as **not evaluated**, never as "not allowed"                                                                           |
+| On a subject or action with no catalogue entry (for example a member's own profile in `MEMBER`) | Read-only under **Advanced rules**, preserved on save | Not explained: counted once as **Other permissions in roles**                                                                 |
+
+The screens never hide such a rule from the server's decisions; they only do not describe it. To make a
+permission appear in both places with a human label, register it as described in the next section: it needs a real
+operation (handler, method, path), a registry adapter and label keys. Registering a catalogue entry never grants
+an existing role anything.
+
+What the Access view says about a registered capability is **what the role settings configure**, by independent
+areas (all, assigned, own, custom): it never proves that a member can act on one particular record, and a read at
+another level does not prove the reading an operation needs. See the
+[member access explanation](../product-admin/member-access.md) for the states and limits.
+
+## Extend a downstream product
+
+1. Add the domain Prisma model and a migration. Add its name to the shared
+   `Subject` enum and model-permission schema. This also makes syntactically
+   valid `action:NewSubject` API-key scopes issuable by the current low-level
+   API, even before a route uses them; review credential policy before issuance.
+2. Add a typed operation descriptor to `CAPABILITY_CATALOGUE` and the shared
+   capability ID/response schemas. Name the exact handler, action, subject,
+   supported presets and editable fields. Register its model scalar grammar in
+   `permission-model-fields.ts` and its typed subject in `AppAbility`.
+3. Implement admission, credential, tenant, field and record checks in the
+   domain handler and service. Register the matching operation metadata and
+   preset builder in `CapabilityRegistry`; its startup check compares the
+   declared catalogue entries with the registered adapter entries. Add the
+   handler to `capability-policy-parity.spec.ts` and verify its route, auth and
+   guards against the descriptor before publishing it. Credential metadata
+   never overrides route `@Auth` or the API-key allowlist.
+4. For lists, combine `accessibleBy(ability)` with the verified tenant predicate
+   using `AND`. Load the page once, check actual rows/fields in memory, and
+   project bounded action hints. Compute the visible total after field filtering
+   (or enforce the same filter in SQL); never disclose a hidden-row count.
+   Check write input, pre-state and post-state in the transaction; keep tenant
+   and assignment columns immutable. An action
+   hint is never the write authorization. Do not send client-provided records
+   to a generic `/can` endpoint or call the server once per button.
+5. Add the label keys the screens read: `organizationRoles.capabilities.<labelKey>.label` and `.description` in every
+   web catalogue (and `organizationRoles.areas.<Subject>` for a new subject). The role editor and the member **Access**
+   view then list the new operation with no further UI code. Set `access: 'none'` on the adapter only to opt out of
+   the member access explanation (the capability is then shown as not evaluated).
+6. Compile shared, API and web consumers. Write PostgreSQL access tests for
+   your product's modules. Cover multiple roles, organization boundaries,
+   own/assigned/all rows, DENY rules, readable and writable fields, and API-key
+   intersection. If the capability appears in the member **Access** view, also
+   test that its explanation matches your real handlers on own, assigned and
+   other records. Verify capability labels in every retained web catalogue.
+   `scripts/fixtures/t024-capability-extension.patch` contains reference tests
+   you can adapt.
+   Do not run `pnpm test:capability-extension` for product validation: its fixed patch tests
+   the starter's extension recipe and can conflict with normal product edits.
+   In `Mode = downstream-product`, the command warns and exits successfully
+   without copying the project or running tests. Inherited tests still run,
+   but a green `Test` no longer proves the complete new-module extension path
+   on product code. The product must test its own modules.
+   Starter member-access unit tests use only built-in capabilities and synthetic
+   fixtures. They do not validate capabilities registered by your product; cover
+   those capabilities in your own PostgreSQL tests.
+   Document the domain's actual screens separately.
+
+An issued `read:all` key does **not** acquire access merely because a subject
+appears in the catalogue. If the owner later receives a read grant for a new
+subject, however, the old key may become effective on a route that separately
+accepts API keys. The same future activation applies to a dormant
+`manage:NewSubject` scope. Freezing wildcard meaning would need a separate
+versioned credential mechanism.
+
+## API-key scope options
+
+`CapabilityDescriptor.additionalApiKeyScopes?: readonly string[]` declares complete
+direct canonical scope requirements for an API-key-eligible operation. Missing/empty
+means no additions. `apiKeyScopeOptions` validates declarations, groups identical
+primary `action:Subject` scopes, unions direct additions, deduplicates and sorts by
+literal code-point order. There is no transitive dependency graph. Malformed scopes,
+`manage:all` and nonempty metadata on bearer-only entries fail definition validation.
+
+PATCH Organization requires update plus read for its response. DELETE requires delete
+plus `manage:TeamAccess`, without read. Field-name metadata does not imply a read grant.
+Prove these requirements against handlers, independently of descriptor validation.
+This new metadata is code-only and explicitly omitted from the unchanged strict HTTP
+catalogue projection. Custom key UI uses compiled descriptors, not `/capabilities`
+as a complete key-option endpoint. See [own keys](../product-admin/own-api-keys.md).

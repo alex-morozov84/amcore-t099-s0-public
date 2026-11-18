@@ -1,0 +1,318 @@
+import { createHmac } from 'node:crypto'
+import { gzipSync } from 'node:zlib'
+
+import { Body, Controller, HttpCode, type INestApplication, Patch, Post, Req } from '@nestjs/common'
+import request from 'supertest'
+
+import { AuthType, MEMBER_REQUEST_BYTES, WORK_COMMAND_INPUT_BYTES } from '@amcore/shared'
+
+import { REQUEST_BODY_LIMIT_BYTES } from '../src/bootstrap/request-body-policy'
+import { Auth } from '../src/core/auth/decorators/auth.decorator'
+import { RATE_LIMIT_POLICIES, RateLimit, SkipRateLimit } from '../src/infrastructure/throttling'
+import { VerifyWebhook } from '../src/infrastructure/webhooks'
+import type { PrismaService } from '../src/prisma'
+
+import { cleanDatabase, cleanOrgData, type E2ETestContext, teardownE2ETest } from './helpers'
+import { setupWebhookTestApp } from './webhook-test-app'
+
+/** Ordinary JSON route: echoes a fixed body so a parsed request returns 200. */
+@Controller('body-size')
+@SkipRateLimit()
+class EchoController {
+  @Post('echo')
+  @HttpCode(200)
+  @Auth(AuthType.None)
+  echo(@Body() _body: { padding?: string }): { ok: true } {
+    return { ok: true }
+  }
+}
+
+/** Raw-body webhook route: proves the limit + raw-byte preservation together. */
+@Controller('body-size/webhooks')
+class WebhookSizeController {
+  @Post('stripe')
+  @HttpCode(200)
+  @Auth(AuthType.None)
+  @RateLimit(RATE_LIMIT_POLICIES.PRIVILEGED_MUTATION)
+  @VerifyWebhook('stripe')
+  handle(@Req() req: { body: { id: string } }): { ok: true; id: string } {
+    return { ok: true, id: req.body.id }
+  }
+}
+
+/** Deliberately unguarded parser probe, unique fixed path avoids production controller collision. */
+@Controller('organizations/parser-probe/members/parser-user/roles')
+@SkipRateLimit()
+class MemberBodyController {
+  @Patch()
+  @HttpCode(200)
+  @Auth(AuthType.None)
+  echo(@Body() _body: unknown) {
+    return { ok: true }
+  }
+}
+
+/** Parser-only probe: exact production path, no ADMIN service in this isolated module. */
+@Controller('admin/background-work')
+@SkipRateLimit()
+class WorkCommandBodyController {
+  @Post([
+    'commands',
+    'commands/:commandId/reconciliation',
+    'works/:workId/jobs/:jobId/reconciliation',
+  ])
+  @HttpCode(200)
+  @Auth(AuthType.None)
+  echo(@Body() _body: unknown) {
+    return { ok: true }
+  }
+}
+
+describe('Request body size limit (e2e)', () => {
+  let app: INestApplication
+  let prisma: PrismaService
+  let context: E2ETestContext
+  const secret = 'whsec_test'
+
+  beforeAll(async () => {
+    process.env.WEBHOOK_STRIPE_SECRET = secret
+    process.env.WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS = '300'
+    process.env.WEBHOOK_REPLAY_DEDUPE_TTL_SECONDS = '300'
+    context = await setupWebhookTestApp(
+      [EchoController, WebhookSizeController, MemberBodyController, WorkCommandBodyController],
+      true
+    )
+    app = context.app
+    prisma = context.prisma
+  }, 120000)
+
+  afterAll(async () => {
+    if (context) await teardownE2ETest(context)
+  }, 120000)
+
+  beforeEach(async () => {
+    await cleanOrgData(prisma)
+    await cleanDatabase(prisma, context.cache, context.throttlerStorage)
+  })
+
+  it('caps streamed command JSON at32KiB, including whitespace and inflated input', async () => {
+    const boundary = jsonBodyOfSize(WORK_COMMAND_INPUT_BYTES)
+    await request(app.getHttpServer())
+      .post('/admin/background-work/commands')
+      .set('Content-Type', 'application/json')
+      .send(boundary)
+      .expect(200)
+    for (const body of [
+      jsonBodyOfSize(WORK_COMMAND_INPUT_BYTES + 1),
+      ' '.repeat(WORK_COMMAND_INPUT_BYTES) + '{}',
+    ])
+      await request(app.getHttpServer())
+        .post('/admin/background-work/commands')
+        .set('Content-Type', 'application/json')
+        .send(body)
+        .expect(413)
+    await request(app.getHttpServer())
+      .post('/admin/background-work/commands')
+      .set('Content-Type', 'application/json')
+      .set('Content-Encoding', 'gzip')
+      .serialize(() => gzipSync(jsonBodyOfSize(WORK_COMMAND_INPUT_BYTES + 1)) as unknown as string)
+      .send({})
+      .expect(413)
+  })
+
+  it('bounds invalid command forms before the generic100000-byte parser', async () => {
+    const body = `value=${'x'.repeat(WORK_COMMAND_INPUT_BYTES - 6)}`
+    await request(app.getHttpServer())
+      .post('/admin/background-work/commands')
+      .set('Content-Type', 'application/x-www-form-urlencoded')
+      .send(body)
+      .expect(200)
+    await request(app.getHttpServer())
+      .post('/admin/background-work/commands')
+      .set('Content-Type', 'application/x-www-form-urlencoded')
+      .send(`${body}x`)
+      .expect(413)
+  })
+
+  it('preserves the32KiB cap for accepted trailing-slash and reconciliation route spellings', async () => {
+    for (const path of [
+      '/admin/background-work/commands/',
+      '/admin/background-work/commands/019a1234-1234-7123-8123-123456789012/reconciliation',
+      '/admin/background-work/commands/%30%31%39a1234-1234-7123-8123-123456789012/reconciliation/',
+      '/admin/background-work/works/email/jobs/recycled-evidence-job/reconciliation',
+      '/admin/background-work/works/email/jobs/%72ecycled-evidence-job/reconciliation/',
+    ]) {
+      await request(app.getHttpServer())
+        .post(path)
+        .set('Content-Type', 'application/json')
+        .send(jsonBodyOfSize(WORK_COMMAND_INPUT_BYTES))
+        .expect(200)
+      await request(app.getHttpServer())
+        .post(path)
+        .set('Content-Type', 'application/json')
+        .send(jsonBodyOfSize(WORK_COMMAND_INPUT_BYTES + 1))
+        .expect(413)
+      await request(app.getHttpServer())
+        .post(path)
+        .set('Content-Type', 'application/x-www-form-urlencoded')
+        .send(`value=${'x'.repeat(WORK_COMMAND_INPUT_BYTES)}`)
+        .expect(413)
+    }
+  })
+
+  describe('scoped member role JSON', () => {
+    const scoped = '/organizations/parser-probe/members/parser-user/roles'
+    it('accepts262144 decoded bytes and rejects262145 before guards', async () => {
+      for (const [bytes, status] of [
+        [MEMBER_REQUEST_BYTES, 200],
+        [MEMBER_REQUEST_BYTES + 1, 413],
+      ]) {
+        const response = await request(app.getHttpServer())
+          .patch(scoped)
+          .set('Content-Type', 'application/json')
+          .send(jsonBodyOfSize(bytes!))
+          .expect(status!)
+        expect(response.body).toMatchObject(
+          status === 413 ? { errorCode: 'PAYLOAD_TOO_LARGE' } : { ok: true }
+        )
+      }
+    })
+    it('does not widen POST, encoded path or urlencoded body', async () => {
+      await request(app.getHttpServer())
+        .post(scoped)
+        .set('Content-Type', 'application/json')
+        .send(jsonBodyOfSize(100001))
+        .expect(413)
+      await request(app.getHttpServer())
+        .patch(scoped.replace('parser-user', 'parser%2Duser'))
+        .set('Content-Type', 'application/json')
+        .send(jsonBodyOfSize(100001))
+        .expect(413)
+      await request(app.getHttpServer())
+        .patch(scoped)
+        .set('Content-Type', 'application/x-www-form-urlencoded')
+        .send(urlencodedBodyOfSize(100001))
+        .expect(413)
+    })
+    it('bounds gzip inflated JSON at scoped cap', async () => {
+      for (const [bytes, status] of [
+        [MEMBER_REQUEST_BYTES, 200],
+        [MEMBER_REQUEST_BYTES + 1, 413],
+      ])
+        await request(app.getHttpServer())
+          .patch(scoped)
+          .set('Content-Type', 'application/json')
+          .set('Content-Encoding', 'gzip')
+          .serialize(() => gzipSync(jsonBodyOfSize(bytes!)) as unknown as string)
+          .send({})
+          .expect(status!)
+    })
+  })
+
+  describe('ordinary JSON', () => {
+    it('accepts a body exactly at the limit', async () => {
+      const body = jsonBodyOfSize(REQUEST_BODY_LIMIT_BYTES)
+      expect(Buffer.byteLength(body)).toBe(REQUEST_BODY_LIMIT_BYTES)
+
+      const res = await request(app.getHttpServer())
+        .post('/body-size/echo')
+        .set('Content-Type', 'application/json')
+        .send(body)
+        .expect(200)
+      expect(res.body).toEqual({ ok: true })
+    })
+
+    it('rejects a body one byte over the limit with 413 PAYLOAD_TOO_LARGE', async () => {
+      const body = jsonBodyOfSize(REQUEST_BODY_LIMIT_BYTES + 1)
+      expect(Buffer.byteLength(body)).toBe(REQUEST_BODY_LIMIT_BYTES + 1)
+
+      const res = await request(app.getHttpServer())
+        .post('/body-size/echo')
+        .set('Content-Type', 'application/json')
+        .send(body)
+        .expect(413)
+      expect(res.body.errorCode).toBe('PAYLOAD_TOO_LARGE')
+    })
+  })
+
+  describe('urlencoded (Apple form_post parser path)', () => {
+    it('accepts a urlencoded body exactly at the limit', async () => {
+      const body = urlencodedBodyOfSize(REQUEST_BODY_LIMIT_BYTES)
+      expect(Buffer.byteLength(body)).toBe(REQUEST_BODY_LIMIT_BYTES)
+
+      const res = await request(app.getHttpServer())
+        .post('/body-size/echo')
+        .set('Content-Type', 'application/x-www-form-urlencoded')
+        .send(body)
+        .expect(200)
+      expect(res.body).toEqual({ ok: true })
+    })
+
+    it('rejects a urlencoded body one byte over the limit with 413', async () => {
+      const body = urlencodedBodyOfSize(REQUEST_BODY_LIMIT_BYTES + 1)
+      expect(Buffer.byteLength(body)).toBe(REQUEST_BODY_LIMIT_BYTES + 1)
+
+      const res = await request(app.getHttpServer())
+        .post('/body-size/echo')
+        .set('Content-Type', 'application/x-www-form-urlencoded')
+        .send(body)
+        .expect(413)
+      expect(res.body.errorCode).toBe('PAYLOAD_TOO_LARGE')
+    })
+  })
+
+  describe('signed webhook (raw body)', () => {
+    it('accepts a signed body exactly at the limit (raw bytes preserved)', async () => {
+      const payload = jsonBodyOfSize(REQUEST_BODY_LIMIT_BYTES, { id: 'evt_at_limit' })
+      expect(Buffer.byteLength(payload)).toBe(REQUEST_BODY_LIMIT_BYTES)
+      const timestamp = Math.floor(Date.now() / 1000)
+
+      const res = await request(app.getHttpServer())
+        .post('/body-size/webhooks/stripe')
+        .set('Content-Type', 'application/json')
+        .set('Stripe-Signature', stripeSignature(payload, timestamp, secret))
+        .send(payload)
+        .expect(200)
+      expect(res.body).toEqual({ ok: true, id: 'evt_at_limit' })
+    })
+
+    it('rejects an over-limit body with 413 before signature verification', async () => {
+      const payload = jsonBodyOfSize(REQUEST_BODY_LIMIT_BYTES + 1, { id: 'evt_over_limit' })
+      expect(Buffer.byteLength(payload)).toBe(REQUEST_BODY_LIMIT_BYTES + 1)
+      const timestamp = Math.floor(Date.now() / 1000)
+
+      const res = await request(app.getHttpServer())
+        .post('/body-size/webhooks/stripe')
+        .set('Content-Type', 'application/json')
+        .set('Stripe-Signature', stripeSignature(payload, timestamp, secret))
+        .send(payload)
+        .expect(413)
+      expect(res.body.errorCode).toBe('PAYLOAD_TOO_LARGE')
+    })
+  })
+})
+
+/**
+ * Build a JSON document whose serialized form is exactly `totalBytes` long by
+ * padding a single ASCII field. ASCII keeps one char == one byte, so the byte
+ * length is deterministic for the boundary assertions.
+ */
+function jsonBodyOfSize(totalBytes: number, seed: Record<string, unknown> = {}): string {
+  const base = JSON.stringify({ ...seed, padding: '' })
+  const padLength = totalBytes - Buffer.byteLength(base)
+  if (padLength < 0) throw new Error(`seed already exceeds ${totalBytes} bytes`)
+  return JSON.stringify({ ...seed, padding: 'a'.repeat(padLength) })
+}
+
+/** Build a urlencoded body (`padding=aaa…`) of exactly `totalBytes` ASCII bytes. */
+function urlencodedBodyOfSize(totalBytes: number): string {
+  const prefix = 'padding='
+  const padLength = totalBytes - prefix.length
+  if (padLength < 0) throw new Error(`prefix already exceeds ${totalBytes} bytes`)
+  return prefix + 'a'.repeat(padLength)
+}
+
+function stripeSignature(payload: string, timestamp: number, secret: string): string {
+  const digest = createHmac('sha256', secret).update(`${timestamp}.${payload}`).digest('hex')
+  return `t=${timestamp},v1=${digest}`
+}

@@ -1,0 +1,160 @@
+import { type NextRequest, NextResponse } from 'next/server'
+import createMiddleware from 'next-intl/middleware'
+import { LOCALE_CATALOGUES, SERVED_LOCALES } from '@amcore/shared'
+
+import { ADMIN_CONSOLE_CONFIG } from '@/shared/lib/admin-console-topology'
+import { buildCspDirectives } from '@/shared/lib/csp/build-csp'
+import {
+  CSP_ENFORCE_HEADER,
+  CSP_REPORT_ENDPOINT_PATH,
+  CSP_REPORT_ONLY_HEADER,
+  CSP_REPORTING_GROUP_NAME,
+  NONCE_REQUEST_HEADER,
+} from '@/shared/lib/csp/constants'
+import { getCspMode } from '@/shared/lib/csp/csp-mode'
+import { generateNonce } from '@/shared/lib/csp/generate-nonce'
+import { getPublicFilesOrigin } from '@/shared/lib/csp/public-files-origin'
+import { applyIndexingPolicy } from '@/shared/lib/seo/indexing'
+
+import { routing } from './i18n/routing'
+
+const handleI18nRouting = createMiddleware(routing)
+
+/**
+ * Locale step of the proxy. With several served locales it is next-intl's middleware.
+ * With one it is a plain pass-through: the locale is added by the `beforeFiles` rewrite
+ * in `next.config.ts`, and next-intl's own rewrite must not run (Next's standalone server
+ * does not apply a proxy rewrite, see `routing.ts`). A prefix of a catalogue locale that
+ * this build does not serve is refused here, explicitly, before any page runs. The proxy
+ * sees the public path (a rewrite later adds the locale), and the CSP, nonce and indexing
+ * work below runs for both branches.
+ */
+const DISABLED_LOCALES: readonly string[] = LOCALE_CATALOGUES.filter(
+  (locale) => !SERVED_LOCALES.includes(locale)
+)
+
+/**
+ * Second layer of the "Console off" refusal (the first is the guard inside every Console
+ * page and route). With the Console disabled, its public pages (`/<alias>`, with or without a
+ * locale prefix) answer 404 here, before any rendering starts. The proxy matcher excludes
+ * `/api`, so the BFF (`/api/console`) is closed only by the route guard
+ * (`withConsoleHostGuard`); the inventory test proves every route has it.
+ */
+function isClosedConsolePath(segments: readonly string[]): boolean {
+  if (ADMIN_CONSOLE_CONFIG.enabled) return false
+  const [first = '', second = ''] = segments
+  const page = (LOCALE_CATALOGUES as readonly string[]).includes(first) ? second : first
+  return page === ADMIN_CONSOLE_CONFIG.alias
+}
+
+function routeLocale(request: NextRequest) {
+  const segments = request.nextUrl.pathname.split('/').slice(1)
+  const firstSegment = segments[0] ?? ''
+  if (DISABLED_LOCALES.includes(firstSegment) || isClosedConsolePath(segments)) {
+    return new NextResponse(null, { status: 404 })
+  }
+  if (SERVED_LOCALES.length > 1) return handleI18nRouting(request)
+  return NextResponse.next({ request: { headers: request.headers } })
+}
+
+/**
+ * Track 3 PR2 (`ai/models-talk.md` FINAL PLAN §3) — generates a per-request
+ * CSP nonce and composes it with next-intl's locale routing.
+ *
+ * Mutates `request.headers` **in place** rather than constructing a new
+ * `Headers`/`NextRequest` (the shape the installed Next docs' own example
+ * uses, and an earlier version of this file matched literally) — deliberate,
+ * found by a real regression, not a style preference. `request.headers` is
+ * genuinely mutable here, and constructing a fresh `NextRequest` broke
+ * `next/experimental/testmode/playwright/msw` (`e2e/server-mocked/oauth-visibility.spec.ts`
+ * started failing to intercept `apps/api` fetches once mounted through this
+ * proxy): that fixture correlates test-mode state
+ * (`apps/web/node_modules/next/dist/experimental/testmode/context.js`, keyed
+ * off `next-test-proxy-port`/`next-test-data` request headers) to a specific
+ * request identity, and a brand-new `NextRequest` object — despite carrying
+ * the same headers — broke that correlation even though header *values*
+ * were preserved. Passing the original, mutated `request` straight through
+ * fixed it, confirmed by reverting to the new-object form and reproducing
+ * the failure. No test-mode-only branch was added: the same code path runs
+ * in dev, production, and this test lane.
+ *
+ * Composition with next-intl, verified against the installed next-intl
+ * 4.14.1 source (`dist/esm/production/middleware/middleware.js`): its
+ * pass-through/rewrite cases clone `request.headers` themselves
+ * (`new Headers(t.headers)`) and forward that clone via
+ * `NextResponse.next({ request: { headers } })` /
+ * `.rewrite(dest, { request: { headers } })` — Next's own documented
+ * mechanism for making proxy-added request headers visible to the renderer
+ * (`apps/web/node_modules/next/dist/server/web/spec-extension/response.js`:
+ * `handleMiddlewareField`). So mutating the headers on the *same* request
+ * object before handing it to next-intl is sufficient — anything added
+ * rides along automatically into whatever next-intl renders. Its
+ * locale-prefix redirects (`NextResponse.redirect(...)`) never forward
+ * request headers at all (no render happens for a 3xx) — nothing to nonce
+ * there, but the response still gets the CSP header below for
+ * completeness/observability.
+ *
+ * Framework constraint this exists to satisfy (`ai/models-talk.md` §3):
+ * Next reads the nonce from the *request's* `Content-Security-Policy` /
+ * `-Report-Only` header, not the response — a response-only CSP would
+ * silently leave Next's own inline Flight-payload script unnoned and
+ * self-block under enforcement.
+ *
+ * **Both possible header names must be cleared before setting the active
+ * one**, not just overwritten by name. Next's nonce extraction
+ * (`app-render.js`) prefers `content-security-policy` over
+ * `content-security-policy-report-only` if *both* are present. This proxy
+ * only ever sets one of the two (`cspHeaderName`, chosen by `getCspMode()`)
+ * — `.set()` on the *other* name is a no-op, so an inbound request that
+ * already carries the header AMCore isn't currently using (e.g. a stray or
+ * spoofed `Content-Security-Policy` while shipping `-Report-Only`) would
+ * survive untouched and win the framework's own preference order, handing
+ * Next's internal scripts a nonce this server never generated. Found by
+ * Agent 2's diff review (`ai/models-talk.md`), reproduced with a single
+ * `curl -H "Content-Security-Policy: script-src 'nonce-attacker'"` against
+ * `next dev` before this fix, confirmed absent after — see
+ * `csp-nonce.spec.ts`'s hostile-inbound-header regression test.
+ */
+export default function proxy(request: NextRequest) {
+  const nonce = generateNonce()
+  const isDev = process.env.NODE_ENV === 'development'
+  const mode = getCspMode()
+  const cspHeaderName = mode === 'enforce' ? CSP_ENFORCE_HEADER : CSP_REPORT_ONLY_HEADER
+  const cspHeaderValue = buildCspDirectives({ nonce, isDev, imageOrigin: getPublicFilesOrigin() })
+
+  request.headers.delete(CSP_ENFORCE_HEADER)
+  request.headers.delete(CSP_REPORT_ONLY_HEADER)
+  request.headers.set(NONCE_REQUEST_HEADER, nonce)
+  request.headers.set(cspHeaderName, cspHeaderValue)
+
+  const response = routeLocale(request)
+
+  response.headers.set(cspHeaderName, cspHeaderValue)
+  // Maps the CSP's `report-to` group name to an actual URL (must be
+  // absolute per the Reporting API spec, unlike `report-uri`, which
+  // accepts the plain relative path already baked into the CSP directive).
+  response.headers.set(
+    'Reporting-Endpoints',
+    `${CSP_REPORTING_GROUP_NAME}="${request.nextUrl.origin}${CSP_REPORT_ENDPOINT_PATH}"`
+  )
+  // Adds `X-Robots-Tag: noindex` unless this request is on the configured site host with
+  // indexing enabled; it never removes a header (docs/frontend/seo.md).
+  applyIndexingPolicy(request, response)
+
+  return response
+}
+
+export const config = {
+  // Match every pathname except the ones that must never be locale-prefixed:
+  // Next.js internals, the API proxy rewrite, and any path with a file
+  // extension (static assets, `manifest.webmanifest`, `sw.js`, icons).
+  // Rewriting those would break asset URLs and the service worker scope.
+  //
+  // Do NOT narrow this to exclude a route group that wants a relaxed CSP
+  // (docs/frontend/browser-security-and-csp.md § "Downstream forks") — this
+  // matcher also gates next-intl's own locale routing, not just the CSP
+  // logic above. Excluding a path here breaks its locale detection/redirects
+  // entirely; it does not give it a relaxed policy. Verified live while
+  // writing that doc section. Branch inside `proxy()` itself instead.
+  matcher: ['/((?!api|_next|_vercel|.*\\..*).*)'],
+}

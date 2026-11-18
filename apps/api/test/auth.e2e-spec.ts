@@ -1,0 +1,1498 @@
+import { jest } from '@jest/globals'
+import type { INestApplication } from '@nestjs/common'
+import { JwtService } from '@nestjs/jwt'
+import type { Response } from 'supertest'
+import request from 'supertest'
+
+import { AuthErrorCode } from '@amcore/shared'
+
+import { ServiceUnavailableException } from '../src/common/exceptions'
+import { resolveTrustedWebPeers } from '../src/common/utils/trusted-web-peer'
+import { LoginRateLimiterService } from '../src/core/auth/login-rate-limiter.service'
+import { mfaCredential } from '../src/core/auth/mfa/mfa-secrets.js'
+import { SessionService } from '../src/core/auth/session.service'
+import { TokenService } from '../src/core/auth/token.service'
+import { TokenManagerService } from '../src/core/auth/token-manager.service'
+import { EnvService } from '../src/env/env.service'
+import type { PrismaService } from '../src/prisma'
+
+import { readEnvelope, seedEnvelope } from './fixtures/counter-envelope'
+import {
+  cleanDatabase,
+  cleanOrgData,
+  type E2ETestContext,
+  seedSystemRoles,
+  setupE2ETest,
+  teardownE2ETest,
+} from './helpers'
+
+/**
+ * Extract refresh token from response cookies
+ */
+function extractRefreshToken(response: Response): string {
+  const cookies = response.headers['set-cookie'] as unknown as string[]
+  const refreshCookie = cookies.find((c) => c.startsWith('refresh_token='))!
+  return refreshCookie.split(';')[0]!.split('=')[1]!
+}
+
+/**
+ * Check if response has refresh token cookie
+ */
+function hasRefreshTokenCookie(response: Response): boolean {
+  const cookies = response.headers['set-cookie'] as unknown as string[]
+  return cookies ? cookies.some((c) => c.startsWith('refresh_token=')) : false
+}
+
+function decodeJwtPayload(token: string): Record<string, unknown> {
+  const payload = token.split('.')[1]
+  if (!payload) throw new Error('Invalid JWT')
+  return JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as Record<string, unknown>
+}
+
+const TRUSTED_ORIGIN = process.env.CORS_ORIGIN?.split(',')[0]?.trim() ?? 'http://localhost:3002'
+const FOREIGN_ORIGIN = 'https://evil.example'
+
+describe('Auth (e2e)', () => {
+  let app: INestApplication
+  let prisma: PrismaService
+  let context: E2ETestContext
+
+  beforeAll(async () => {
+    // Ensure environment variables are set early
+    if (!process.env.REDIS_URL) {
+      process.env.REDIS_URL = 'redis://localhost:6379' // fallback
+    }
+
+    context = await setupE2ETest()
+    app = context.app
+    prisma = context.prisma
+    // Required for AK-01 sessions block which creates an organization
+    // (POST /organizations assigns the creator as ADMIN via system roles).
+    // Idempotent — safe even though most tests in this file don't need it.
+    await seedSystemRoles(prisma)
+  }, 120000) // 2 min timeout for container start
+
+  afterAll(async () => {
+    await teardownE2ETest(context)
+  }, 120000)
+
+  beforeEach(async () => {
+    // Clean org-scoped data first (respects FK order; see helpers.ts).
+    await cleanOrgData(prisma)
+    await cleanDatabase(prisma, context.cache, context.throttlerStorage)
+  })
+
+  it('rejects opaque MFA continuations as ordinary bearer and refresh credentials', async () => {
+    const continuation = mfaCredential()
+    await request(app.getHttpServer())
+      .get('/auth/me')
+      .set('Authorization', `Bearer ${continuation}`)
+      .expect(401)
+    await request(app.getHttpServer())
+      .post('/auth/refresh')
+      .set('Cookie', `refresh_token=${continuation}`)
+      .expect(401)
+  })
+
+  describe('password limiter HTTP boundary', () => {
+    afterEach(() => jest.restoreAllMocks())
+    it('uses a peer-verified visitor key and preserves aggregate debt on successful login', async () => {
+      const env = app.get(EnvService)
+      const get = env.get.bind(env)
+      jest
+        .spyOn(env, 'get')
+        .mockImplementation((key) =>
+          key === 'TRUSTED_WEB_PEERS' ? (resolveTrustedWebPeers('loopback') as never) : get(key)
+        )
+      await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email: 'relay@e2e.amcore.test', password: 'StrongP@ss123' })
+        .expect(201)
+      const visitor = '203.0.113.75'
+      const key = `rate:login_ip:${visitor}`
+      await seedEnvelope(context.cache.connection, key, 99, 100000)
+      await request(app.getHttpServer())
+        .post('/auth/login')
+        .set('x-amcore-client-ip', visitor)
+        .send({ email: 'relay@e2e.amcore.test', password: 'StrongP@ss123' })
+        .expect(200)
+      expect(await readEnvelope(context.cache.connection, key)).toBe(99)
+      await request(app.getHttpServer())
+        .post('/auth/login')
+        .set('x-amcore-client-ip', visitor)
+        .send({ email: 'relay@e2e.amcore.test', password: 'WrongP@ss123' })
+        .expect(401)
+      expect(await readEnvelope(context.cache.connection, key)).toBe(100)
+      await request(app.getHttpServer())
+        .post('/auth/login')
+        .set('x-amcore-client-ip', visitor)
+        .send({ email: 'relay@e2e.amcore.test', password: 'StrongP@ss123' })
+        .expect(429)
+    })
+    it.each(['check', 'consume', 'reset'] as const)(
+      '%s failure issues neither login credentials nor step-up refresh',
+      async (mode) => {
+        const registered = await request(app.getHttpServer())
+          .post('/auth/register')
+          .send({ email: 'unavailable@e2e.amcore.test', password: 'StrongP@ss123' })
+          .expect(201)
+        const limiter = app.get(LoginRateLimiterService)
+        jest
+          .spyOn(limiter, mode)
+          .mockRejectedValue(
+            new ServiceUnavailableException('Login protection temporarily unavailable')
+          )
+        const sessions = await prisma.session.count()
+        const password = mode === 'consume' ? 'WrongP@ss123' : 'StrongP@ss123'
+        const response = await request(app.getHttpServer())
+          .post('/auth/login')
+          .send({ email: 'unavailable@e2e.amcore.test', password })
+          .expect(503)
+        expect(response.body.errorCode).toBe('SERVICE_UNAVAILABLE')
+        expect(hasRefreshTokenCookie(response)).toBe(false)
+        expect(response.body.accessToken).toBeUndefined()
+        expect(await prisma.session.count()).toBe(sessions)
+        const step = await request(app.getHttpServer())
+          .post('/auth/step-up')
+          .set('Authorization', `Bearer ${registered.body.accessToken}`)
+          .send({ password })
+          .expect(503)
+        expect(step.body.accessToken).toBeUndefined()
+      }
+    )
+  })
+
+  describe('POST /auth/register', () => {
+    it('should register new user with valid data', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({
+          email: 'newuser@example.com',
+          password: 'StrongP@ss123',
+          name: 'New User',
+        })
+        .expect(201)
+
+      expect(response.body).toMatchObject({
+        user: {
+          email: 'newuser@example.com',
+          name: 'New User',
+          emailVerified: false,
+        },
+        accessToken: expect.any(String),
+      })
+
+      // Check refresh_token cookie is set
+      expect(hasRefreshTokenCookie(response)).toBe(true)
+
+      // Verify user exists in database
+      const user = await prisma.user.findUnique({
+        where: { emailCanonical: 'newuser@example.com' },
+      })
+      expect(user).toBeDefined()
+      expect(user?.name).toBe('New User')
+    })
+
+    it('should register user without name', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({
+          email: 'noname@example.com',
+          password: 'StrongP@ss123',
+        })
+        .expect(201)
+
+      expect(response.body.user.name).toBeNull()
+    })
+
+    it('should return 409 if user already exists', async () => {
+      const registerData = {
+        email: 'duplicate@example.com',
+        password: 'StrongP@ss123',
+      }
+
+      // First registration
+      await request(app.getHttpServer()).post('/auth/register').send(registerData).expect(201)
+
+      // Duplicate registration
+      const response = await request(app.getHttpServer())
+        .post('/auth/register')
+        .send(registerData)
+        .expect(409)
+
+      expect(response.body.message).toBeDefined()
+    })
+
+    it('should return 409 for duplicate email with different casing', async () => {
+      await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email: 'CaseUser@Example.COM', password: 'StrongP@ss123' })
+        .expect(201)
+
+      await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email: 'caseuser@example.com', password: 'StrongP@ss123' })
+        .expect(409)
+    })
+
+    it('should trim email input while preserving display casing', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email: '  Trimmed@Example.COM  ', password: 'StrongP@ss123' })
+        .expect(201)
+
+      expect(response.body.user.email).toBe('Trimmed@Example.COM')
+
+      const user = await prisma.user.findUnique({
+        where: { emailCanonical: 'trimmed@example.com' },
+      })
+      expect(user?.email).toBe('Trimmed@Example.COM')
+    })
+
+    it('should return 400 for whitespace-only email', async () => {
+      await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email: '   ', password: 'StrongP@ss123' })
+        .expect(400)
+    })
+
+    it('should return 400 for invalid email', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({
+          email: 'invalid-email',
+          password: 'StrongP@ss123',
+        })
+        .expect(400)
+
+      expect(response.body.message).toBeDefined()
+    })
+
+    it('should return 400 for weak password', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({
+          email: 'test@example.com',
+          password: 'weak',
+        })
+        .expect(400)
+
+      expect(response.body.message).toBeDefined()
+    })
+
+    it('should create session in database', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({
+          email: 'session@example.com',
+          password: 'StrongP@ss123',
+        })
+        .expect(201)
+
+      expect(response.body.user).toBeDefined()
+
+      const sessions = await prisma.session.findMany()
+      expect(sessions).toHaveLength(1)
+      expect(sessions[0]!.userAgent).toBeDefined()
+    })
+
+    it('seeds locale from Accept-Language when no explicit locale is given', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/register')
+        .set('Accept-Language', 'en-US,en;q=0.9')
+        .send({ email: 'enheader@example.com', password: 'StrongP@ss123' })
+        .expect(201)
+
+      expect(response.body.user.locale).toBe('en')
+    })
+
+    it('prefers an explicit body locale over Accept-Language', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/register')
+        .set('Accept-Language', 'en-US,en;q=0.9')
+        .send({ email: 'bodyru@example.com', password: 'StrongP@ss123', locale: 'ru' })
+        .expect(201)
+
+      expect(response.body.user.locale).toBe('ru')
+    })
+
+    it('falls back to the DB default for an unsupported Accept-Language', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/register')
+        .set('Accept-Language', 'de-DE,de;q=0.9')
+        .send({ email: 'deheader@example.com', password: 'StrongP@ss123' })
+        .expect(201)
+
+      expect(response.body.user.locale).toBe('en')
+    })
+
+    it('returns 400 for an unsupported body locale', async () => {
+      await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email: 'badlocale@example.com', password: 'StrongP@ss123', locale: 'de' })
+        .expect(400)
+    })
+  })
+
+  describe('POST /auth/register commit boundary', () => {
+    const password = 'StrongP@ss123'
+    const counts = async (emailCanonical: string) => ({
+      users: await prisma.user.count({ where: { emailCanonical } }),
+      sessions: await prisma.session.count(),
+      tokens: await prisma.emailVerificationToken.count(),
+    })
+
+    afterEach(() => jest.restoreAllMocks())
+
+    it('commits the user, one session and one verification token together', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email: 'commit@example.com', password })
+        .expect(201)
+
+      expect(await counts('commit@example.com')).toEqual({ users: 1, sessions: 1, tokens: 1 })
+      await request(app.getHttpServer())
+        .get('/auth/me')
+        .set('Authorization', `Bearer ${response.body.accessToken}`)
+        .expect(200)
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .set('Cookie', `refresh_token=${extractRefreshToken(response)}`)
+        .expect(200)
+    })
+
+    it.each([
+      ['session creation', 'sessions'],
+      ['verification token issuance', 'tokens'],
+      ['access token signing', 'signing'],
+    ] as const)('leaves nothing behind when %s fails', async (_label, stage) => {
+      const failure = new Error(`${stage} failed`)
+      if (stage === 'sessions')
+        jest
+          .spyOn(app.get(SessionService), 'createSession')
+          .mockImplementationOnce(() => Promise.reject(failure))
+      else if (stage === 'tokens')
+        jest
+          .spyOn(app.get(TokenManagerService), 'generateEmailVerificationToken')
+          .mockImplementationOnce(() => Promise.reject(failure))
+      else
+        jest.spyOn(app.get(TokenService), 'generateAccessToken').mockImplementationOnce(() => {
+          throw failure
+        })
+      const before = await counts('rollback@example.com')
+
+      await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email: 'rollback@example.com', password })
+        .expect(500)
+
+      expect(await counts('rollback@example.com')).toEqual(before)
+      jest.restoreAllMocks()
+      // The same email is still free: the failed attempt left no partial account behind.
+      await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email: 'rollback@example.com', password })
+        .expect(201)
+    })
+
+    it('creates exactly one account when the same canonical email is submitted concurrently', async () => {
+      const responses = await Promise.all(
+        ['Race@Example.com', 'race@example.com', ' RACE@example.com', 'race@example.com'].map(
+          (email) =>
+            request(app.getHttpServer())
+              .post('/auth/register')
+              .send({ email: email.trim(), password })
+        )
+      )
+
+      const statuses = responses.map((response) => response.status).sort()
+      expect(statuses.filter((status) => status === 201)).toHaveLength(1)
+      for (const response of responses.filter((r) => r.status !== 201)) {
+        expect(response.status).toBe(409)
+        expect(response.body.errorCode).toBe(AuthErrorCode.EMAIL_ALREADY_EXISTS)
+      }
+      expect(await counts('race@example.com')).toEqual({ users: 1, sessions: 1, tokens: 1 })
+    })
+  })
+
+  describe('POST /auth/login', () => {
+    beforeEach(async () => {
+      // Create test user
+      await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({
+          email: 'login@example.com',
+          password: 'LoginP@ss123',
+          name: 'Login User',
+        })
+        .expect(201)
+    })
+
+    it('should login with valid credentials', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email: 'login@example.com',
+          password: 'LoginP@ss123',
+        })
+        .expect(200)
+
+      expect(response.body).toMatchObject({
+        user: {
+          email: 'login@example.com',
+          name: 'Login User',
+        },
+        accessToken: expect.any(String),
+      })
+
+      expect(hasRefreshTokenCookie(response)).toBe(true)
+    })
+
+    it('should login with different email casing and keep display email in JWT', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email: 'LOGIN@EXAMPLE.COM',
+          password: 'LoginP@ss123',
+        })
+        .expect(200)
+
+      expect(response.body.user.email).toBe('login@example.com')
+      expect(decodeJwtPayload(response.body.accessToken).email).toBe('login@example.com')
+    })
+
+    it('should return 401 for wrong password', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email: 'login@example.com',
+          password: 'WrongPassword123',
+        })
+        .expect(401)
+
+      expect(response.body.message).toBeDefined()
+    })
+
+    it('should return 401 for non-existent user', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email: 'nonexistent@example.com',
+          password: 'Password123',
+        })
+        .expect(401)
+
+      expect(response.body.message).toBeDefined()
+    })
+
+    it('should update lastLoginAt timestamp', async () => {
+      const userBefore = await prisma.user.findUnique({
+        where: { emailCanonical: 'login@example.com' },
+      })
+      const lastLoginBefore = userBefore!.lastLoginAt
+
+      // Wait a bit to ensure timestamp difference
+      await new Promise((resolve) => setTimeout(resolve, 100))
+
+      await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({
+          email: 'login@example.com',
+          password: 'LoginP@ss123',
+        })
+        .expect(200)
+
+      const userAfter = await prisma.user.findUnique({
+        where: { emailCanonical: 'login@example.com' },
+      })
+
+      expect(userAfter!.lastLoginAt!.getTime()).toBeGreaterThan(lastLoginBefore!.getTime())
+    })
+  })
+
+  describe('POST /auth/logout', () => {
+    let refreshToken: string
+
+    beforeEach(async () => {
+      // Register and get refresh token
+      const response = await request(app.getHttpServer()).post('/auth/register').send({
+        email: 'logout@example.com',
+        password: 'LogoutP@ss123',
+      })
+
+      refreshToken = extractRefreshToken(response)
+    })
+
+    it('should logout and clear cookie', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/logout')
+        .set('Cookie', `refresh_token=${refreshToken}`)
+        .expect(204)
+
+      // Check cookie is cleared
+      const cookies = response.headers['set-cookie'] as unknown as string[]
+      expect(cookies.some((c) => c.includes('refresh_token=;'))).toBe(true)
+    })
+
+    it('should delete session from database', async () => {
+      await request(app.getHttpServer())
+        .post('/auth/logout')
+        .set('Cookie', `refresh_token=${refreshToken}`)
+        .expect(204)
+
+      const sessions = await prisma.session.findMany()
+      expect(sessions).toHaveLength(0)
+    })
+
+    it('should return 204 even without refresh token', async () => {
+      await request(app.getHttpServer()).post('/auth/logout').expect(204)
+
+      // Session not deleted — no token to match
+      const sessions = await prisma.session.findMany()
+      expect(sessions).toHaveLength(1)
+    })
+
+    it('should reject logout from a foreign Origin', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/logout')
+        .set('Origin', FOREIGN_ORIGIN)
+        .set('Cookie', `refresh_token=${refreshToken}`)
+        .expect(403)
+
+      expect(response.body.errorCode).toBe(AuthErrorCode.AUTH_ORIGIN_REJECTED)
+    })
+
+    it('should allow logout from a trusted Origin', async () => {
+      await request(app.getHttpServer())
+        .post('/auth/logout')
+        .set('Origin', TRUSTED_ORIGIN)
+        .set('Cookie', `refresh_token=${refreshToken}`)
+        .expect(204)
+    })
+  })
+
+  describe('POST /auth/refresh', () => {
+    let agent: ReturnType<typeof request.agent>
+    let refreshToken: string
+
+    beforeEach(async () => {
+      // Create agent to persist cookies between requests
+      agent = request.agent(app.getHttpServer())
+
+      const response = await agent.post('/auth/register').send({
+        email: 'refresh@example.com',
+        password: 'RefreshP@ss123',
+      })
+
+      refreshToken = extractRefreshToken(response)
+    })
+
+    it('should refresh access token with valid refresh token', async () => {
+      // Agent automatically sends cookies from register request
+      const response = await agent.post('/auth/refresh').expect(200)
+
+      expect(response.body).toMatchObject({
+        accessToken: expect.any(String),
+      })
+
+      // Check new refresh token in cookie
+      const newRefreshToken = extractRefreshToken(response)
+      expect(newRefreshToken).toBeDefined()
+      expect(newRefreshToken).not.toBe(refreshToken) // Token rotated
+    })
+
+    it('should return 401 for invalid refresh token', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .set('Cookie', 'refresh_token=invalid-token')
+        .expect(401)
+
+      expect(response.body.message).toBeDefined()
+    })
+
+    it('should return 401 without refresh token', async () => {
+      const response = await request(app.getHttpServer()).post('/auth/refresh').expect(401)
+
+      expect(response.body.message).toBeDefined()
+    })
+
+    it('should rotate refresh token in database', async () => {
+      const sessionsBefore = await prisma.session.findMany()
+      const oldTokenHash = sessionsBefore[0]!.refreshToken
+
+      // Agent automatically sends cookies from register request
+      await agent.post('/auth/refresh').expect(200)
+
+      const sessionsAfter = await prisma.session.findMany()
+      expect(sessionsAfter).toHaveLength(2)
+
+      const activeSessions = sessionsAfter.filter((session) => session.revokedAt === null)
+      const revokedSessions = sessionsAfter.filter((session) => session.revokedAt !== null)
+
+      expect(activeSessions).toHaveLength(1)
+      expect(revokedSessions).toHaveLength(1)
+      expect(activeSessions[0]!.refreshToken).not.toBe(oldTokenHash)
+      expect(revokedSessions[0]!.refreshToken).toBe(oldTokenHash)
+      expect(revokedSessions[0]!.revocationReason).toBe('rotated')
+    })
+
+    it('should revoke the entire token family when an old rotated token is reused', async () => {
+      const firstRefresh = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .set('Cookie', `refresh_token=${refreshToken}`)
+        .expect(200)
+
+      const rotatedRefreshToken = extractRefreshToken(firstRefresh)
+
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .set('Cookie', `refresh_token=${refreshToken}`)
+        .expect(401)
+
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .set('Cookie', `refresh_token=${rotatedRefreshToken}`)
+        .expect(401)
+    })
+
+    it('should reject refresh from a foreign Origin', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .set('Origin', FOREIGN_ORIGIN)
+        .set('Cookie', `refresh_token=${refreshToken}`)
+        .expect(403)
+
+      expect(response.body.errorCode).toBe(AuthErrorCode.AUTH_ORIGIN_REJECTED)
+    })
+
+    it('should allow refresh from a trusted Origin', async () => {
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .set('Origin', TRUSTED_ORIGIN)
+        .set('Cookie', `refresh_token=${refreshToken}`)
+        .expect(200)
+    })
+  })
+
+  describe('GET /auth/me', () => {
+    let accessToken: string
+
+    beforeEach(async () => {
+      const response = await request(app.getHttpServer()).post('/auth/register').send({
+        email: 'me@example.com',
+        password: 'MeP@ss123',
+        name: 'Me User',
+      })
+
+      accessToken = response.body.accessToken
+    })
+
+    it('should return current user profile', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/auth/me')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(200)
+
+      expect(response.body.user).toMatchObject({
+        email: 'me@example.com',
+        name: 'Me User',
+        emailVerified: false,
+      })
+      expect(response.body.user.passwordHash).toBeUndefined()
+    })
+
+    it('should return 401 without access token', async () => {
+      const response = await request(app.getHttpServer()).get('/auth/me').expect(401)
+
+      expect(response.body.message).toBeDefined()
+    })
+
+    it('should return 401 with invalid access token', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/auth/me')
+        .set('Authorization', 'Bearer invalid-token')
+        .expect(401)
+
+      expect(response.body.message).toBeDefined()
+    })
+  })
+
+  describe('PATCH /auth/me', () => {
+    let accessToken: string
+
+    beforeEach(async () => {
+      const response = await request(app.getHttpServer()).post('/auth/register').send({
+        email: 'profile@example.com',
+        password: 'MeP@ss123',
+        name: 'Profile User',
+      })
+      accessToken = response.body.accessToken
+    })
+
+    it('updates name, locale, and timezone and persists them', async () => {
+      const response = await request(app.getHttpServer())
+        .patch('/auth/me')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .send({ name: 'Updated Name', locale: 'en', timezone: 'America/New_York' })
+        .expect(200)
+
+      expect(response.body.user).toMatchObject({
+        name: 'Updated Name',
+        locale: 'en',
+        timezone: 'America/New_York',
+      })
+
+      const user = await prisma.user.findUnique({
+        where: { emailCanonical: 'profile@example.com' },
+      })
+      expect(user).toMatchObject({
+        name: 'Updated Name',
+        locale: 'en',
+        timezone: 'America/New_York',
+      })
+    })
+
+    it('updates only the supplied field and leaves the rest untouched', async () => {
+      await request(app.getHttpServer())
+        .patch('/auth/me')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .send({ name: 'Only Name' })
+        .expect(200)
+
+      const user = await prisma.user.findUnique({
+        where: { emailCanonical: 'profile@example.com' },
+      })
+      expect(user?.name).toBe('Only Name')
+      expect(user?.locale).toBe('en') // default preserved
+      expect(user?.timezone).toBe('UTC') // default preserved
+    })
+
+    it('returns 400 for an unsupported locale', async () => {
+      await request(app.getHttpServer())
+        .patch('/auth/me')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .send({ locale: 'de' })
+        .expect(400)
+    })
+
+    it('returns 400 for an invalid IANA timezone', async () => {
+      await request(app.getHttpServer())
+        .patch('/auth/me')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .send({ timezone: 'Mars/Phobos' })
+        .expect(400)
+    })
+
+    it('returns 400 for a numeric UTC offset (named IANA zone required)', async () => {
+      await request(app.getHttpServer())
+        .patch('/auth/me')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .send({ timezone: '+01:00' })
+        .expect(400)
+    })
+
+    it('accepts UTC as a named zone', async () => {
+      const response = await request(app.getHttpServer())
+        .patch('/auth/me')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .send({ timezone: 'UTC' })
+        .expect(200)
+
+      expect(response.body.user.timezone).toBe('UTC')
+    })
+
+    it('returns 401 without an access token', async () => {
+      await request(app.getHttpServer()).patch('/auth/me').send({ name: 'X' }).expect(401)
+    })
+
+    // PATCH /auth/me is @Auth(Bearer) only — a valid API key (accepted by GET
+    // /auth/me) must not be able to mutate the profile.
+    it('rejects a valid API key (bearer-only route)', async () => {
+      const orgRes = await request(app.getHttpServer())
+        .post('/organizations')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .send({ name: 'Profile AK Org' })
+        .expect(201)
+
+      const keyRes = await request(app.getHttpServer())
+        .post('/api-keys')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .send({ name: 'Carrier', organizationId: orgRes.body.id, scopes: ['read:User'] })
+        .expect(201)
+      const apiKey = keyRes.body.key as string
+
+      await request(app.getHttpServer())
+        .patch('/auth/me')
+        .set('Authorization', `Bearer ${apiKey}`)
+        .send({ name: 'Should Not Apply' })
+        .expect(401)
+
+      const user = await prisma.user.findUnique({
+        where: { emailCanonical: 'profile@example.com' },
+      })
+      expect(user?.name).toBe('Profile User')
+    })
+
+    // Real HTTP round trip through the actual DI graph, not the mocked
+    // `NotificationsService` the unit tests use — proves the definition is
+    // registered and the payload really validates against its Zod schema,
+    // neither of which a mock would catch.
+    it('creates an account.profile_updated notification when a field actually changes', async () => {
+      await request(app.getHttpServer())
+        .patch('/auth/me')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .send({ name: 'Real Change' })
+        .expect(200)
+
+      const user = await prisma.user.findUnique({
+        where: { emailCanonical: 'profile@example.com' },
+      })
+      const created = await prisma.notification.findMany({
+        where: { recipientUserId: user!.id, type: 'account.profile_updated' },
+      })
+
+      expect(created).toHaveLength(1)
+      expect(created[0]).toMatchObject({ payload: { updatedFields: ['name'] } })
+    })
+
+    it('does not create a notification when the PATCH does not change anything', async () => {
+      // The user was just registered with this exact name — nothing actually changes.
+      await request(app.getHttpServer())
+        .patch('/auth/me')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .send({ name: 'Profile User' })
+        .expect(200)
+
+      const user = await prisma.user.findUnique({
+        where: { emailCanonical: 'profile@example.com' },
+      })
+      const created = await prisma.notification.findMany({
+        where: { recipientUserId: user!.id, type: 'account.profile_updated' },
+      })
+
+      expect(created).toHaveLength(0)
+    })
+  })
+
+  describe('GET /auth/sessions', () => {
+    let agent: ReturnType<typeof request.agent>
+    let accessToken: string
+
+    beforeEach(async () => {
+      agent = request.agent(app.getHttpServer())
+
+      const response = await agent.post('/auth/register').send({
+        email: 'sessions@example.com',
+        password: 'SessionsP@ss123',
+      })
+
+      accessToken = response.body.accessToken
+    })
+
+    it('returns all user sessions in paginated envelope (OB-05)', async () => {
+      const response = await agent
+        .get('/auth/sessions')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(200)
+
+      expect(response.body.data).toHaveLength(1)
+      expect(response.body.total).toBe(1)
+      expect(response.body.page).toBe(1)
+      expect(response.body.limit).toBe(20)
+      expect(response.body.data[0]).toMatchObject({
+        id: expect.any(String),
+        current: true,
+      })
+    })
+
+    it('marks current session correctly within envelope', async () => {
+      // Create second session via login (using new agent to simulate different device)
+      await request(app.getHttpServer()).post('/auth/login').send({
+        email: 'sessions@example.com',
+        password: 'SessionsP@ss123',
+      })
+
+      const response = await agent
+        .get('/auth/sessions')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(200)
+
+      expect(response.body.data).toHaveLength(2)
+      const currentSessions = response.body.data.filter((s: { current: boolean }) => s.current)
+      expect(currentSessions).toHaveLength(1)
+    })
+  })
+
+  describe('DELETE /auth/sessions/:sessionId', () => {
+    let accessToken: string
+    let sessionId: string
+
+    beforeEach(async () => {
+      const response = await request(app.getHttpServer()).post('/auth/register').send({
+        email: 'delete@example.com',
+        password: 'DeleteP@ss123',
+      })
+
+      accessToken = response.body.accessToken
+
+      const sessions = await prisma.session.findMany()
+      sessionId = sessions[0]!.id
+    })
+
+    it('should delete specific session', async () => {
+      await request(app.getHttpServer())
+        .delete(`/auth/sessions/${sessionId}`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(204)
+
+      const sessions = await prisma.session.findMany()
+      expect(sessions).toHaveLength(0)
+    })
+
+    it('should return 404 for non-existent session', async () => {
+      const response = await request(app.getHttpServer())
+        .delete('/auth/sessions/nonexistent-id')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(404)
+
+      expect(response.body.message).toBeDefined()
+    })
+  })
+
+  describe('DELETE /auth/sessions', () => {
+    let agent: ReturnType<typeof request.agent>
+    let accessToken: string
+
+    beforeEach(async () => {
+      agent = request.agent(app.getHttpServer())
+
+      const registerResponse = await agent.post('/auth/register').send({
+        email: 'deleteall@example.com',
+        password: 'DeleteAllP@ss123',
+      })
+
+      accessToken = registerResponse.body.accessToken
+
+      // Create second session (using new agent to simulate different device)
+      await request(app.getHttpServer()).post('/auth/login').send({
+        email: 'deleteall@example.com',
+        password: 'DeleteAllP@ss123',
+      })
+    })
+
+    it('should delete all sessions except current', async () => {
+      await agent.delete('/auth/sessions').set('Authorization', `Bearer ${accessToken}`).expect(204)
+
+      const sessions = await prisma.session.findMany()
+      expect(sessions).toHaveLength(1) // Current session remains
+    })
+
+    it('should return 204 if no refresh token cookie', async () => {
+      await request(app.getHttpServer())
+        .delete('/auth/sessions')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(204)
+
+      // Both sessions remain — no current session to identify
+      const sessions = await prisma.session.findMany()
+      expect(sessions).toHaveLength(2)
+    })
+  })
+
+  /**
+   * AK-01: session-management routes are bearer-only.
+   *
+   * An API key must not be able to enumerate active sessions (recon surface)
+   * or revoke them (denial-of-service / eviction of legitimate user). The
+   * invariant is enforced by `@Auth(AuthType.Bearer)` on the three session
+   * routes in `AuthController`.
+   */
+  describe('AK-01: api keys cannot manage sessions', () => {
+    let apiKey: string
+    let sessionId: string
+
+    beforeEach(async () => {
+      const registerRes = await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email: 'session-ak@example.com', password: 'StrongP@ss123' })
+        .expect(201)
+
+      const accessToken = registerRes.body.accessToken as string
+
+      const created = await prisma.session.findMany({
+        where: { user: { email: 'session-ak@example.com' } },
+      })
+      sessionId = created[0]!.id
+
+      // Per ADR-033: API keys are organization-scoped. Bootstrap an org
+      // before creating the carrier key used by these AK-01 assertions.
+      const orgRes = await request(app.getHttpServer())
+        .post('/organizations')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .send({ name: 'Session AK Org' })
+        .expect(201)
+
+      const keyRes = await request(app.getHttpServer())
+        .post('/api-keys')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .send({ name: 'Carrier', organizationId: orgRes.body.id, scopes: ['read:User'] })
+        .expect(201)
+
+      apiKey = keyRes.body.key as string
+    })
+
+    it('rejects GET /auth/sessions with api key auth', async () => {
+      await request(app.getHttpServer())
+        .get('/auth/sessions')
+        .set('Authorization', `Bearer ${apiKey}`)
+        .expect(401)
+    })
+
+    it('rejects DELETE /auth/sessions/:sessionId with api key auth', async () => {
+      await request(app.getHttpServer())
+        .delete(`/auth/sessions/${sessionId}`)
+        .set('Authorization', `Bearer ${apiKey}`)
+        .expect(401)
+
+      // Session was not revoked
+      const stillThere = await prisma.session.findUnique({ where: { id: sessionId } })
+      expect(stillThere).not.toBeNull()
+      expect(stillThere?.revokedAt).toBeNull()
+    })
+
+    it('rejects DELETE /auth/sessions with api key auth', async () => {
+      await request(app.getHttpServer())
+        .delete('/auth/sessions')
+        .set('Authorization', `Bearer ${apiKey}`)
+        .expect(401)
+    })
+  })
+
+  describe('Full Authentication Flow', () => {
+    it('login refresh and step-up keep ordinary signed issuance lifetimes', async () => {
+      const credentials = { email: 'issuance@example.com', password: 'StrongP@ss123' }
+      await request(app.getHttpServer()).post('/auth/register').send(credentials).expect(201)
+      const login = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send(credentials)
+        .expect(200)
+      const refresh = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .set('Cookie', `refresh_token=${extractRefreshToken(login)}`)
+        .set('Origin', TRUSTED_ORIGIN)
+        .expect(200)
+      const stepUp = await request(app.getHttpServer())
+        .post('/auth/step-up')
+        .set('Authorization', `Bearer ${refresh.body.accessToken}`)
+        .send({ password: credentials.password })
+        .expect(200)
+      const jwt = app.get(JwtService)
+      for (const result of [login, refresh, stepUp]) {
+        const signed = jwt.verify(result.body.accessToken)
+        expect(signed.exp - signed.iat).toBe(900)
+        expect(signed.sid).toEqual(expect.any(String))
+      }
+    })
+
+    it('should complete: register → me → refresh → logout', async () => {
+      // Create agent to persist cookies throughout the flow
+      const agent = request.agent(app.getHttpServer())
+
+      // 1. Register (user is now authenticated)
+      const registerRes = await agent
+        .post('/auth/register')
+        .send({
+          email: 'flow@example.com',
+          password: 'FlowP@ss123',
+          name: 'Flow User',
+        })
+        .expect(201)
+
+      expect(registerRes.body.user.email).toBe('flow@example.com')
+      const accessToken = registerRes.body.accessToken
+
+      // 2. Get profile
+      const meRes = await request(app.getHttpServer())
+        .get('/auth/me')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(200)
+
+      expect(meRes.body.user.name).toBe('Flow User')
+
+      // 3. Refresh token (agent automatically sends cookie from register)
+      const refreshRes = await agent.post('/auth/refresh').expect(200)
+
+      expect(refreshRes.body.accessToken).toBeDefined()
+
+      // 4. Logout (agent automatically sends updated cookie from refresh)
+      await agent.post('/auth/logout').expect(204)
+
+      // Verify the current session is gone; rotated ancestors may remain for reuse detection
+      const sessions = await prisma.session.findMany()
+      expect(sessions.filter((session) => session.revokedAt === null)).toHaveLength(0)
+    })
+  })
+
+  describe('POST /auth/forgot-password', () => {
+    it('should return 200 with accepted message for non-existent email', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .send({ email: 'nonexistent@example.com' })
+        .expect(200)
+
+      expect(response.body.message).toContain('If an account')
+    })
+
+    it('should return same response for existing email (account enumeration prevention)', async () => {
+      await request(app.getHttpServer()).post('/auth/register').send({
+        email: 'forgotpw@example.com',
+        password: 'ForgotP@ss123',
+      })
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .send({ email: 'forgotpw@example.com' })
+        .expect(200)
+
+      expect(response.body.message).toContain('If an account')
+    })
+
+    it('should accept existing email with different casing', async () => {
+      await request(app.getHttpServer()).post('/auth/register').send({
+        email: 'ForgotCase@Example.COM',
+        password: 'ForgotP@ss123',
+      })
+
+      await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .send({ email: 'forgotcase@example.com' })
+        .expect(200)
+    })
+
+    it('should return 400 for invalid email format', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .send({ email: 'not-an-email' })
+        .expect(400)
+
+      expect(response.body.message).toBeDefined()
+    })
+  })
+
+  describe('POST /auth/reset-password', () => {
+    let tokenManager: TokenManagerService
+    let userId: string
+    const userEmail = 'resetpw@example.com'
+    const newPassword = 'NewP@ss456'
+
+    beforeEach(async () => {
+      tokenManager = app.get(TokenManagerService)
+
+      const response = await request(app.getHttpServer()).post('/auth/register').send({
+        email: userEmail,
+        password: 'OldP@ss123',
+      })
+
+      userId = response.body.user.id
+    })
+
+    it('should reset password and return 204', async () => {
+      const { token } = await tokenManager.generatePasswordResetToken(userId)
+
+      await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({ token, password: newPassword })
+        .expect(204)
+
+      // Verify can login with new password
+      const loginRes = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({ email: userEmail, password: newPassword })
+        .expect(200)
+
+      expect(loginRes.body.accessToken).toBeDefined()
+    })
+
+    it('should return 401 for invalid token', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({ token: 'i'.repeat(64), password: newPassword })
+        .expect(401)
+
+      expect(response.body.message).toBeDefined()
+    })
+
+    it('should invalidate all sessions after password reset', async () => {
+      const { token } = await tokenManager.generatePasswordResetToken(userId)
+
+      await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({ token, password: newPassword })
+        .expect(204)
+
+      const sessions = await prisma.session.findMany()
+      expect(sessions).toHaveLength(0)
+    })
+
+    it('consumes the reset token exactly once under concurrent use', async () => {
+      const { token } = await tokenManager.generatePasswordResetToken(userId)
+
+      // Fire two resets with the SAME token simultaneously. The atomic CAS consumption
+      // must let exactly one win (204) and reject the other (401) — proving single-use
+      // is enforced by the DB, not by the verify-then-update read window.
+      const results = await Promise.all([
+        request(app.getHttpServer())
+          .post('/auth/reset-password')
+          .send({ token, password: newPassword }),
+        request(app.getHttpServer())
+          .post('/auth/reset-password')
+          .send({ token, password: 'OtherP@ss789' }),
+      ])
+
+      const statuses = results.map((r) => r.status).sort()
+      expect(statuses).toEqual([204, 401])
+
+      // The token row is consumed once and a subsequent reuse is still rejected.
+      const reuse = await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({ token, password: 'ThirdP@ss000' })
+        .expect(401)
+      expect(reuse.body.message).toBeDefined()
+    })
+  })
+
+  describe('POST /auth/verify-email', () => {
+    let tokenManager: TokenManagerService
+    let userId: string
+    const userEmail = 'verifyemail@example.com'
+
+    beforeEach(async () => {
+      tokenManager = app.get(TokenManagerService)
+
+      const response = await request(app.getHttpServer()).post('/auth/register').send({
+        email: userEmail,
+        password: 'VerifyP@ss123',
+      })
+
+      userId = response.body.user.id
+    })
+
+    it('should verify email and return 204', async () => {
+      const { token } = await tokenManager.generateEmailVerificationToken(userId)
+
+      await request(app.getHttpServer()).post('/auth/verify-email').send({ token }).expect(204)
+
+      const user = await prisma.user.findUnique({ where: { id: userId } })
+      expect(user?.emailVerified).toBe(true)
+    })
+
+    it('should return 401 for invalid token', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/verify-email')
+        .send({ token: 'i'.repeat(64) })
+        .expect(401)
+
+      expect(response.body.message).toBeDefined()
+    })
+  })
+
+  describe('POST /auth/resend-verification', () => {
+    it('should return 200 with accepted message for any email', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/resend-verification')
+        .send({ email: 'nonexistent@example.com' })
+        .expect(200)
+
+      expect(response.body.message).toContain('If the account')
+    })
+
+    it('should return same message for already-verified user', async () => {
+      const tokenManager = app.get(TokenManagerService)
+
+      await request(app.getHttpServer()).post('/auth/register').send({
+        email: 'alreadyverified@example.com',
+        password: 'VerifiedP@ss123',
+      })
+
+      const user = await prisma.user.findUnique({
+        where: { emailCanonical: 'alreadyverified@example.com' },
+      })
+      const { token } = await tokenManager.generateEmailVerificationToken(user!.id)
+      await request(app.getHttpServer()).post('/auth/verify-email').send({ token }).expect(204)
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/resend-verification')
+        .send({ email: 'alreadyverified@example.com' })
+        .expect(200)
+
+      expect(response.body.message).toContain('If the account')
+    })
+
+    it('should accept verification resend email with different casing', async () => {
+      await request(app.getHttpServer()).post('/auth/register').send({
+        email: 'VerifyCase@Example.COM',
+        password: 'VerifiedP@ss123',
+      })
+
+      await request(app.getHttpServer())
+        .post('/auth/resend-verification')
+        .send({ email: 'verifycase@example.com' })
+        .expect(200)
+    })
+
+    it('should return 400 for invalid email format', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auth/resend-verification')
+        .send({ email: 'not-an-email' })
+        .expect(400)
+
+      expect(response.body.message).toBeDefined()
+    })
+  })
+
+  describe('Login brute-force protection', () => {
+    const password = 'BruteP@ss123'
+    const wrongPassword = 'WrongPassword123'
+
+    // Each test uses a unique email to avoid cross-test cache key collisions
+    // (per-email+IP keys are independent; per-IP counter accumulates but limit is 100)
+
+    it('should return 429 after 5 failed login attempts', async () => {
+      const email = 'brute-block@example.com'
+      await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email, password })
+        .expect(201)
+
+      for (let i = 0; i < 5; i++) {
+        await request(app.getHttpServer())
+          .post('/auth/login')
+          .send({ email, password: wrongPassword })
+          .expect(401)
+      }
+
+      const response = await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({ email, password: wrongPassword })
+        .expect(429)
+
+      expect(response.body.message).toContain('Too many failed login attempts')
+      expect(response.body.details?.retryAfterSeconds).toBe(900)
+    })
+
+    it('should reset counter after successful login', async () => {
+      const email = 'brute-reset@example.com'
+      await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email, password })
+        .expect(201)
+
+      // Fail 4 times — not yet blocked
+      for (let i = 0; i < 4; i++) {
+        await request(app.getHttpServer())
+          .post('/auth/login')
+          .send({ email, password: wrongPassword })
+          .expect(401)
+      }
+
+      // Login successfully — resets counter
+      await request(app.getHttpServer()).post('/auth/login').send({ email, password }).expect(200)
+
+      // Should get 401, not 429 — counter was reset
+      await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({ email, password: wrongPassword })
+        .expect(401)
+    })
+
+    it('should block even correct password after 5 failures', async () => {
+      const email = 'brute-correct@example.com'
+      await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email, password })
+        .expect(201)
+
+      // Trigger block with 5 failures
+      for (let i = 0; i < 5; i++) {
+        await request(app.getHttpServer())
+          .post('/auth/login')
+          .send({ email, password: wrongPassword })
+          .expect(401)
+      }
+
+      // check() runs before DB lookup — correct password is still blocked
+      await request(app.getHttpServer()).post('/auth/login').send({ email, password }).expect(429)
+    })
+
+    it('should share rate-limit counters across email casing variants', async () => {
+      const email = 'brute-canonical@example.com'
+      await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email, password })
+        .expect(201)
+
+      const variants = [
+        'BRUTE-CANONICAL@example.com',
+        'brute-canonical@EXAMPLE.COM',
+        'Brute-Canonical@example.com',
+        'brute-canonical@example.com',
+        'BRUTE-CANONICAL@EXAMPLE.COM',
+      ]
+
+      for (const variant of variants) {
+        await request(app.getHttpServer())
+          .post('/auth/login')
+          .send({ email: variant, password: wrongPassword })
+          .expect(401)
+      }
+
+      await request(app.getHttpServer()).post('/auth/login').send({ email, password }).expect(429)
+    })
+  })
+
+  describe('Full Password Reset Flow', () => {
+    it('should complete: register → forgot-password → reset-password → login with new password', async () => {
+      const email = 'fullreset@example.com'
+      const oldPassword = 'OldP@ss123'
+      const newPassword = 'NewP@ss456'
+
+      // 1. Register
+      const registerRes = await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email, password: oldPassword })
+        .expect(201)
+
+      const userId = registerRes.body.user.id
+
+      // 2. Request password reset (verifies silent-fail response)
+      const forgotRes = await request(app.getHttpServer())
+        .post('/auth/forgot-password')
+        .send({ email })
+        .expect(200)
+
+      expect(forgotRes.body.message).toContain('If an account')
+
+      // 3. Generate token (simulates token delivered via email)
+      const tokenManager = app.get(TokenManagerService)
+      const { token } = await tokenManager.generatePasswordResetToken(userId)
+
+      // 4. Reset password
+      await request(app.getHttpServer())
+        .post('/auth/reset-password')
+        .send({ token, password: newPassword })
+        .expect(204)
+
+      // 5. Old password no longer works
+      await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({ email, password: oldPassword })
+        .expect(401)
+
+      // 6. New password works
+      await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({ email, password: newPassword })
+        .expect(200)
+    })
+  })
+})

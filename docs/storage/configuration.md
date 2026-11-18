@@ -1,0 +1,387 @@
+# Storage Configuration
+
+Storage is configured entirely through environment variables and validated at
+startup.
+
+## Driver Selection
+
+| Environment     | Default driver | Why                                                            |
+| --------------- | -------------- | -------------------------------------------------------------- |
+| `production`    | `s3`           | Fails fast unless a real bucket and credentials are configured |
+| `test`          | `memory`       | Fast deterministic unit tests                                  |
+| everything else | `local`        | No cloud dependency during development                         |
+
+This table applies when `STORAGE_DRIVER` is **unset in the API environment**.
+The reference Docker Compose file supplies `local` by default, including when
+`NODE_ENV=production`. Set `STORAGE_DRIVER` explicitly for each production
+deployment: `local` for the shared persistent volume below, or `s3` with bucket
+credentials. Do not rely on the runtime-mode default to select storage in Compose.
+
+Override with:
+
+```env
+STORAGE_DRIVER=s3 # s3 | local | memory
+```
+
+## S3-Compatible Storage
+
+Required when `STORAGE_DRIVER=s3`:
+
+```env
+STORAGE_BUCKET=amcore-prod
+STORAGE_REGION=us-east-1
+STORAGE_ACCESS_KEY_ID=<access-key-id>
+STORAGE_SECRET_ACCESS_KEY=<secret-access-key>
+STORAGE_PUBLIC_BASE_URL=https://cdn.example.com
+```
+
+The application never guesses a public URL from the SDK endpoint or the bucket
+name, so `STORAGE_PUBLIC_BASE_URL` is required for `s3` and for every production
+deployment of the `local` driver. Boot fails with the variable name when it is
+missing.
+
+### Variable reference
+
+| Variable                                | Default            | Meaning                                                                                                                                                                                            |
+| --------------------------------------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `STORAGE_ENDPOINT`                      | empty (AWS)        | SDK endpoint. May be internal or private. Set it for every non-AWS provider.                                                                                                                       |
+| `STORAGE_PRESIGN_ENDPOINT`              | `STORAGE_ENDPOINT` | Browser-facing **S3 API origin** used only to sign URLs. A bare origin (`https://s3.example.com`); a path or query fails boot. Never a CDN.                                                        |
+| `STORAGE_REGION`                        | `us-east-1`        | Signing region. Providers define their own value (`auto`, `ru-central1`, `ru-1`, ...). See [providers](providers.md).                                                                              |
+| `STORAGE_BUCKET`                        | none, required     | Private bucket. Everything outside `public/` lives here.                                                                                                                                           |
+| `STORAGE_ACCESS_KEY_ID`                 | none, required     | Credentials for the application. Grant object read/write/delete (and list) on the buckets below.                                                                                                   |
+| `STORAGE_SECRET_ACCESS_KEY`             | none, required     |                                                                                                                                                                                                    |
+| `STORAGE_FORCE_PATH_STYLE`              | `false`            | Path-style addressing (`https://host/bucket/key`). Most providers accept virtual-hosted style; follow the provider page.                                                                           |
+| `STORAGE_PUBLIC_DELIVERY`               | `external`         | How `public/` objects become readable: `external`, `acl` or `api` (served by this API's public route). See [Public files](public-files.md).                                                        |
+| `STORAGE_PUBLIC_BUCKET`                 | `STORAGE_BUCKET`   | Bucket that holds `public/` keys. A separate bucket is the portable choice; the same bucket works when the provider can publish a prefix.                                                          |
+| `STORAGE_PUBLIC_BASE_URL`               | none, required     | URL of the **root of the public bucket** as a browser reaches it. The key is appended: `<base>/public/avatars/...`. For `api` mode and the local driver: the absolute URL of the API public route. |
+| `STORAGE_PUBLIC_CHECK_ENABLED`          | `true`             | The [public-delivery check](public-files.md#verify-the-setup) (s3 only). Must stay `true` when `STORAGE_PUBLIC_DELIVERY=acl`.                                                                      |
+| `STORAGE_PUBLIC_CHECK_INTERVAL_SECONDS` | `3600`             | Time between read-only checks, 300 to 86400 seconds. Environment only.                                                                                                                             |
+| `STORAGE_PUBLIC_CHECK_TIMEOUT_SECONDS`  | `10`               | Deadline of one check, 1 to 30 seconds.                                                                                                                                                            |
+
+Signed URL lifetimes and limits:
+
+```env
+STORAGE_SIGNED_URL_DEFAULT_TTL=3600
+STORAGE_SIGNED_URL_MAX_TTL=604800
+```
+
+`STORAGE_ENDPOINT` and `STORAGE_PRESIGN_ENDPOINT` talk to the S3 API.
+`STORAGE_PUBLIC_BASE_URL` is a different thing: a plain HTTP address that serves
+public objects without credentials, often a CDN or a provider public domain.
+Never put a CDN in `STORAGE_PRESIGN_ENDPOINT`: the SDK signs the host and the
+path, and a CDN host or path produces a URL that no server accepts.
+
+How the public URL is built:
+
+```text
+external / acl:   {STORAGE_PUBLIC_BASE_URL}/{key}              (every path segment percent-encoded)
+api / local driver: {STORAGE_PUBLIC_BASE_URL}?key={encoded key}   (the API public route)
+```
+
+Only keys under `public/` have a public URL; asking for the URL of any other key is an error.
+
+## Provider Examples
+
+These blocks show which variables each provider needs. They come from the
+providers' own documentation and were **not** run against the real services by
+the maintainers; see the evidence level on each [provider page](providers.md).
+Replace every `<...>` value. Making `public/` readable is a separate step on the
+provider side: follow [Public files](public-files.md).
+
+### AWS S3
+
+```env
+STORAGE_DRIVER=s3
+STORAGE_BUCKET=<private-bucket>
+STORAGE_PUBLIC_BUCKET=<public-bucket>
+STORAGE_REGION=us-east-1
+STORAGE_PUBLIC_BASE_URL=https://<distribution>.cloudfront.net
+```
+
+New AWS buckets disable ACLs and block public access, so the default `external`
+mode is the right one. Serve the public bucket through CloudFront with origin
+access control, or publish only the `public/*` prefix with a bucket policy.
+`STORAGE_PUBLIC_DELIVERY=acl` fails on a default bucket
+(`AccessControlListNotSupported`).
+
+### Cloudflare R2
+
+```env
+STORAGE_DRIVER=s3
+STORAGE_BUCKET=<private-bucket>
+STORAGE_PUBLIC_BUCKET=<public-bucket>
+STORAGE_REGION=auto
+STORAGE_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+STORAGE_PUBLIC_BASE_URL=https://assets.example.com
+```
+
+R2 has no object ACLs and publishes a whole bucket through a custom domain
+(`r2.dev` is rate-limited and meant for development). Use a separate public
+bucket and keep the default `external` mode. Presigned URLs work only on the
+`r2.cloudflarestorage.com` endpoint, never on a custom domain.
+
+### Backblaze B2
+
+```env
+STORAGE_DRIVER=s3
+STORAGE_BUCKET=<private-bucket>
+STORAGE_PUBLIC_BUCKET=<public-bucket>
+STORAGE_REGION=us-west-004
+STORAGE_ENDPOINT=https://s3.us-west-004.backblazeb2.com
+STORAGE_PUBLIC_BASE_URL=https://f<NNN>.backblazeb2.com/file/<public-bucket>
+```
+
+B2 publishes a whole bucket (set it to public) and supports ACLs only at the
+bucket level. Use a separate public bucket and the default `external` mode.
+
+### DigitalOcean Spaces
+
+```env
+STORAGE_DRIVER=s3
+STORAGE_BUCKET=<private-space>
+STORAGE_PUBLIC_BUCKET=<public-space>
+STORAGE_REGION=nyc3
+STORAGE_ENDPOINT=https://nyc3.digitaloceanspaces.com
+STORAGE_PUBLIC_BASE_URL=https://<public-space>.nyc3.cdn.digitaloceanspaces.com
+```
+
+### Yandex Object Storage
+
+```env
+STORAGE_DRIVER=s3
+STORAGE_BUCKET=<bucket>
+STORAGE_REGION=ru-central1
+STORAGE_ENDPOINT=https://storage.yandexcloud.net
+STORAGE_ACCESS_KEY_ID=<static key id of a service account>
+STORAGE_SECRET_ACCESS_KEY=<static key secret>
+STORAGE_PUBLIC_BASE_URL=https://<bucket>.storage.yandexcloud.net
+```
+
+One bucket with the `public/` prefix published is verified (2026-10-15). It needs the bucket
+public-read flag **and** a bucket policy that also names the application account. Read the
+[Yandex page](providers/yandex.md) before you attach a policy: it changes the bucket to "closed
+unless allowed". A two-bucket layout is not verified.
+
+### Selectel
+
+```env
+STORAGE_DRIVER=s3
+STORAGE_BUCKET=<private-bucket>
+STORAGE_PUBLIC_BUCKET=<public-bucket>
+STORAGE_REGION=ru-1
+STORAGE_ENDPOINT=https://s3.ru-1.storage.selcloud.ru
+STORAGE_PUBLIC_BASE_URL=https://<bucket-uuid>.selstorage.ru
+```
+
+The S3 API domain accepts only authorized requests. Anonymous reads go through
+the public domain of a public bucket (or your custom domain), which is what
+`STORAGE_PUBLIC_BASE_URL` must name. Selectel has no object ACLs.
+
+### VK Cloud
+
+```env
+STORAGE_DRIVER=s3
+STORAGE_BUCKET=<private-bucket>
+STORAGE_PUBLIC_BUCKET=<public-bucket>
+STORAGE_REGION=ru-msk
+STORAGE_ENDPOINT=https://hb.ru-msk.vkcloud-storage.ru
+STORAGE_PUBLIC_BASE_URL=https://<public-bucket>.hb.ru-msk.vkcloud-storage.ru
+```
+
+VK Cloud supports ACLs but not bucket policies. Set the **bucket** ACL of the
+public bucket to `public-read` once; the application then sends no ACL.
+
+### Cloud.ru
+
+```env
+STORAGE_DRIVER=s3
+STORAGE_BUCKET=<private-bucket>
+STORAGE_PUBLIC_BUCKET=<public-bucket>
+STORAGE_REGION=ru-central-1
+STORAGE_ENDPOINT=https://s3.cloud.ru
+STORAGE_ACCESS_KEY_ID=<tenant-id>:<key-id>
+STORAGE_PUBLIC_BASE_URL=https://<public-bucket>.s3.cloud.ru
+```
+
+The access key id has the form `<tenant_id>:<key_id>`.
+
+## Local Driver
+
+```env
+STORAGE_DRIVER=local
+STORAGE_LOCAL_ROOT=./uploads
+STORAGE_PUBLIC_BASE_URL=http://localhost:5002/api/v1/storage/public
+```
+
+The local driver stores bytes under:
+
+```text
+{STORAGE_LOCAL_ROOT}/objects/{key}
+```
+
+and metadata sidecars under:
+
+```text
+{STORAGE_LOCAL_ROOT}/meta/{key}.json
+```
+
+`STORAGE_PUBLIC_BASE_URL` points at the browser-facing API endpoint
+`/api/v1/storage/public`; generated URLs encode the object key in `?key=...`. In development it defaults to `http://localhost:<API_PORT>/api/v1/storage/public`; production must set it.
+It must be reachable through your API reverse proxy. Only copies of keys under `public/`
+are served, with safe content types, attachment disposition, nosniff and sandbox
+headers. Public copies explicitly permit cross-origin resource embedding so a
+frontend on a different API domain can display images. This does not grant
+access to private files. The web starter's CSP allows images only from its own origin
+plus the single origin set in `WEB_PUBLIC_FILES_ORIGIN`: set it to the origin of
+`STORAGE_PUBLIC_BASE_URL`, or expose this endpoint under the web origin through the product
+reverse proxy. A public API response does not override the page's CSP.
+Private objects, metadata and probes are never served. Never expose the
+`objects/` directory or the storage root through a static file server.
+
+### Local production
+
+Explicitly choose `STORAGE_DRIVER=local`. The reference Compose stack mounts the
+same named `local_storage` volume at `/app/uploads` in API and worker. The image
+creates this directory with runtime uid/gid 1001 ownership, which Docker copies
+into a new empty volume. Existing volumes and bind mounts retain their own
+permissions: provision ownership before rollout. Do not use world-writable access.
+If overriding `STORAGE_LOCAL_ROOT`, mount the same durable storage at the new path
+in both services; an environment override alone does not move a volume.
+
+This supports a single-host deployment such as a VPS. Replicas on different hosts
+need shared durable storage or S3; identically named local volumes are not shared
+across machines. Separate Compose projects also get separate named volumes by
+default; plan shared storage or a coordinated file migration before a blue-green
+cutover. Preserve the volume during upgrades; `docker compose down -v`
+removes it. Back up objects, metadata and public copies consistently while writes
+are paused or using a filesystem snapshot. Restore to an isolated deployment and
+verify private downloads, public avatars and API/worker access. Database backups
+do not include this volume. See [backup/restore](../operations/backup-restore.md).
+A successful probe proves current I/O, not persistence after recreation or backups.
+
+## Active file monitoring and readiness
+
+Every API/worker process checks the selected local, S3-compatible or test-memory
+driver independently. It writes a 35-byte private canary, reads/compares the bytes
+and deletes it. Overview and metrics scrapes only read the cached result.
+Overview shows result time and the next scheduled check; an unfinished operation
+blocks new checks. A timeout timestamp is publication of the failed verdict, not
+proof that underlying I/O or cleanup has completed.
+
+```env
+STORAGE_PROBE_INTERVAL_SECONDS=600
+STORAGE_PROBE_TIMEOUT_SECONDS=10
+STORAGE_PROBE_PREFIX=__amcore_probes__
+STORAGE_HEALTH_ENABLED=false
+STORAGE_HEALTH_PROBE_KEY=__storage_health_check__
+```
+
+Cadence accepts 30–3600 seconds; transaction deadline 1–20 seconds plus a separate
+five-second cleanup deadline. Results become stale after three cadences. Startup
+has an unmeasured state until completion; success, failure, unknown and stale are
+separate. Cancellation is cooperative: unfinished I/O retains the single-operation
+slot, so timed-out work cannot accumulate. No deadline promises cancellation of
+kernel filesystem operations. Crash/denial can leave a canary; use lifecycle cleanup
+only on the dedicated S3 prefix (including noncurrent versions when applicable)
+and old-file cleanup only on local `objects/.amcore-probes/` and `meta/.amcore-probes/`.
+
+The deployment baseline is **10 minutes** (`STORAGE_PROBE_INTERVAL_SECONDS=600`).
+A saved platform override takes precedence and is adopted without restart.
+The retained
+[operator API](../backend/settings.md#operator-api-and-rights) supports Save and
+reset. Reset clears
+the override and uses each process's validated deployment baseline; align
+API/worker values. An API Save of 600 explicitly overrides the baseline with 600.
+Changing the env baseline requires process initialization or redeployment and
+does not replace a saved override. Save/reset/read never starts a canary.
+Healthy reconciliation aims for 35 seconds; a warm database-read failure retains
+the last confirmed value, while a cold unconfirmed reader uses its env baseline.
+
+On Console Overview, change the inline interval field in **File storage** and
+choose **Save**; **Cancel** discards the draft without writing. There is no reset
+button or separate Settings page.
+
+The following request counts assume the default applied interval.
+Normal S3 traffic is one PUT, one GET and one DELETE per check per process.
+Over 30 days, one API and one worker therefore perform **8,640 operations of each
+type** (25,920 requests in total), excluding startup checks, retries and cleanup
+after failures. Replicas multiply this traffic; application traffic shares any
+provider free allowance. For example, Yandex Object Storage currently includes
+10,000 standard write operations and 100,000 reads per month; DELETE is free.
+These checks alone use about 86% of its free write allowance for that topology.
+Check current [provider pricing](https://yandex.cloud/ru/docs/storage/pricing)
+before deployment; other S3-compatible providers have different terms.
+Each instance tests its own credentials/mount, including worker. Increasing
+the interval reduces cost but delays detection: with checks completing on schedule,
+a failure just after a successful check is not seen for about ten minutes at the
+default interval. A stalled operation can delay the next check further; its result
+eventually becomes stale. The synthetic check complements metrics from actual
+user operations. It does not test public/CDN URLs,
+backup integrity, persistence across container recreation or S3 capacity.
+
+The active S3 check needs `s3:PutObject`, `s3:GetObject` and `s3:DeleteObject`
+under `{bucket}/{STORAGE_PROBE_PREFIX}/*`. An AWS resource example is
+`arn:aws:s3:::example-bucket/__amcore_probes__/*`; compatible providers use their
+corresponding policy. The same configured credentials also serve application files:
+grant their required object permissions separately. Restricting the credentials
+to the diagnostic prefix alone would break user uploads and downloads. The check
+needs no ListBucket or public ACL permission. Encryption
+policies may additionally require KMS access. Prefix-scoped deployments can select
+a dedicated reserved prefix inside their allowed namespace. Do not share it with
+user objects. HTTP 403 is an access failure, not proof of a provider outage.
+
+Storage failure does not change API readiness by default. The separate existing
+`STORAGE_HEALTH_ENABLED=true` opt-in adds a passive HEAD/exists check to readiness;
+it does not trigger a synthetic write per health request. That passive check can
+return 403 for a missing S3 key without ListBucket. Configure its key to an existing
+readable object or grant appropriate scoped listing access; don't interpret 403 as
+"S3 is down". The unauthenticated readiness response reports only a failure class
+(`access_denied` or `io_error`); the provider message goes to the log as
+`storage_health_failed`. Compose forwards both monitoring and readiness settings.
+
+`amcore_storage_probe_state{driver,state}` and the tested five-minute alert expose
+cached failures without user traffic. The five-minute alert hold starts when
+monitoring observes a failed result; it does not prove five minutes of continuous
+failed I/O. With the default cadence, initial detection plus the hold can take
+about fifteen minutes, plus scrape/evaluation delays. A transient failure may
+remain reported until the next successful check. Set up a downstream notification receiver
+once. For the supplied monitoring harness,
+follow [Alertmanager receiver setup](../operations/observability.md#local-verification-harness).
+See the [storage runbook](../operations/runbooks/storage.md) for failure recovery.
+
+The optional Console displays the cached file-check result; it does not send alerts.
+
+## Public delivery monitoring
+
+The file check above covers private storage. The `s3` driver adds a second, independent
+observation of the public boundary: after one idempotent write of two fixed canary
+objects at start-up it only **reads**, so it adds no write cost and needs no cleanup.
+Each check makes two or three small anonymous GET requests:
+
+1. the public canary (`public/<STORAGE_PROBE_PREFIX>/public-canary`) at
+   `STORAGE_PUBLIC_BASE_URL`;
+2. the private canary (`<STORAGE_PROBE_PREFIX>/private-canary`) through the storage API
+   without credentials, which must be refused (401, 403 or 404);
+3. with one bucket only, the private canary at the public base, which must be refused.
+
+Defaults run it once an hour per API process (a dedicated worker skips it); `STORAGE_PUBLIC_CHECK_ENABLED=false`
+turns it off (not allowed in `acl` mode). The result appears as the metrics
+`amcore_storage_public_check_state{driver,state}` and `amcore_storage_private_exposed{driver}`,
+the alerts `AMCoreStoragePublicDeliveryFailed` (ticket) and `AMCoreStoragePrivateExposed`
+(page), and log events written on a change. It never changes API readiness. The application
+credentials need object write on both buckets for the start-up canary write and object read;
+the canaries sit in the same reserved folder as the private file check, so the same
+prefix-only lifecycle rule can clean them. The operator command
+`pnpm --filter api storage:check` runs these checks and more on demand. See
+[Public Files](public-files.md#verify-the-setup) and the
+[runbook](../operations/runbooks/storage.md#public-delivery).
+
+## Limits
+
+```env
+STORAGE_MAX_FILE_SIZE=52428800
+STORAGE_SIGNED_URL_MAX_TTL=604800
+```
+
+`STORAGE_SIGNED_URL_MAX_TTL` cannot exceed 604800 seconds because SigV4
+presigned URLs have a seven-day hard limit.

@@ -1,0 +1,852 @@
+jest.mock('./providers/oauth-provider.factory', () => ({ OAuthProviderFactory: jest.fn() }))
+jest.mock('./oauth-client.service', () => ({ OAuthClientService: jest.fn() }))
+
+import { HttpStatus } from '@nestjs/common'
+import type { PinoLogger } from 'nestjs-pino'
+
+import { AuthErrorCode, DEFAULT_LOCALE } from '@amcore/shared'
+
+import { AppException } from '../../../common/exceptions'
+import { EmailIdentityService } from '../email-identity.service'
+
+import { OAuthService } from './oauth.service'
+import { hashOAuthStateNonce } from './oauth-nonce'
+import type { OAuthStateData } from './oauth-state.service'
+
+import type { OAuthProvider, User } from '@/generated/prisma/client'
+
+// Browser-binding nonce the controller would set as the `oauth_state` cookie; the
+// mocked state record stores its hash, so a callback carrying TEST_NONCE is bound.
+const TEST_NONCE = 'browser-binding-nonce'
+const TEST_NONCE_HASH = hashOAuthStateNonce(TEST_NONCE)
+
+const mockUser = (overrides: Partial<User> = {}): User =>
+  ({
+    id: 'user-1',
+    email: 'user@example.com',
+    emailCanonical: 'user@example.com',
+    emailVerified: true,
+    passwordHash: null,
+    name: 'Test User',
+    avatarUrl: null,
+    phone: null,
+    locale: 'ru',
+    timezone: 'Europe/Moscow',
+    systemRole: 'USER' as never,
+    createdAt: new Date('2024-01-01'),
+    updatedAt: new Date('2024-01-01'),
+    lastLoginAt: null,
+    ...overrides,
+  }) as User
+
+const mockProfile = {
+  providerId: 'google-123',
+  provider: 'google',
+  email: 'user@example.com',
+  emailVerified: true,
+  displayName: 'Test User',
+  avatarUrl: null,
+  phone: null,
+}
+
+describe('OAuthService', () => {
+  let env: { get: jest.Mock }
+  let invitationAuthority: { lockValid: jest.Mock; lockOAuthIntent: jest.Mock }
+  let avatarRehost: { schedule: jest.Mock }
+  let service: OAuthService
+  let prisma: jest.Mocked<any>
+  let sessionService: jest.Mocked<any>
+  let providerFactory: jest.Mocked<any>
+  let stateService: jest.Mocked<any>
+  let mockProvider: jest.Mocked<any>
+  let mockLogger: jest.Mocked<PinoLogger>
+
+  const requestInfo = { userAgent: 'test-agent', ipAddress: '127.0.0.1' }
+
+  beforeEach(() => {
+    mockProvider = {
+      getAuthorizationURL: jest
+        .fn()
+        .mockResolvedValue(new URL('https://accounts.google.com/o/oauth2/auth?state=x')),
+      exchangeCode: jest.fn().mockResolvedValue({ accessToken: 'access-token' }),
+      getUserProfile: jest.fn().mockResolvedValue(mockProfile),
+    }
+
+    prisma = {
+      mfaAccount: { findUnique: jest.fn().mockResolvedValue(null) },
+      mfaFactor: { findUnique: jest.fn().mockResolvedValue(null) },
+      invitationAuthHandoff: { findUnique: jest.fn().mockResolvedValue(null) },
+      oAuthAccount: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        create: jest.fn().mockResolvedValue({}),
+      },
+      user: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        findUniqueOrThrow: jest.fn().mockResolvedValue(mockUser()),
+        create: jest.fn().mockResolvedValue(mockUser()),
+        update: jest.fn().mockResolvedValue(mockUser()),
+      },
+      $executeRaw: jest.fn(async () => 1),
+      $queryRaw: jest.fn(async () => [{ id: 'user-1', now: new Date() }]),
+      $transaction: jest
+        .fn()
+        .mockImplementation((ops: any) =>
+          typeof ops === 'function' ? ops(prisma) : Promise.all(ops)
+        ),
+    }
+
+    sessionService = {
+      createSession: jest.fn().mockResolvedValue({
+        session: { id: 'session-123' },
+        refreshToken: 'refresh-token-raw',
+      }),
+    }
+
+    providerFactory = {
+      get: jest.fn().mockReturnValue(mockProvider),
+      callbackUri: jest.fn(
+        (provider: string, frontend: string): string =>
+          `https://${frontend === 'admin' ? 'staff' : 'shop'}.example.test/api/${frontend === 'admin' ? 'product-admin/' : ''}auth/oauth/${provider}/callback`
+      ),
+      getAvailableProviders: jest.fn().mockReturnValue(['google', 'github', 'apple']),
+    }
+
+    stateService = {
+      store: jest.fn().mockResolvedValue(undefined),
+      consume: jest.fn().mockResolvedValue({
+        provider: 'google',
+        codeVerifier: 'verifier',
+        mode: 'login',
+        browserNonceHash: TEST_NONCE_HASH,
+      } as OAuthStateData),
+    }
+
+    mockLogger = {
+      setContext: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+      debug: jest.fn(),
+    } as unknown as jest.Mocked<PinoLogger>
+
+    env = { get: jest.fn(() => true) }
+    invitationAuthority = { lockValid: jest.fn(), lockOAuthIntent: jest.fn() }
+    avatarRehost = { schedule: jest.fn() }
+    service = new OAuthService(
+      prisma,
+      sessionService,
+      providerFactory,
+      stateService,
+      new EmailIdentityService(),
+      mockLogger,
+      env as never,
+      invitationAuthority as never,
+      { getPublicUrl: (key: string) => `https://files.test/${key}` } as never,
+      avatarRehost as never
+    )
+  })
+
+  describe('getAuthorizationURL', () => {
+    it('should store state in Redis and return provider URL', async () => {
+      const result = await service.getAuthorizationURL('google')
+
+      expect(providerFactory.get).toHaveBeenCalledWith('google', 'site')
+      expect(stateService.store).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          provider: 'google',
+          codeVerifier: expect.any(String),
+          mode: 'login',
+          browserNonceHash: expect.any(String),
+        })
+      )
+      expect(result.url).toContain('accounts.google.com')
+      // Raw nonce is returned to the controller (set as the oauth_state cookie),
+      // never the hash that is persisted with the state.
+      expect(result.browserNonce).toEqual(expect.any(String))
+      expect(stateService.store).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ browserNonceHash: hashOAuthStateNonce(result.browserNonce) })
+      )
+    })
+
+    it('should throw when provider is not configured', async () => {
+      providerFactory.get.mockImplementation(() => {
+        throw new AppException(
+          'not configured',
+          HttpStatus.BAD_REQUEST,
+          AuthErrorCode.OAUTH_PROVIDER_NOT_CONFIGURED
+        )
+      })
+
+      await expect(service.getAuthorizationURL('vk')).rejects.toThrow(AppException)
+    })
+
+    it('carries the negotiated locale into the stored state (D2)', async () => {
+      await service.getAuthorizationURL('google', 'en')
+
+      expect(stateService.store).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ locale: 'en' })
+      )
+    })
+
+    it('omits locale from state when none is negotiated', async () => {
+      await service.getAuthorizationURL('google')
+
+      const storeArg = stateService.store.mock.calls[0]![1] as OAuthStateData
+      expect(storeArg).not.toHaveProperty('locale')
+    })
+  })
+
+  describe('handleCallback', () => {
+    it('returns callback identity without a session or usable credentials', async () => {
+      prisma.user.create.mockResolvedValue(mockUser())
+
+      const result = await service.handleCallback(
+        'google',
+        'code',
+        'state',
+        TEST_NONCE,
+        requestInfo
+      )
+
+      if (result.mode !== 'login_identity') throw new Error('Expected identity result')
+      expect(result.identity).toMatchObject({
+        userId: 'user-1',
+        systemRole: 'USER',
+        securityVersion: 0,
+        protectedAccount: false,
+      })
+      expect(sessionService.createSession).not.toHaveBeenCalled()
+      expect(result).not.toHaveProperty('refreshToken')
+      expect(result).not.toHaveProperty('accessClaims')
+      expect(result.user.email).toBe('user@example.com')
+    })
+
+    it('should throw OAUTH_STATE_INVALID when state is missing', async () => {
+      stateService.consume.mockResolvedValue(null)
+
+      await expect(
+        service.handleCallback('google', 'code', 'bad-state', TEST_NONCE, requestInfo)
+      ).rejects.toMatchObject({
+        errorCode: AuthErrorCode.OAUTH_STATE_INVALID,
+      })
+    })
+
+    it('should throw OAUTH_STATE_INVALID when provider does not match', async () => {
+      stateService.consume.mockResolvedValue({
+        provider: 'github',
+        codeVerifier: 'v',
+        mode: 'login',
+      } as OAuthStateData)
+
+      await expect(
+        service.handleCallback('google', 'code', 'state', TEST_NONCE, requestInfo)
+      ).rejects.toMatchObject({
+        errorCode: AuthErrorCode.OAUTH_STATE_INVALID,
+      })
+    })
+
+    it('should throw OAUTH_EMAIL_REQUIRED when provider returns no email', async () => {
+      mockProvider.getUserProfile.mockResolvedValue({ ...mockProfile, email: null })
+
+      await expect(
+        service.handleCallback('google', 'code', 'state', TEST_NONCE, requestInfo)
+      ).rejects.toMatchObject({
+        errorCode: AuthErrorCode.OAUTH_EMAIL_REQUIRED,
+      })
+    })
+
+    it('should throw OAUTH_STATE_INVALID when the browser binding nonce is missing', async () => {
+      await expect(
+        service.handleCallback('google', 'code', 'state', undefined, requestInfo)
+      ).rejects.toMatchObject({
+        errorCode: AuthErrorCode.OAUTH_STATE_INVALID,
+      })
+      // Binding fails before the provider code exchange.
+      expect(mockProvider.exchangeCode).not.toHaveBeenCalled()
+    })
+
+    it('should throw OAUTH_STATE_INVALID when the browser binding nonce mismatches', async () => {
+      await expect(
+        service.handleCallback('google', 'code', 'state', 'wrong-nonce', requestInfo)
+      ).rejects.toMatchObject({
+        errorCode: AuthErrorCode.OAUTH_STATE_INVALID,
+      })
+      expect(mockProvider.exchangeCode).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('profile picture copy', () => {
+    const source = 'https://avatars.githubusercontent.com/u/1'
+    const withPicture = (): void =>
+      mockProvider.getUserProfile.mockResolvedValue({ ...mockProfile, avatarSourceUrl: source })
+    const signIn = (): Promise<unknown> =>
+      service.handleCallback('google', 'code', 'state', TEST_NONCE, requestInfo)
+
+    it('copies the picture when this sign-in creates the user', async () => {
+      withPicture()
+      prisma.oAuthAccount.findUnique.mockResolvedValue(null)
+      prisma.user.findUnique.mockResolvedValue(null)
+      prisma.user.create.mockResolvedValue(mockUser({ id: 'new-user' }))
+      await signIn()
+      expect(avatarRehost.schedule).toHaveBeenCalledWith('new-user', source)
+    })
+
+    it('copies the picture the first time a provider is linked to a user without avatar', async () => {
+      withPicture()
+      const user = mockUser()
+      prisma.oAuthAccount.findUnique.mockResolvedValue(null)
+      prisma.user.findUnique.mockResolvedValue(user)
+      prisma.user.findUniqueOrThrow.mockResolvedValue(user)
+      await signIn()
+      expect(avatarRehost.schedule).toHaveBeenCalledWith(user.id, source)
+    })
+
+    it('does not replace an avatar the linked user already has', async () => {
+      withPicture()
+      const user = mockUser({ avatarKey: 'public/avatars/user-1/v-1-a/avatar-256.webp' })
+      prisma.oAuthAccount.findUnique.mockResolvedValue(null)
+      prisma.user.findUnique.mockResolvedValue(user)
+      prisma.user.findUniqueOrThrow.mockResolvedValue(user)
+      await signIn()
+      expect(avatarRehost.schedule).not.toHaveBeenCalled()
+    })
+
+    it('never copies on a repeat sign-in, so a removed avatar stays removed', async () => {
+      withPicture()
+      const user = mockUser({ avatarKey: null })
+      prisma.oAuthAccount.findUnique.mockResolvedValue({ userId: user.id, user })
+      await signIn()
+      expect(avatarRehost.schedule).not.toHaveBeenCalled()
+    })
+
+    it('does nothing when the provider returns no picture', async () => {
+      prisma.oAuthAccount.findUnique.mockResolvedValue(null)
+      prisma.user.findUnique.mockResolvedValue(null)
+      prisma.user.create.mockResolvedValue(mockUser())
+      await signIn()
+      expect(avatarRehost.schedule).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('findOrCreateUser', () => {
+    it('does not attach an unverified email claim to an existing account', async () => {
+      mockProvider.getUserProfile.mockResolvedValue({ ...mockProfile, emailVerified: false })
+      prisma.oAuthAccount.findUnique.mockResolvedValue(null)
+      prisma.user.findUnique.mockResolvedValue(mockUser())
+
+      await expect(
+        service.handleCallback('google', 'code', 'state', TEST_NONCE, requestInfo)
+      ).rejects.toMatchObject({ errorCode: AuthErrorCode.OAUTH_EMAIL_UNVERIFIED })
+
+      expect(prisma.oAuthAccount.create).not.toHaveBeenCalled()
+      expect(sessionService.createSession).not.toHaveBeenCalled()
+    })
+
+    it('should return existing user when OAuth account is already linked', async () => {
+      const user = mockUser()
+      prisma.oAuthAccount.findUnique.mockResolvedValue({ userId: user.id, user })
+
+      const result = await service.handleCallback(
+        'google',
+        'code',
+        'state',
+        TEST_NONCE,
+        requestInfo
+      )
+
+      expect(prisma.user.create).not.toHaveBeenCalled()
+      expect(result.user.id).toBe(user.id)
+    })
+
+    it('should link OAuth account to existing user with same email', async () => {
+      const user = mockUser({ emailVerified: false })
+      prisma.oAuthAccount.findUnique.mockResolvedValue(null)
+      prisma.user.findUnique.mockResolvedValue(user)
+      prisma.user.findUniqueOrThrow.mockResolvedValue(mockUser({ emailVerified: true }))
+
+      await service.handleCallback('google', 'code', 'state', TEST_NONCE, requestInfo)
+
+      expect(prisma.user.findUnique).toHaveBeenCalledWith({
+        where: { emailCanonical: 'user@example.com' },
+      })
+      expect(prisma.$transaction).toHaveBeenCalled()
+    })
+
+    it('should link OAuth account when provider returns mixed-case email', async () => {
+      const user = mockUser({ email: 'user@example.com' })
+      mockProvider.getUserProfile.mockResolvedValue({ ...mockProfile, email: 'User@Example.COM' })
+      prisma.oAuthAccount.findUnique.mockResolvedValue(null)
+      prisma.user.findUnique.mockResolvedValue(user)
+      prisma.user.findUniqueOrThrow.mockResolvedValue(user)
+
+      await service.handleCallback('google', 'code', 'state', TEST_NONCE, requestInfo)
+
+      expect(prisma.user.findUnique).toHaveBeenCalledWith({
+        where: { emailCanonical: 'user@example.com' },
+      })
+      expect(prisma.user.create).not.toHaveBeenCalled()
+    })
+
+    it('should mark email as verified when provider confirms it', async () => {
+      const unverifiedUser = mockUser({ emailVerified: false })
+      prisma.oAuthAccount.findUnique.mockResolvedValue(null)
+      prisma.user.findUnique.mockResolvedValue(unverifiedUser)
+      prisma.user.findUniqueOrThrow.mockResolvedValue(mockUser({ emailVerified: true }))
+
+      const result = await service.handleCallback(
+        'google',
+        'code',
+        'state',
+        TEST_NONCE,
+        requestInfo
+      )
+
+      expect(prisma.$transaction).toHaveBeenCalled()
+      expect(result.user.emailVerified).toBe(true)
+    })
+
+    it('should create new user when no match found', async () => {
+      prisma.oAuthAccount.findUnique.mockResolvedValue(null)
+      prisma.user.findUnique.mockResolvedValue(null)
+
+      await service.handleCallback('google', 'code', 'state', TEST_NONCE, requestInfo)
+
+      expect(prisma.user.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            email: mockProfile.email,
+            emailCanonical: mockProfile.email,
+            emailVerified: true,
+            accounts: expect.objectContaining({
+              create: expect.objectContaining({ provider: 'GOOGLE' as OAuthProvider }),
+            }),
+          }),
+        })
+      )
+    })
+
+    it('does not update lastLoginAt before OAuth publication', async () => {
+      const user = mockUser()
+      prisma.oAuthAccount.findUnique.mockResolvedValue({ userId: user.id, user })
+
+      await service.handleCallback('google', 'code', 'state', TEST_NONCE, requestInfo)
+
+      expect(prisma.user.update).not.toHaveBeenCalled()
+    })
+
+    // Apple sends the display name only in the first-login form_post `user` field
+    // (provider profile has displayName: null); the controller passes it as
+    // `firstLoginName`. It must fill a missing name but never clobber one the
+    // provider already supplied.
+    it('should use firstLoginName when the provider profile has no displayName', async () => {
+      prisma.oAuthAccount.findUnique.mockResolvedValue(null)
+      prisma.user.findUnique.mockResolvedValue(null)
+      mockProvider.getUserProfile.mockResolvedValue({ ...mockProfile, displayName: null })
+
+      await service.handleCallback(
+        'google',
+        'code',
+        'state',
+        TEST_NONCE,
+        requestInfo,
+        'Jane Appleseed'
+      )
+
+      expect(prisma.user.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ name: 'Jane Appleseed' }),
+        })
+      )
+    })
+
+    it('should not overwrite a provider-supplied displayName with firstLoginName', async () => {
+      prisma.oAuthAccount.findUnique.mockResolvedValue(null)
+      prisma.user.findUnique.mockResolvedValue(null)
+      // mockProfile.displayName = 'Test User' (non-null)
+
+      await service.handleCallback(
+        'google',
+        'code',
+        'state',
+        TEST_NONCE,
+        requestInfo,
+        'Spoofed Name'
+      )
+
+      expect(prisma.user.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ name: 'Test User' }),
+        })
+      )
+    })
+
+    // D2: a new OAuth user's locale is seeded from the negotiated language
+    // carried in the one-time state.
+    it('seeds a new OAuth user locale from the negotiated state locale', async () => {
+      stateService.consume.mockResolvedValue({
+        provider: 'google',
+        codeVerifier: 'verifier',
+        mode: 'login',
+        browserNonceHash: TEST_NONCE_HASH,
+        locale: 'en',
+      } as OAuthStateData)
+      prisma.oAuthAccount.findUnique.mockResolvedValue(null)
+      prisma.user.findUnique.mockResolvedValue(null)
+
+      await service.handleCallback('google', 'code', 'state', TEST_NONCE, requestInfo)
+
+      expect(prisma.user.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ locale: 'en' }) })
+      )
+    })
+
+    it('writes the build default locale on create when the state carries none', async () => {
+      prisma.oAuthAccount.findUnique.mockResolvedValue(null)
+      prisma.user.findUnique.mockResolvedValue(null)
+
+      await service.handleCallback('google', 'code', 'state', TEST_NONCE, requestInfo)
+
+      const createArg = prisma.user.create.mock.calls[0]![0]!
+      expect(createArg.data).toHaveProperty('locale', DEFAULT_LOCALE)
+    })
+
+    // D2: an already-linked OAuth account keeps its stored preference — the
+    // returning-login path bumps only lastLoginAt and never writes locale.
+    it('retains the stored locale for an already-linked OAuth user', async () => {
+      stateService.consume.mockResolvedValue({
+        provider: 'google',
+        codeVerifier: 'verifier',
+        mode: 'login',
+        browserNonceHash: TEST_NONCE_HASH,
+        locale: 'en',
+      } as OAuthStateData)
+      const user = mockUser({ locale: 'ru' })
+      prisma.oAuthAccount.findUnique.mockResolvedValue({ userId: user.id, user })
+
+      await service.handleCallback('google', 'code', 'state', TEST_NONCE, requestInfo)
+
+      expect(prisma.user.create).not.toHaveBeenCalled()
+      expect(prisma.user.update).not.toHaveBeenCalled()
+      for (const call of prisma.user.update.mock.calls) {
+        expect(call[0]!.data).not.toHaveProperty('locale')
+      }
+    })
+
+    // D2: an existing user found by email keeps its stored preference — the
+    // browser hint never overwrites it (no locale in the link update).
+    it('does not overwrite an existing user locale when linking by email', async () => {
+      stateService.consume.mockResolvedValue({
+        provider: 'google',
+        codeVerifier: 'verifier',
+        mode: 'login',
+        browserNonceHash: TEST_NONCE_HASH,
+        locale: 'en',
+      } as OAuthStateData)
+      const existing = mockUser({ locale: 'ru' })
+      prisma.oAuthAccount.findUnique.mockResolvedValue(null)
+      prisma.user.findUnique.mockResolvedValue(existing)
+      prisma.user.findUniqueOrThrow.mockResolvedValue(existing)
+
+      await service.handleCallback('google', 'code', 'state', TEST_NONCE, requestInfo)
+
+      expect(prisma.user.create).not.toHaveBeenCalled()
+      for (const call of prisma.user.update.mock.calls) {
+        expect(call[0]!.data).not.toHaveProperty('locale')
+      }
+    })
+  })
+
+  describe('getLinkAuthorizationURL', () => {
+    it('should store state with mode=link and userId', async () => {
+      const result = await service.getLinkAuthorizationURL('telegram', 'user-42')
+
+      expect(stateService.store).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ provider: 'telegram', mode: 'link', userId: 'user-42' })
+      )
+      expect(result.url).toBeDefined()
+    })
+  })
+
+  describe('handleCallback (link mode)', () => {
+    const linkStateData: OAuthStateData = {
+      provider: 'telegram',
+      codeVerifier: 'verifier',
+      mode: 'link',
+      userId: 'user-42',
+      browserNonceHash: TEST_NONCE_HASH,
+    }
+
+    beforeEach(() => {
+      stateService.consume.mockResolvedValue(linkStateData)
+      mockProvider.getUserProfile.mockResolvedValue({
+        ...mockProfile,
+        provider: 'telegram',
+        email: null,
+        phone: '+79001234567',
+      })
+    })
+
+    it('should attach provider to user and return mode=link result', async () => {
+      const user = mockUser()
+      prisma.user.findUniqueOrThrow.mockResolvedValue(user)
+
+      const result = await service.handleCallback(
+        'telegram',
+        'code',
+        'state',
+        TEST_NONCE,
+        requestInfo
+      )
+
+      expect(result.mode).toBe('link')
+      expect(result.user.id).toBe(user.id)
+      expect(prisma.oAuthAccount.create).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ provider: 'GOOGLE' }) })
+      )
+    })
+
+    it('should throw OAUTH_ACCOUNT_ALREADY_LINKED if provider already linked to another user', async () => {
+      prisma.oAuthAccount.findUnique.mockResolvedValue({
+        userId: 'other-user',
+        provider: 'TELEGRAM',
+      })
+
+      await expect(
+        service.handleCallback('telegram', 'code', 'state', TEST_NONCE, requestInfo)
+      ).rejects.toMatchObject({
+        errorCode: AuthErrorCode.OAUTH_ACCOUNT_ALREADY_LINKED,
+      })
+    })
+
+    it('should update phone on user when Telegram provides phone number', async () => {
+      await service.handleCallback('telegram', 'code', 'state', TEST_NONCE, requestInfo)
+
+      expect(prisma.$transaction).toHaveBeenCalled()
+    })
+  })
+  describe('invitation correlation and public signup policy', () => {
+    const correlation = {
+      attemptId: 'AAAAAAAAAAAAAAAAAAAAAA',
+      provider: 'google' as const,
+      expectedInviteId: 'invite-one',
+      expectedGeneration: 1,
+    }
+    const expiresAt = new Date(Date.now() + 600000).toISOString()
+    const scopedState = {
+      provider: 'google',
+      codeVerifier: 'verifier',
+      mode: 'login',
+      browserNonceHash: TEST_NONCE_HASH,
+      invitation: {
+        correlation,
+        cleanupKeyHash: 'a'.repeat(64),
+        expiresAt,
+        intent: {
+          attemptId: correlation.attemptId,
+          cleanupKeyHash: 'a'.repeat(64),
+          credentialHash: 'b'.repeat(64),
+          inviteId: 'invite-one',
+          organizationId: 'org-one',
+          generation: 1,
+          recipient: 'user@example.com',
+          expiresAt,
+        },
+      },
+    }
+    beforeEach(() => {
+      prisma.$queryRaw.mockImplementation(async (query: TemplateStringsArray | { sql: string }) => {
+        const sql = 'sql' in query ? query.sql : Array.from(query).join('')
+        if (sql.includes('organization_provisionings')) return []
+        if (sql.includes('FROM core.roles'))
+          return [{ id: 'role-one', name: 'Recipient', isSystem: false, organizationId: 'org-one' }]
+        if (sql.includes('FROM core.org_invites'))
+          return [
+            {
+              id: 'invite-one',
+              generation: 1,
+              emailCanonical: 'user@example.com',
+              expiresAt: new Date(expiresAt),
+            },
+          ]
+        return [{ value: new Date(), now: new Date(), id: 'user-1' }]
+      })
+      prisma.orgInviteRoleIntent = {
+        findMany: jest
+          .fn()
+          .mockResolvedValue([{ requestedRoleId: 'role-one', liveRoleId: 'role-one' }]),
+      }
+      prisma.invitationContinuation = {
+        findUnique: jest.fn().mockResolvedValue({
+          inviteId: 'invite-one',
+          generation: 1,
+          expiresAt: new Date(expiresAt),
+        }),
+      }
+      invitationAuthority.lockOAuthIntent.mockResolvedValue({ emailCanonical: 'user@example.com' })
+      env.get.mockReturnValue(false)
+    })
+    it('blocks a new ordinary OAuth account when public signup is disabled', async () => {
+      await expect(
+        service.handleCallback('google', 'code', 'state', TEST_NONCE, requestInfo)
+      ).rejects.toMatchObject({ errorCode: 'PUBLIC_SIGNUP_DISABLED' })
+      expect(prisma.user.create).not.toHaveBeenCalled()
+      expect(sessionService.createSession).not.toHaveBeenCalled()
+    })
+    it('keeps existing provider login available when public signup is disabled', async () => {
+      prisma.oAuthAccount.findUnique.mockResolvedValue({ userId: 'user-1', user: mockUser() })
+      expect(
+        (await service.handleCallback('google', 'code', 'state', TEST_NONCE, requestInfo)).mode
+      ).toBe('login_identity')
+      expect(prisma.user.create).not.toHaveBeenCalled()
+    })
+    it('allows fixed-email invited signup and carries only server correlation to the ticket', async () => {
+      stateService.consume.mockResolvedValue(scopedState)
+      const result = await service.handleCallback(
+        'google',
+        'code',
+        'state',
+        TEST_NONCE,
+        requestInfo
+      )
+      expect(result).toMatchObject({
+        mode: 'login_identity',
+        invitationIntent: scopedState.invitation.intent,
+      })
+      expect(sessionService.createSession).not.toHaveBeenCalled()
+      expect(result).not.toHaveProperty('accessToken')
+    })
+    it('rejects mismatched provider email before account or session creation', async () => {
+      stateService.consume.mockResolvedValue(scopedState)
+      invitationAuthority.lockOAuthIntent.mockResolvedValue({
+        emailCanonical: 'different@example.com',
+      })
+      await expect(
+        service.handleCallback('google', 'code', 'state', TEST_NONCE, requestInfo)
+      ).rejects.toMatchObject({ errorCode: 'INVITE_INVALID_OR_EXPIRED' })
+      expect(prisma.user.create).not.toHaveBeenCalled()
+      expect(sessionService.createSession).not.toHaveBeenCalled()
+    })
+    it('rejects browser nonce mismatch before resolving invitation authority', async () => {
+      stateService.consume.mockResolvedValue(scopedState)
+      await expect(
+        service.handleCallback('google', 'code', 'state', 'wrong-nonce', requestInfo)
+      ).rejects.toMatchObject({ errorCode: 'OAUTH_STATE_INVALID' })
+      expect(invitationAuthority.lockOAuthIntent).not.toHaveBeenCalled()
+    })
+  })
+  describe('selected frontend OAuth policy', () => {
+    const frontend = { frontend: 'admin' as const, placementFingerprint: 'a'.repeat(64) }
+    const callbackUri = 'https://staff.example.test/api/product-admin/auth/oauth/google/callback'
+    function state(): OAuthStateData {
+      return {
+        provider: 'google',
+        codeVerifier: 'verifier',
+        mode: 'login',
+        browserNonceHash: TEST_NONCE_HASH,
+        ...frontend,
+        callbackUri,
+        pkceMethod: 'S256',
+      }
+    }
+    it('stores selected callback, frontend and finite return with the browser-bound state', async () => {
+      const target = {
+        page: 'organizations' as const,
+        locale: 'ru' as const,
+        query: { view: 'list' as const },
+      }
+      await service.getAuthorizationURL('google', 'ru', undefined, frontend, target)
+      expect(providerFactory.get).toHaveBeenCalledWith('google', 'admin')
+      expect(stateService.store).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ ...frontend, callbackUri, returnTo: target, pkceMethod: 'S256' })
+      )
+    })
+    it.each(['frontend', 'fingerprint', 'callback', 'missing-context'] as const)(
+      'rejects changed %s before provider redemption or account work',
+      async (field) => {
+        const stored = state()
+        if (field === 'callback') stored.callbackUri = 'https://other.example.test/callback'
+        stateService.consume.mockResolvedValue(stored)
+        const supplied =
+          field === 'missing-context'
+            ? undefined
+            : {
+                frontend: field === 'frontend' ? ('site' as const) : ('admin' as const),
+                placementFingerprint:
+                  field === 'fingerprint' ? 'b'.repeat(64) : frontend.placementFingerprint,
+              }
+        await expect(
+          service.handleCallback(
+            'google',
+            'code',
+            'state',
+            TEST_NONCE,
+            requestInfo,
+            undefined,
+            supplied
+          )
+        ).rejects.toMatchObject({ errorCode: AuthErrorCode.OAUTH_STATE_INVALID })
+        expect(mockProvider.exchangeCode).not.toHaveBeenCalled()
+        expect(prisma.$transaction).not.toHaveBeenCalled()
+        expect(sessionService.createSession).not.toHaveBeenCalled()
+      }
+    )
+    it('refuses ordinary admin signup even while public site signup is enabled', async () => {
+      stateService.consume.mockResolvedValue(state())
+      await expect(
+        service.handleCallback(
+          'google',
+          'code',
+          'state',
+          TEST_NONCE,
+          requestInfo,
+          undefined,
+          frontend
+        )
+      ).rejects.toMatchObject({ errorCode: AuthErrorCode.PUBLIC_SIGNUP_DISABLED })
+      expect(prisma.user.create).not.toHaveBeenCalled()
+      expect(prisma.oAuthAccount.create).not.toHaveBeenCalled()
+      expect(sessionService.createSession).not.toHaveBeenCalled()
+    })
+    it('keeps existing admin provider login available', async () => {
+      stateService.consume.mockResolvedValue(state())
+      prisma.oAuthAccount.findUnique.mockResolvedValue({ userId: 'user-1', user: mockUser() })
+      expect(
+        (
+          await service.handleCallback(
+            'google',
+            'code',
+            'state',
+            TEST_NONCE,
+            requestInfo,
+            undefined,
+            frontend
+          )
+        ).mode
+      ).toBe('login_identity')
+      expect(prisma.user.create).not.toHaveBeenCalled()
+      expect(sessionService.createSession).not.toHaveBeenCalled()
+    })
+    it.each([undefined, 'S256'] as const)(
+      'retains the GitHub state PKCE contract %s',
+      async (pkceMethod) => {
+        stateService.consume.mockResolvedValue({
+          provider: 'github',
+          codeVerifier: 'verifier',
+          mode: 'login',
+          browserNonceHash: TEST_NONCE_HASH,
+          pkceMethod,
+        })
+        await service.handleCallback('github', 'code', 'state', TEST_NONCE, requestInfo)
+        const expected = pkceMethod
+          ? ['code', 'verifier']
+          : ['code', 'verifier', { legacyWithoutPkce: true }]
+        expect(mockProvider.exchangeCode).toHaveBeenCalledWith(...expected)
+      }
+    )
+  })
+})

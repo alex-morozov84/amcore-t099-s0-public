@@ -1,0 +1,203 @@
+import { NextResponse } from 'next/server'
+import { AuthErrorCode, type UserResponse } from '@amcore/shared'
+import type { ZodType } from 'zod'
+
+import { apiErrorResponse, zodValidationErrors } from './api-error-response'
+import { revokeBackendSession } from './backend-session-revocation'
+import { handleBrowserPassword, stageIssuedBrowserLogin } from './browser-login-handler'
+import { prepareBrowserRegistration } from './browser-registration'
+import { readContextJson } from './context-body-budget'
+import { ContextRequestError } from './context-errors'
+import { SessionVaultUnavailableError } from './errors'
+import { retireFlowsForOrdinaryAuth } from './invitation-auth-lifecycle'
+import { mintSession } from './mint-session'
+import { isTrustedOrigin } from './origin-guard'
+import { isProductMutationTrusted, type ProductWebContext } from './product-web-context.server'
+import { registrationSignInRequiredResponse } from './registration-outcome'
+import { SESSION_COOKIE_NAME, sessionCookieOptions } from './session-cookie'
+import { redisVaultStore } from './session-vault-store'
+import {
+  callUpstreamAuth,
+  callUpstreamRegister,
+  UpstreamAuthError,
+  type UpstreamAuthResult,
+} from './upstream-auth'
+
+import 'server-only'
+
+export interface CredentialAuthOptions<TInput> {
+  context?: ProductWebContext
+  schema: ZodType<TInput>
+  backendPath: string
+  successStatus: number
+  /**
+   * Set only by the register route. Enables the confirmed-creation classification:
+   * a failure to publish the browser session after the API confirmed creation returns
+   * `REGISTRATION_SIGN_IN_REQUIRED` instead of a generic failure. Login stays unchanged.
+   */
+  registration?: true
+}
+
+/**
+ * Calls the register endpoint and keeps only a confirmed creation. An unconfirmed success
+ * keeps the generic failure (any session cookie is revoked once). `null` means the account
+ * exists but the API set no session cookie, so there is nothing to publish or revoke.
+ */
+async function callRegistration<TInput>(
+  request: Request,
+  options: CredentialAuthOptions<TInput>,
+  body: unknown,
+  prepared?: Awaited<ReturnType<typeof prepareBrowserRegistration>>
+): Promise<UpstreamAuthResult<UserResponse> | null> {
+  const registered = await callUpstreamRegister(
+    options.backendPath,
+    body,
+    request,
+    options.context,
+    prepared
+  )
+  if (registered.outcome === 'unknown') {
+    if (registered.refreshToken)
+      await revokeBackendSession(registered.refreshToken, request.headers)
+    throw new Error('Upstream registration did not confirm creation')
+  }
+  if (!registered.refreshToken) {
+    console.error('[bff] registration confirmed without a session cookie')
+    return null
+  }
+  return {
+    user: registered.user,
+    accessToken: registered.accessToken,
+    refreshToken: registered.refreshToken,
+    ...(registered.publication ? { publication: registered.publication } : {}),
+  }
+}
+
+/** Register: the account exists, so report that. Login (and anything else): rethrow as before. */
+function publicationFailure<TInput>(
+  request: Request,
+  options: CredentialAuthOptions<TInput>,
+  error: unknown
+): NextResponse {
+  if (!options.registration) throw error
+  console.error('[bff] registration session publication failed', {
+    category: error instanceof SessionVaultUnavailableError ? 'vault' : 'unexpected',
+  })
+  return registrationSignInRequiredResponse(request)
+}
+
+/**
+ * Shared implementation behind `/api/auth/login` and `/api/auth/register`:
+ * CSRF-check the request, validate the body, call the backend server-side,
+ * mint a vault entry from the result, and set the one cookie the browser
+ * ever gets (ADR-068). `route.ts` files stay thin adapters over this.
+ */
+export async function handleCredentialAuth<TInput>(
+  request: Request,
+  options: CredentialAuthOptions<TInput>
+): Promise<NextResponse> {
+  const context = options.context
+  if (
+    !(context?.frontend === 'admin'
+      ? isProductMutationTrusted(request, context)
+      : isTrustedOrigin(request))
+  ) {
+    return apiErrorResponse(request, {
+      statusCode: 403,
+      message: 'Request origin rejected',
+      errorCode: AuthErrorCode.AUTH_ORIGIN_REJECTED,
+    })
+  }
+
+  if (!options.registration && new URL(request.url).search)
+    throw new ContextRequestError(400, 'BAD_REQUEST')
+  const rawBody = options.registration
+    ? await request.json().catch(() => null)
+    : await readContextJson(request.body, 2048)
+  const parsed = options.schema.safeParse(rawBody)
+  if (!parsed.success) {
+    return apiErrorResponse(request, {
+      statusCode: 400,
+      message: 'Validation failed',
+      errors: zodValidationErrors(parsed.error),
+    })
+  }
+
+  let upstream: UpstreamAuthResult<UserResponse> | null
+  let registration: Awaited<ReturnType<typeof prepareBrowserRegistration>> | undefined
+  try {
+    if (!options.registration && options.backendPath === '/auth/login' && context)
+      return await handleBrowserPassword(request, context, parsed.data)
+    if (options.registration && context)
+      registration = await prepareBrowserRegistration(request, context)
+    upstream = options.registration
+      ? await callRegistration(request, options, parsed.data, registration)
+      : await callUpstreamAuth<UserResponse>(options.backendPath, parsed.data, request, context)
+  } catch (error) {
+    if (error instanceof UpstreamAuthError) {
+      return NextResponse.json(error.body as object, { status: error.status })
+    }
+    if (error instanceof TypeError)
+      return apiErrorResponse(request, {
+        statusCode: 503,
+        message: 'Backend temporarily unavailable',
+      })
+    throw error
+  }
+
+  // Created, but there is no session this layer could revoke or publish.
+  if (!upstream) return registrationSignInRequiredResponse(request)
+
+  if (registration && context) {
+    try {
+      const completed = await stageIssuedBrowserLogin(
+        request,
+        context,
+        registration.handle,
+        registration.record,
+        {
+          status: 201,
+          body: {
+            user: upstream.user,
+            accessToken: upstream.accessToken,
+            publication: upstream.publication,
+          },
+          refreshToken: upstream.refreshToken,
+        },
+        201
+      )
+      const sessionId = completed.cookies.get(context.cookieName)?.value
+      if (!sessionId) throw new ContextRequestError(503, 'SERVICE_UNAVAILABLE')
+      return new NextResponse(completed.body, {
+        status: options.successStatus,
+        headers: completed.headers,
+      })
+    } catch (error) {
+      return publicationFailure(request, options, error)
+    }
+  }
+
+  let minted
+  try {
+    minted = context ? await mintSession(upstream, context.store) : await mintSession(upstream)
+  } catch (error) {
+    await revokeBackendSession(upstream.refreshToken, request.headers)
+    return publicationFailure(request, options, error)
+  }
+  const { sessionId, user } = minted
+  try {
+    await retireFlowsForOrdinaryAuth(request, { sessionId, actorId: user.id }, undefined, context)
+  } catch (error) {
+    await (context?.store ?? redisVaultStore).delete(sessionId).catch(() => undefined)
+    await revokeBackendSession(upstream.refreshToken, request.headers)
+    return publicationFailure(request, options, error)
+  }
+
+  const response = NextResponse.json({ user }, { status: options.successStatus })
+  response.cookies.set(
+    context?.cookieName ?? SESSION_COOKIE_NAME,
+    sessionId,
+    context?.cookieOptions ?? sessionCookieOptions()
+  )
+  return response
+}

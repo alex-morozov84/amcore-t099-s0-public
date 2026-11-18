@@ -1,0 +1,40 @@
+// Post-apply, read-only verification (FINAL PLAN, Safety model point 7):
+// "this is the bar for 'coherent output', not an afterthought a human/agent
+// is expected to run separately." init:brand only ever writes JSON (always
+// syntactically valid via JSON.stringify) and known single-line TS/JS
+// literals, so `typecheck` + `lint` catch the realistic failure modes.
+// `test:e2e` stays out on purpose — it needs Docker/Testcontainers, which this
+// verification step cannot assume is available.
+//
+// Deliberately never runs `pnpm install`: this module runs as part of the
+// real `init:brand` CLI against a fork the owner already has installed, and
+// a tool reaching out to the network and rewriting node_modules on every
+// real run is its own hazard. A disposable test copy with no node_modules
+// is the test harness's own setup problem.
+import { spawnSync } from 'node:child_process'
+
+const VERIFY_STEPS = [
+  { label: 'typecheck', args: ['typecheck'] },
+  { label: 'lint', args: ['lint'] },
+]
+
+function runSteps(cwd, steps) {
+  return steps.map(({ label, args }) => {
+    const result = spawnSync('pnpm', args, {
+      cwd,
+      encoding: 'utf8',
+      // Web tests print large next-intl warnings; the 1 MiB default would kill a passing run.
+      maxBuffer: 256 * 1024 * 1024,
+      env: { ...process.env, CI: 'true' },
+    })
+    return {
+      label,
+      ok: result.status === 0,
+      output: `${result.stdout ?? ''}${result.stderr ?? ''}`.trim(),
+    }
+  })
+}
+
+export function runVerification(cwd) {
+  return runSteps(cwd, VERIFY_STEPS)
+}

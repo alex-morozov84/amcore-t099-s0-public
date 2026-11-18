@@ -1,0 +1,308 @@
+import { Injectable } from '@nestjs/common'
+import { PinoLogger } from 'nestjs-pino'
+
+import { Prisma } from '../../generated/prisma/client.js'
+import { ScheduledJobExecutor } from '../../infrastructure/schedule/scheduled-job.executor.js'
+import { ScheduledJob } from '../../infrastructure/schedule/scheduled-job.js'
+import { bucketOutcome } from '../../infrastructure/schedule/scheduled-job-outcome.js'
+import { NOTIFICATION_RETENTION_JOB } from '../../infrastructure/schedule/scheduled-jobs.catalogue.js'
+import { PrismaService } from '../../prisma/index.js'
+
+import { lockRetentionChildren, protectsNotification } from './notification-retention-locks.js'
+
+/**
+ * Retention windows (ADR-052 §10). Hardcoded starter constants tuned by code change,
+ * matching the cleanup/limiter convention — not env knobs. A row is deleted once it has
+ * been in its terminal feed state past the window; the unread window is the longest
+ * safety net. The feed is not an audit log — durable security events live in `AuditLog`.
+ */
+const RETENTION_ARCHIVED_DAYS = 30
+const RETENTION_READ_DAYS = 90
+const RETENTION_UNREAD_DAYS = 180
+const RETENTION_FINISHED_ATTEMPTS_DAYS = 30
+// Telegram link tokens / update receipts: a chosen 30-day bounded recovery/dedupe window
+// (an operational default, not an asserted provider guarantee). v1 effects are additionally
+// idempotent — one-time tokens + durable `update_id` dedupe — and the token sweep is guarded
+// to expired/consumed rows, so pruning these bounded tables is safe (Arc D).
+const RETENTION_TELEGRAM_DAYS = 30
+const DAY_MS = 24 * 60 * 60 * 1000
+
+/**
+ * Bounded batch + cycle cap so a single nightly run holds no long lock and cannot loop
+ * unbounded on a large backlog (the next night continues). 500 × 200 = up to 100k rows
+ * per bucket per run.
+ */
+const RETENTION_BATCH_LIMIT = 500
+const RETENTION_MAX_CYCLES = 200
+
+// The distributed lock (key + generous TTL, mirrors CleanupService) is in
+// `NOTIFICATION_RETENTION_JOB`: the daily cron fires on every replica, only the lock-winner
+// sweeps; the TTL outlives a slow sweep yet expires on a crash. A missed run self-repairs next
+// night (ADR-052 §10), so the fail-closed-on-lock-failure runner is acceptable here (unlike the
+// recovery poller).
+
+/** Buckets swept by retention; also the identifiers used in `failures`. */
+export type RetentionBucket =
+  | 'archivedNotifications'
+  | 'readNotifications'
+  | 'unreadNotifications'
+  | 'finishedAttempts'
+  | 'telegramLinkTokens'
+  | 'telegramUpdateReceipts'
+
+export interface NotificationRetentionResult {
+  archivedNotifications: number
+  readNotifications: number
+  unreadNotifications: number
+  finishedAttempts: number
+  telegramLinkTokens: number
+  telegramUpdateReceipts: number
+  /** Buckets whose delete failed this run; empty on full success. Never throws. */
+  failures: RetentionBucket[]
+}
+
+/**
+ * Worker-only notification retention (ADR-052 §10). Daily bounded/batched/idempotent
+ * cleanup of the feed and the attempt history. Deleting a `Notification` cascades to its
+ * deliveries and attempts (schema `onDelete: Cascade`), so the notification buckets
+ * exclude any notification that still has an active external delivery
+ * (`PENDING`/`PROCESSING`/`RETRY_SCHEDULED`) — active work is never auto-deleted. The
+ * deletes are raw SQL `DELETE … WHERE id IN (SELECT … LIMIT n)` batched loops (Prisma
+ * `deleteMany` has no `take`); each bucket is isolated so one failure neither aborts the
+ * others nor throws (mirrors `CleanupService`).
+ */
+@Injectable()
+export class NotificationRetentionService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly jobs: ScheduledJobExecutor,
+    private readonly logger: PinoLogger
+  ) {
+    this.logger.setContext(NotificationRetentionService.name)
+  }
+
+  @ScheduledJob(NOTIFICATION_RETENTION_JOB)
+  async scheduledRetention(): Promise<void> {
+    // One replica sweeps (lock in `NOTIFICATION_RETENTION_JOB`); the rest skip. A skipped run
+    // self-repairs next night.
+    await this.jobs.run(NOTIFICATION_RETENTION_JOB, async () => {
+      const result = await this.runRetention()
+      this.logger.info(
+        { event: 'notification.retention_complete', ...result },
+        'Notification retention complete'
+      )
+      return bucketOutcome(result)
+    })
+  }
+
+  /**
+   * Run every bucket independently (isolated via `Promise.allSettled`): a single failing
+   * delete does not abort the others and never throws. Each delete is idempotent
+   * (delete-by-age), so partial success is correct without a transaction.
+   */
+  async runRetention(now?: Date): Promise<NotificationRetentionResult> {
+    const cutoff = (days: number): Date | Prisma.Sql =>
+      now
+        ? new Date(now.getTime() - days * DAY_MS)
+        : Prisma.sql`clock_timestamp() - make_interval(days => ${days}::int)`
+    const archivedCutoff = cutoff(RETENTION_ARCHIVED_DAYS)
+    const readCutoff = cutoff(RETENTION_READ_DAYS)
+    const unreadCutoff = cutoff(RETENTION_UNREAD_DAYS)
+    const attemptsCutoff = cutoff(RETENTION_FINISHED_ATTEMPTS_DAYS)
+    const telegramCutoff = cutoff(RETENTION_TELEGRAM_DAYS)
+
+    const tasks: { bucket: RetentionBucket; run: () => Promise<number> }[] = [
+      {
+        bucket: 'archivedNotifications',
+        run: () =>
+          this.deleteNotifications(Prisma.sql`n."archivedAt" IS NOT NULL
+            AND n."archivedAt" < ${archivedCutoff}`),
+      },
+      {
+        bucket: 'readNotifications',
+        run: () =>
+          this.deleteNotifications(Prisma.sql`n."archivedAt" IS NULL
+            AND n."readAt" IS NOT NULL AND n."readAt" < ${readCutoff}`),
+      },
+      {
+        bucket: 'unreadNotifications',
+        run: () =>
+          this.deleteNotifications(Prisma.sql`n."archivedAt" IS NULL
+            AND n."readAt" IS NULL AND n."createdAt" < ${unreadCutoff}`),
+      },
+      { bucket: 'finishedAttempts', run: () => this.deleteFinishedAttempts(attemptsCutoff) },
+      { bucket: 'telegramLinkTokens', run: () => this.deleteTelegramLinkTokens(telegramCutoff) },
+      {
+        bucket: 'telegramUpdateReceipts',
+        run: () => this.deleteTelegramUpdateReceipts(telegramCutoff),
+      },
+    ]
+
+    const settled = await Promise.allSettled(tasks.map((task) => task.run()))
+
+    const result: NotificationRetentionResult = {
+      archivedNotifications: 0,
+      readNotifications: 0,
+      unreadNotifications: 0,
+      finishedAttempts: 0,
+      telegramLinkTokens: 0,
+      telegramUpdateReceipts: 0,
+      failures: [],
+    }
+
+    settled.forEach((outcome, index) => {
+      const { bucket } = tasks[index]!
+      if (outcome.status === 'fulfilled') {
+        result[bucket] = outcome.value
+      } else {
+        result.failures.push(bucket)
+        this.logger.error(
+          {
+            event: 'notification.retention_partial_failure',
+            bucket,
+            error: outcome.reason instanceof Error ? outcome.reason.message : 'unknown',
+          },
+          'Notification retention task failed'
+        )
+      }
+    })
+
+    return result
+  }
+
+  /**
+   * Delete notifications matching `predicate` in bounded batches. Excludes any
+   * notification that still has an active external delivery so the cascade never removes
+   * pending/in-flight/retrying work. Returns the total rows deleted.
+   */
+  private deleteNotifications(predicate: Prisma.Sql): Promise<number> {
+    return this.deleteTransactional(async (tx) => {
+      const parents = await tx.$queryRaw<{ id: string }[]>(Prisma.sql`
+        SELECT n.id FROM notifications.notifications n WHERE ${predicate}
+          AND NOT EXISTS (SELECT 1 FROM notifications.notification_deliveries d
+            WHERE d."notificationId" = n.id AND (d.status IN ('PENDING', 'PROCESSING', 'RETRY_SCHEDULED')
+              OR d."unresolvedEffectCount" > 0 OR d."legacyUnverified" OR d."manualGrant" = 'reserved'))
+        AND NOT EXISTS (SELECT 1 FROM notifications.notification_deliveries excess
+          WHERE excess."notificationId" = n.id OFFSET 4096 LIMIT 1)
+        ORDER BY n.id FOR UPDATE SKIP LOCKED LIMIT 50`)
+      const locked = await lockRetentionChildren(
+        tx,
+        parents.map((row) => row.id)
+      )
+      const children = locked.rows
+      const ids = parents
+        .filter((parent) => locked.parentIds.includes(parent.id))
+        .filter(
+          (parent) =>
+            !children.some((row) => row.notificationId === parent.id && protectsNotification(row))
+        )
+        .map((row) => row.id)
+      if (!ids.length) return 0
+      // Separate statement sees the current feed predicate after all lock waits.
+      return tx.$executeRaw(Prisma.sql`DELETE FROM notifications.notifications n
+        WHERE id IN (${Prisma.join(ids)}) AND ${predicate}`)
+    })
+  }
+
+  private deleteFinishedAttempts(cutoff: Date | Prisma.Sql): Promise<number> {
+    return this.deleteTransactional(async (tx) => {
+      const parents = await tx.$queryRaw<{ id: string }[]>(Prisma.sql`
+        SELECT n.id FROM notifications.notifications n WHERE EXISTS (
+          SELECT 1 FROM notifications.notification_deliveries d
+          JOIN notifications.notification_delivery_attempts a ON a."deliveryId" = d.id
+          WHERE d."notificationId" = n.id AND a."finishedAt" < ${cutoff}
+            AND d.status IN ('DELIVERED', 'FAILED', 'SKIPPED', 'CANCELLED')
+            AND d."unresolvedEffectCount" = 0 AND NOT d."legacyUnverified"
+            AND a."attemptNumber" IS DISTINCT FROM d."grantAttemptNumber"
+        ) AND NOT EXISTS (SELECT 1 FROM notifications.notification_deliveries excess
+          WHERE excess."notificationId" = n.id OFFSET 4096 LIMIT 1)
+        ORDER BY n.id FOR UPDATE SKIP LOCKED LIMIT 50`)
+      const locked = await lockRetentionChildren(
+        tx,
+        parents.map((row) => row.id)
+      )
+      const ids = locked.rows.filter((row) => !protectsNotification(row)).map((row) => row.id)
+      if (!ids.length) return 0
+      const removed = await tx.$queryRaw<
+        { deliveryId: string; attemptNumber: number }[]
+      >(Prisma.sql`
+        DELETE FROM notifications.notification_delivery_attempts WHERE id IN (
+          SELECT a.id FROM notifications.notification_delivery_attempts a
+          JOIN notifications.notification_deliveries d ON a."deliveryId" = d.id
+          WHERE d.id IN (${Prisma.join(ids)}) AND a."finishedAt" < ${cutoff}
+            AND a.outcome IS NOT NULL AND a."attemptNumber" IS DISTINCT FROM d."grantAttemptNumber"
+          ORDER BY a.id LIMIT 500
+        ) RETURNING "deliveryId", "attemptNumber"`)
+      for (const id of [...new Set(removed.map((row) => row.deliveryId))].sort()) {
+        const through = Math.max(
+          ...removed.filter((row) => row.deliveryId === id).map((row) => row.attemptNumber)
+        )
+        await tx.$executeRaw`UPDATE notifications.notification_deliveries
+          SET "historyPrunedThrough" = GREATEST("historyPrunedThrough", ${through}) WHERE id = ${id}`
+      }
+      return removed.length
+    })
+  }
+
+  private async deleteTransactional(
+    run: (tx: Prisma.TransactionClient) => Promise<number>
+  ): Promise<number> {
+    let total = 0
+    for (let cycle = 0; cycle < RETENTION_MAX_CYCLES; cycle += 1) {
+      const count = await this.prisma.$transaction(
+        async (tx) => {
+          await tx.$queryRaw`SELECT set_config('lock_timeout', '500ms', true), set_config('statement_timeout', '2000ms', true)`
+          return run(tx)
+        },
+        { timeout: 5000 }
+      )
+      total += count
+      if (!count) break
+    }
+    return total
+  }
+
+  /**
+   * Prune one-time link tokens past the window. Guarded to expired/consumed rows so a
+   * still-bindable token is never swept (the token TTL is far shorter than the window,
+   * so this is defense-in-depth, not the primary bound).
+   */
+  private deleteTelegramLinkTokens(cutoff: Date | Prisma.Sql): Promise<number> {
+    return this.deleteInBatches(
+      (limit) => Prisma.sql`
+        DELETE FROM "notifications"."telegram_link_tokens"
+        WHERE id IN (
+          SELECT id FROM "notifications"."telegram_link_tokens"
+          WHERE "createdAt" < ${cutoff}
+            AND ("consumedAt" IS NOT NULL OR "expiresAt" < ${cutoff})
+          LIMIT ${limit}
+        )
+      `
+    )
+  }
+
+  /** Prune durable `update_id` dedupe receipts older than the window. */
+  private deleteTelegramUpdateReceipts(cutoff: Date | Prisma.Sql): Promise<number> {
+    return this.deleteInBatches(
+      (limit) => Prisma.sql`
+        DELETE FROM "notifications"."telegram_update_receipts"
+        WHERE "updateId" IN (
+          SELECT "updateId" FROM "notifications"."telegram_update_receipts"
+          WHERE "receivedAt" < ${cutoff}
+          LIMIT ${limit}
+        )
+      `
+    )
+  }
+
+  /** Run a delete in bounded batches until a short batch (or the cycle cap) is reached. */
+  private async deleteInBatches(build: (limit: number) => Prisma.Sql): Promise<number> {
+    let total = 0
+    for (let cycle = 0; cycle < RETENTION_MAX_CYCLES; cycle += 1) {
+      const deleted = await this.prisma.$executeRaw(build(RETENTION_BATCH_LIMIT))
+      total += deleted
+      if (deleted < RETENTION_BATCH_LIMIT) break
+    }
+    return total
+  }
+}

@@ -1,0 +1,233 @@
+import { Injectable } from '@nestjs/common'
+
+import { type RequestPrincipal } from '@amcore/shared'
+
+import {
+  AppException,
+  BusinessRuleViolationException,
+  ConflictException,
+  ForbiddenException,
+  NotFoundException,
+} from '../../common/exceptions/index.js'
+import type { Prisma } from '../../generated/prisma/client.js'
+import { AuditActorType, AuditTargetType } from '../../generated/prisma/client.js'
+import { PrismaService } from '../../prisma/index.js'
+import { ApiKeyRevocationService } from '../api-keys/api-key-revocation.service.js'
+import { AuditLogService } from '../audit/index.js'
+
+import type { MemberKeyActor } from './member-api-keys/member-key-actor.js'
+import { authorizeMemberKeys, lockKeyActor } from './member-api-keys/member-key-authority.js'
+import {
+  MEMBER_KEY_TRANSACTION,
+  memberKeyTimeouts,
+  memberKeyWriteFailure,
+} from './member-api-keys/member-key-transaction.js'
+import { recordMemberRoles } from './member-role-audit.js'
+import { lockOrganizationMembers } from './organization-mutation-lock.js'
+import { OrganizationsService } from './organizations.service.js'
+import { RoleAssignabilityService } from './role-assignability.service.js'
+import { getSystemRoleId } from './system-role.js'
+
+type PrismaTx = Prisma.TransactionClient
+
+/**
+ * Membership lifecycle service for `MembersController`.
+ *
+ * Previously also owned the `invite()` flow with the
+ * "user must already exist" contract. Stage C of OB-02 moved the
+ * invite flow to `InviteService` (pending-invite, uniform 202
+ * response, accept-at-membership). The post-membership operations
+ * — removeMember / assignRole / removeRole — stay here.
+ */
+@Injectable()
+export class MemberService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly orgsService: OrganizationsService,
+    private readonly roleAssignability: RoleAssignabilityService,
+    private readonly audit: AuditLogService,
+    private readonly keyRevocation: ApiKeyRevocationService
+  ) {}
+
+  async removeMember(
+    orgId: string,
+    targetUserId: string,
+    actor: MemberKeyActor,
+    expectedMemberId?: string
+  ): Promise<void> {
+    this.assertOrgContext(actor.principal, orgId)
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        await memberKeyTimeouts(tx)
+        const role = await lockKeyActor(tx, actor)
+        await lockOrganizationMembers(tx, orgId)
+        await authorizeMemberKeys(tx, orgId, actor, role, true)
+        const member = await tx.orgMember.findUnique({
+          where: { userId_organizationId: { userId: targetUserId, organizationId: orgId } },
+        })
+        if (!member) throw new NotFoundException('Member not found in this organization')
+        if (expectedMemberId !== undefined && member.id !== expectedMemberId)
+          throw new AppException('Membership identity changed', 409, 'MEMBER_ROLES_CONFLICT')
+        await this.assertNotLastAdmin(orgId, targetUserId, tx)
+        const counts = await this.keyRevocation.revokeMember(
+          tx,
+          orgId,
+          targetUserId,
+          actor.principal.sub,
+          'membership_removed'
+        )
+        await this.audit.record(
+          {
+            action: 'organization.member_removed',
+            actorId: actor.principal.sub,
+            actorType: AuditActorType.USER,
+            organizationId: orgId,
+            targetId: targetUserId,
+            targetType: AuditTargetType.USER,
+            metadata: {
+              memberId: member.id,
+              selectedKeyCount: counts.requestedCount,
+              revokedKeyCount: counts.affectedCount,
+              reason: 'membership_removed',
+            },
+          },
+          { tx }
+        )
+        await tx.orgMember.delete({ where: { id: member.id } })
+        await this.orgsService.bumpAclVersionTx(orgId, tx)
+      }, MEMBER_KEY_TRANSACTION)
+    } catch (error) {
+      memberKeyWriteFailure(error)
+    }
+    await this.orgsService.invalidateAclVersion(orgId).catch(() => undefined)
+  }
+
+  async assignRole(
+    orgId: string,
+    targetUserId: string,
+    roleId: string,
+    principal: RequestPrincipal
+  ): Promise<void> {
+    this.assertOrgContext(principal, orgId)
+
+    // OA-05: role-ownership validation + assignment in the same
+    // transaction so the role's organizationId can't change between
+    // check and write. Conflict detection is hoisted into the same
+    // transaction for the same reason.
+    // OA-12: bump aclVersion inside the same transaction.
+    await this.prisma.$transaction(async (tx) => {
+      await lockOrganizationMembers(tx, orgId)
+      const member = await tx.orgMember.findUnique({
+        where: { userId_organizationId: { userId: targetUserId, organizationId: orgId } },
+      })
+      if (!member) throw new NotFoundException('Member not found in this organization')
+
+      await this.roleAssignability.assert(roleId, orgId, tx)
+
+      const alreadyAssigned = await tx.memberRole.findUnique({
+        where: { memberId_roleId: { memberId: member.id, roleId } },
+      })
+      if (alreadyAssigned) throw new ConflictException('Member already has this role')
+
+      await tx.memberRole.create({ data: { memberId: member.id, roleId } })
+      await recordMemberRoles(
+        this.audit,
+        tx,
+        orgId,
+        member.id,
+        targetUserId,
+        principal,
+        1,
+        0,
+        'assign'
+      )
+      await this.orgsService.bumpAclVersionTx(orgId, tx)
+    })
+    await this.orgsService.invalidateAclVersion(orgId)
+  }
+
+  async removeRole(
+    orgId: string,
+    targetUserId: string,
+    roleId: string,
+    principal: RequestPrincipal
+  ): Promise<void> {
+    this.assertOrgContext(principal, orgId)
+
+    // OA-09 companion: lock + read + assertion + write all inside one
+    // transaction. See `removeMember` for the full rationale on the
+    // advisory lock.
+    await this.prisma.$transaction(async (tx) => {
+      await lockOrganizationMembers(tx, orgId)
+
+      const member = await tx.orgMember.findUnique({
+        where: { userId_organizationId: { userId: targetUserId, organizationId: orgId } },
+      })
+      if (!member) throw new NotFoundException('Member not found in this organization')
+
+      const adminRoleId = await this.getSystemRoleId('ADMIN', tx)
+      if (roleId === adminRoleId) {
+        await this.assertNotLastAdmin(orgId, targetUserId, tx)
+      }
+
+      // OA-12: deleteMany + bump in the same transaction so a transient
+      // DB failure cannot leave the cache stale on a partial role-removal.
+      const removed = await tx.memberRole.deleteMany({ where: { memberId: member.id, roleId } })
+      if (removed.count)
+        await recordMemberRoles(
+          this.audit,
+          tx,
+          orgId,
+          member.id,
+          targetUserId,
+          principal,
+          0,
+          removed.count,
+          'remove'
+        )
+      await this.orgsService.bumpAclVersionTx(orgId, tx)
+    })
+    await this.orgsService.invalidateAclVersion(orgId)
+  }
+
+  /**
+   * Guard: target user must not be the last ADMIN in this org.
+   *
+   * Must be called inside the same transaction that performs the
+   * subsequent removal, and only after `acquireXactLock` on the
+   * org-scoped last-admin key — otherwise two callers can both pass
+   * this check and both commit, leaving the org with no admins.
+   */
+  private async assertNotLastAdmin(
+    orgId: string,
+    targetUserId: string,
+    tx: PrismaTx
+  ): Promise<void> {
+    const adminRoleId = await this.getSystemRoleId('ADMIN', tx)
+
+    const admins = await tx.memberRole.findMany({
+      where: { roleId: adminRoleId, member: { organizationId: orgId } },
+      include: { member: { select: { userId: true } } },
+    })
+
+    const isTarget = admins.some((mr) => mr.member.userId === targetUserId)
+    if (isTarget && admins.length === 1) {
+      throw new BusinessRuleViolationException(
+        'Cannot remove the last administrator from an organization'
+      )
+    }
+  }
+
+  private assertOrgContext(principal: RequestPrincipal, orgId: string): void {
+    if (principal.organizationId !== orgId) {
+      throw new ForbiddenException('Organization context does not match the operation target')
+    }
+  }
+
+  private async getSystemRoleId(
+    name: 'ADMIN',
+    db: PrismaService | PrismaTx = this.prisma
+  ): Promise<string> {
+    return getSystemRoleId(db, name)
+  }
+}

@@ -1,0 +1,275 @@
+import { DEFAULT_LOCALE, type UserResponse } from '@amcore/shared'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+import type { ContextExecutorDeps } from './context-executor'
+import { recoverFailedInvitationAuth } from './invitation-auth-failure'
+import { publishInvitedCredentials } from './invitation-auth-publication'
+import { invitationCookiePolicy } from './invitation-cookie'
+import { invitationCredentialHandler } from './invitation-credential-handler'
+import { admitInvitationFlow, newInvitationOwner } from './invitation-flow-authority'
+import { invitationOwnerStore } from './invitation-owner-store'
+import { captureInvitationRequest } from './invitation-request-snapshot'
+import type * as InvitationUpstream from './invitation-upstream'
+import { invitationBackend, InvitationBackendError } from './invitation-upstream'
+
+vi.mock('server-only', () => ({}))
+vi.mock('./invitation-request-snapshot', () => ({ captureInvitationRequest: vi.fn() }))
+vi.mock('./invitation-owner-store', () => ({ invitationOwnerStore: { compareAndSet: vi.fn() } }))
+vi.mock('./invitation-owner-lease', () => ({
+  withInvitationOwnerLease: vi.fn(async (_hash, _signal, work) => work()),
+}))
+vi.mock('./invitation-auth-publication', () => ({ publishInvitedCredentials: vi.fn() }))
+vi.mock('./invitation-auth-failure', () => ({ recoverFailedInvitationAuth: vi.fn() }))
+vi.mock('./invitation-upstream', async (original) => ({
+  ...(await original<typeof InvitationUpstream>()),
+  invitationBackend: vi.fn(),
+}))
+const deps = { store: {} } as ContextExecutorDeps
+function fixture() {
+  const now = Date.now()
+  const admitted = admitInvitationFlow(
+    newInvitationOwner('https://app.example.test', null, now),
+    {
+      credential: 'c'.repeat(43),
+      expiresAt: new Date(now + 1800000).toISOString(),
+      intent: { expectedInviteId: 'invitation-example', expectedGeneration: 1 },
+    },
+    DEFAULT_LOCALE,
+    null,
+    now
+  )
+  const snapshot = {
+    ...admitted,
+    ownerHash: 'a'.repeat(64),
+    session: null,
+    policy: invitationCookiePolicy(admitted.owner.origin),
+  }
+  const user: UserResponse = {
+    id: 'example-user',
+    name: 'Example',
+    email: 'invited@example.test',
+    emailVerified: false,
+    phone: null,
+    avatarUrl: null,
+    locale: DEFAULT_LOCALE,
+    timezone: 'UTC',
+    createdAt: new Date(now).toISOString(),
+    lastLoginAt: null,
+  }
+  const request = (kind: 'login' | 'register') =>
+    new Request(
+      `${admitted.owner.origin}/api/invitation-flows/${admitted.flow.binding.flowId}/${kind}`,
+      {
+        method: 'POST',
+        headers: { origin: admitted.owner.origin },
+        body: JSON.stringify({
+          binding: admitted.flow.binding,
+          password: 'Test-password-123!',
+          ...(kind === 'login'
+            ? { email: user.email }
+            : { name: user.name, locale: DEFAULT_LOCALE }),
+        }),
+      }
+    )
+  return { snapshot, user, request }
+}
+beforeEach(() => vi.resetAllMocks())
+function prepare(current: ReturnType<typeof fixture>) {
+  vi.mocked(captureInvitationRequest).mockResolvedValue(current.snapshot)
+  vi.mocked(invitationOwnerStore.compareAndSet).mockResolvedValue(true)
+  vi.mocked(invitationBackend).mockResolvedValue({
+    data: { user: current.user, accessToken: '<test-access>' },
+    refreshToken: '<test-refresh>',
+  })
+  vi.mocked(publishInvitedCredentials).mockResolvedValue({
+    sessionId: 's'.repeat(43),
+    binding: { ...current.snapshot.flow.binding, flowRevision: 3, sessionBinding: 'b'.repeat(64) },
+    user: current.user,
+    attemptId: 'i'.repeat(22),
+  })
+}
+describe('dedicated invited credential commands', () => {
+  it('refuses unbound legacy login without issuing authentication', async () => {
+    const current = fixture()
+    prepare(current)
+    const response = await invitationCredentialHandler(
+      current.request('login'),
+      current.snapshot.flow.binding.flowId,
+      'login',
+      deps
+    )
+    expect(response.status).toBe(503)
+    expect(invitationOwnerStore.compareAndSet).toHaveBeenCalledWith(
+      current.snapshot.ownerHash,
+      1,
+      expect.objectContaining({
+        flows: [
+          expect.objectContaining({
+            state: 'authenticating',
+            binding: expect.objectContaining({ flowRevision: 2 }),
+          }),
+        ],
+      }),
+      undefined
+    )
+    expect(invitationBackend).not.toHaveBeenCalled()
+    expect(publishInvitedCredentials).not.toHaveBeenCalled()
+    expect(response.headers.get('set-cookie')).toBeNull()
+    expect(recoverFailedInvitationAuth).toHaveBeenCalledOnce()
+  })
+  it('registers without a client-selected email and preserves the created status', async () => {
+    const current = fixture()
+    prepare(current)
+    const response = await invitationCredentialHandler(
+      current.request('register'),
+      current.snapshot.flow.binding.flowId,
+      'register',
+      deps
+    )
+    expect(response.status).toBe(201)
+    expect(invitationBackend).toHaveBeenCalledWith(
+      '/auth/invites/register',
+      expect.anything(),
+      expect.objectContaining({
+        expectedStatus: 201,
+        body: { name: 'Example', password: 'Test-password-123!', locale: DEFAULT_LOCALE },
+      })
+    )
+  })
+  it('does not issue authentication after a failed reservation CAS', async () => {
+    const current = fixture()
+    prepare(current)
+    vi.mocked(invitationOwnerStore.compareAndSet).mockResolvedValue(false)
+    expect(
+      (
+        await invitationCredentialHandler(
+          current.request('login'),
+          current.snapshot.flow.binding.flowId,
+          'login',
+          deps
+        )
+      ).status
+    ).toBe(409)
+    expect(invitationBackend).not.toHaveBeenCalled()
+    expect(publishInvitedCredentials).not.toHaveBeenCalled()
+  })
+  it('recovers an unknown issuance independently and never sets a session cookie on an error', async () => {
+    const current = fixture()
+    prepare(current)
+    vi.mocked(invitationBackend).mockRejectedValue(new InvitationBackendError(503, false))
+    const response = await invitationCredentialHandler(
+      current.request('login'),
+      current.snapshot.flow.binding.flowId,
+      'login',
+      deps
+    )
+    expect(response.status).toBe(503)
+    expect(response.headers.get('set-cookie')).toBeNull()
+    expect(recoverFailedInvitationAuth).toHaveBeenCalledWith(
+      expect.objectContaining({ snapshot: current.snapshot, store: deps.store })
+    )
+    expect(publishInvitedCredentials).not.toHaveBeenCalled()
+  })
+})
+
+describe('invited registration — confirmed creation', () => {
+  const CREATED = 'REGISTRATION_SIGN_IN_REQUIRED'
+  const flowId = (current: ReturnType<typeof fixture>) => current.snapshot.flow.binding.flowId
+  const never = () => new Promise<never>(() => undefined)
+
+  it('reports a created account when publication fails after the API confirmed it', async () => {
+    const current = fixture()
+    prepare(current)
+    vi.mocked(publishInvitedCredentials).mockRejectedValue(new Error('vault unavailable'))
+    const response = await invitationCredentialHandler(
+      current.request('register'),
+      flowId(current),
+      'register',
+      deps
+    )
+    expect(response.status).toBe(503)
+    expect(response.headers.get('set-cookie')).toBeNull()
+    expect(response.headers.get('retry-after')).toBeNull()
+    await expect(response.json()).resolves.toMatchObject({ errorCode: CREATED })
+    expect(recoverFailedInvitationAuth).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps login failures on their existing mapping', async () => {
+    const current = fixture()
+    prepare(current)
+    vi.mocked(publishInvitedCredentials).mockRejectedValue(new Error('vault unavailable'))
+    const response = await invitationCredentialHandler(
+      current.request('login'),
+      flowId(current),
+      'login',
+      deps
+    )
+    expect((await response.json()).errorCode).not.toBe(CREATED)
+  })
+
+  it('does not claim creation when the API gave no confirmed answer', async () => {
+    const current = fixture()
+    prepare(current)
+    vi.mocked(invitationBackend).mockRejectedValue(new InvitationBackendError(503, false))
+    const response = await invitationCredentialHandler(
+      current.request('register'),
+      flowId(current),
+      'register',
+      deps
+    )
+    expect(response.status).toBe(503)
+    expect((await response.json()).errorCode).not.toBe(CREATED)
+    expect(publishInvitedCredentials).not.toHaveBeenCalled()
+  })
+
+  it('classifies an outer abort that wins while publication and cleanup are still pending', async () => {
+    const current = fixture()
+    prepare(current)
+    vi.mocked(publishInvitedCredentials).mockImplementation(never)
+    vi.mocked(recoverFailedInvitationAuth).mockImplementation(never)
+    const controller = new AbortController()
+    const request = new Request(current.request('register'), { signal: controller.signal })
+    const pending = invitationCredentialHandler(request, flowId(current), 'register', deps)
+    await vi.waitFor(() => expect(publishInvitedCredentials).toHaveBeenCalled())
+    controller.abort()
+    const response = await pending
+    expect(response.status).toBe(503)
+    expect(response.headers.get('set-cookie')).toBeNull()
+    await expect(response.json()).resolves.toMatchObject({ errorCode: CREATED })
+  })
+
+  it('does not claim creation when the abort wins before the API evidence', async () => {
+    const current = fixture()
+    prepare(current)
+    vi.mocked(invitationBackend).mockImplementation(never)
+    const controller = new AbortController()
+    const request = new Request(current.request('register'), { signal: controller.signal })
+    const pending = invitationCredentialHandler(request, flowId(current), 'register', deps)
+    await vi.waitFor(() => expect(invitationBackend).toHaveBeenCalled())
+    controller.abort()
+    const response = await pending
+    expect((await response.json()).errorCode).not.toBe(CREATED)
+    expect(response.headers.get('set-cookie')).toBeNull()
+  })
+
+  it('does not revise an unknown response when the API result arrives late', async () => {
+    const current = fixture()
+    prepare(current)
+    let resolveLate!: (value: Awaited<ReturnType<typeof invitationBackend>>) => void
+    vi.mocked(invitationBackend).mockImplementation(
+      () => new Promise((resolve) => (resolveLate = resolve))
+    )
+    vi.mocked(publishInvitedCredentials).mockImplementation(never)
+    const controller = new AbortController()
+    const request = new Request(current.request('register'), { signal: controller.signal })
+    const pending = invitationCredentialHandler(request, flowId(current), 'register', deps)
+    await vi.waitFor(() => expect(invitationBackend).toHaveBeenCalled())
+    controller.abort()
+    const response = await pending
+    const body = await response.json()
+    resolveLate({ data: { user: current.user, accessToken: '<late>' }, refreshToken: '<late>' })
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(body.errorCode).not.toBe(CREATED)
+    expect(response.headers.get('set-cookie')).toBeNull()
+  })
+})

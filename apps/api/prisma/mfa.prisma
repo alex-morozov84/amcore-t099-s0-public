@@ -1,0 +1,232 @@
+// Account security state stays separate from the legacy User scalar contract.
+model MfaAccount {
+  userId            String  @id
+  securityVersion   Int     @default(0)
+  required          Boolean @default(false)
+  setupComplete     Boolean @default(false)
+  codeGeneration    Int     @default(0)
+  emergencyRequired Boolean @default(false)
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("mfa_accounts")
+  @@schema("core")
+}
+
+// Authentication authority is retained when Console frontend is removed.
+model MfaProtocol {
+  id        String   @id @default("platform")
+  state     String   @default("prepared")
+  version   Int      @default(1)
+  updatedAt DateTime @updatedAt
+
+  @@map("mfa_protocol")
+  @@schema("core")
+}
+
+model MfaFactor {
+  id               String   @id @default(cuid())
+  userId           String   @unique
+  encryptedSeed    String
+  keyId            String
+  version          Int      @default(1)
+  lastAcceptedStep BigInt   @default(-1)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("mfa_factors")
+  @@schema("core")
+}
+
+model MfaRecoveryCode {
+  id         String    @id @default(cuid())
+  userId     String
+  generation Int
+  hash       String    @unique
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, generation])
+  @@map("mfa_recovery_codes")
+  @@schema("core")
+}
+
+model MfaRecoveryTicket {
+  id               String    @id @default(cuid())
+  userId           String    @unique
+  credentialHash   String    @unique
+  securityVersion  Int
+  expiresAt        DateTime
+  consumedAt       DateTime?
+  consumedByFlowId String?   @unique
+  createdAt        DateTime  @default(now())
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+  @@map("mfa_recovery_tickets")
+  @@schema("core")
+}
+
+model AuthSessionFamily {
+  id                    String    @id
+  userId                String
+  securityVersion       Int
+  primaryMethod         String    @default("password")
+  primaryAt             DateTime?
+  primaryProofId        String?
+  mfaMethod             String?
+  mfaAt                 DateTime?
+  mfaProofId            String?
+  factorVersion         Int?
+  recoveryGeneration    Int?
+  publicationState      String    @default("pending")
+  receiptHash           String?   @unique
+  publicationDeadline   DateTime?
+  browserContextId      String?
+  publicationGeneration Int?
+  expiresAt             DateTime
+  lastAccessIssuedAt    DateTime?
+  retainUntil           DateTime?
+  revokedAt             DateTime?
+  createdAt             DateTime  @default(now())
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  browserContext        BrowserAuthContext? @relation(fields: [browserContextId], references: [id])
+
+  @@index([userId, revokedAt])
+  @@index([publicationState, publicationDeadline])
+  @@index([retainUntil])
+  @@index([browserContextId])
+  @@map("auth_session_families")
+  @@schema("core")
+}
+
+model BrowserAuthContext {
+  id                String    @id @default(cuid())
+  bindingHash       String    @unique
+  audience          String
+  generation        Int       @default(0)
+  state             String    @default("empty")
+  reservedFlowId    String?
+  currentFamilyId   String?
+  stagedBindingHash String?
+  expiresAt         DateTime
+  createdAt         DateTime  @default(now())
+  families          AuthSessionFamily[]
+
+  @@index([expiresAt])
+  @@map("browser_auth_contexts")
+  @@schema("core")
+}
+
+model MfaFlow {
+  id                    String    @id @default(cuid())
+  credentialHash        String    @unique
+  userId                String
+  purpose               String
+  authorityKind         String
+  audience              String
+  bindingHash           String
+  state                 String    @default("open")
+  securityVersion       Int
+  sourceFamilyId        String?
+  sourceSecurityVersion Int?
+  browserContextId      String?
+  publicationGeneration Int?
+  primaryAt             DateTime?
+  mfaAt                 DateTime?
+  mfaMethod             String?
+  factorVersion         Int?
+  recoveryGeneration    Int?
+  transferId            String?   @unique
+  data                  Json      @default("{}")
+  attempts              Int       @default(0)
+  expiresAt             DateTime
+  createdAt             DateTime  @default(now())
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  operations            MfaOperation[]
+
+  @@index([userId, expiresAt])
+  @@index([userId, securityVersion, state])
+  @@index([browserContextId])
+  @@index([expiresAt])
+  @@map("mfa_flows")
+  @@schema("core")
+}
+
+model MfaOperation {
+  id        String   @id
+  flowId    String
+  kind      String
+  result    Json
+  createdAt DateTime @default(now())
+  flow      MfaFlow  @relation(fields: [flowId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt])
+  @@index([flowId, kind])
+  @@map("mfa_operations")
+  @@schema("core")
+}
+
+model MfaAttemptBudget {
+  userId    String   @id
+  failures  Json     @default("[]")
+  starts    Json     @default("[]")
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("mfa_attempt_budgets")
+  @@schema("core")
+}
+
+model MfaSettingsStartReceipt {
+  operationId           String   @id
+  userId                String
+  sourceFamilyId        String
+  sourceSecurityVersion Int
+  sourceSessionId       String
+  browserContextId      String
+  generation            Int
+  audience              String
+  bindingHash           String
+  purpose               String
+  startNotAfter         DateTime
+  state                 String
+  flowId                String?
+  expiresAt             DateTime
+  createdAt             DateTime @default(now())
+  user                  User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+  @@index([userId, sourceFamilyId])
+  @@map("mfa_settings_start_receipts")
+  @@schema("core")
+}
+
+model BrowserLogoutReceipt {
+  operationId           String   @id
+  returnEntryId         String   @unique
+  credentialHash        String
+  userId                String
+  sourceFamilyId        String
+  securityVersion       Int
+  sourceSessionId       String
+  contextId             String
+  audience              String
+  bindingHash           String
+  beforeGeneration      Int
+  afterGeneration       Int
+  expiresAt             DateTime
+  committedAt           DateTime @default(now())
+  neutralAttemptId      String?  @unique
+  reservedFlowId        String?  @unique
+  reservedGeneration    Int?
+  completionId          String?
+  publishedFamilyId     String?
+  user                  User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+  @@index([contextId])
+  @@map("browser_logout_receipts")
+  @@schema("core")
+}

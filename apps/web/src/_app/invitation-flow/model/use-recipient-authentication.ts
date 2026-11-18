@@ -1,0 +1,262 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  AuthErrorCode,
+  frontendAuthPath,
+  type InvitationFlowBinding,
+  type UserResponse,
+} from '@amcore/shared'
+import { useQueryClient } from '@tanstack/react-query'
+
+import { invitationFlowClient } from '@/entities/invitation-flow'
+import { userKeys } from '@/entities/user'
+import { ClientErrorCode, ClientStateError } from '@/shared/api/error-codes'
+import { getErrorCode } from '@/shared/api/errors'
+import { publishCurrentUser, type UserEnvelope } from '@/shared/api/query-session'
+import { useRouteProgressRouter } from '@/shared/lib/route-progress/use-route-progress-router'
+
+import { createInvitationCredentialAdapters } from './credential-adapters'
+
+type Phase = 'active' | 'authenticating' | 'completing_signin' | 'retired' | 'unusable'
+const changed = () => new ClientStateError(ClientErrorCode.AUTH_CONTINUATION_CHANGED)
+
+/** Application auth/cache wiring; credentials and headless presentation remain separate boundaries. */
+export function useRecipientAuthentication(
+  initial: InvitationFlowBinding,
+  initialUser: UserResponse | null,
+  actionBase: '/auth' | '/product-admin/auth' = '/auth'
+) {
+  const router = useRouteProgressRouter()
+  const [binding, setBinding] = useState(initial)
+  const [user, setUser] = useState(initialUser)
+  const [phase, setPhase] = useState<Phase>('active')
+  const [handoff, setHandoff] = useState<string | null>(null)
+  const [error, setError] = useState<unknown>()
+  const [busy, setBusy] = useState(false)
+  // The API confirmed the account but no session was published. Kept apart from `error`,
+  // which later reads and sign-in attempts replace; it lives above the auth form, so the
+  // notice survives remounts and tab changes (not a full page reload).
+  const [createdFailure, setCreatedFailure] = useState<unknown>()
+  const lifecycle = useRef({ active: true, epoch: 0 })
+  const confirmedBinding = useRef(initial.sessionBinding)
+  const recoverRef = useRef<() => Promise<void>>(async () => undefined)
+  const client = useQueryClient()
+  useEffect(() => {
+    lifecycle.current.active = true
+    return () => {
+      lifecycle.current.active = false
+      lifecycle.current.epoch++
+    }
+  }, [])
+  const confirmed = async (
+    next: InvitationFlowBinding,
+    account: UserResponse | null,
+    contextSession?: string
+  ) => {
+    const captured = lifecycle.current.epoch
+    const old = client.getQueryData<UserEnvelope>(userKeys.me())
+    const token =
+      contextSession ??
+      (account &&
+      user?.id === account.id &&
+      old?.user?.id === account.id &&
+      confirmedBinding.current === next.sessionBinding
+        ? old.contextSession
+        : undefined)
+    if (
+      !(await publishCurrentUser(
+        client,
+        { user: account, ...(token ? { contextSession: token } : {}) },
+        () => lifecycle.current.active && lifecycle.current.epoch === captured
+      ))
+    )
+      return null
+    confirmedBinding.current = next.sessionBinding
+    setBinding(next)
+    setUser(account)
+    setPhase('active')
+    setHandoff(null)
+    setError(undefined)
+    if (account) setCreatedFailure(undefined)
+    if (account && !token) void client.invalidateQueries({ queryKey: userKeys.me() })
+    return ++lifecycle.current.epoch
+  }
+  const adapters = useMemo(() => {
+    let captured: number | undefined
+    return createInvitationCredentialAdapters({
+      binding,
+      onMfaRequired: (flowBinding) =>
+        router.replace(
+          `${frontendAuthPath(actionBase === '/auth' ? 'site' : 'admin', '/mfa')}?flow=${encodeURIComponent(flowBinding)}`
+        ),
+      isCurrent: () =>
+        lifecycle.current.active &&
+        (captured === undefined || lifecycle.current.epoch === captured),
+      onStart: () => {
+        captured = lifecycle.current.epoch
+        setPhase('authenticating')
+        setError(undefined)
+      },
+      onHandoff: (next, attemptId) => {
+        setBinding(next)
+        setHandoff(attemptId)
+        setPhase('completing_signin')
+      },
+      onConfirmed: (next, account) => {
+        confirmedBinding.current = next.sessionBinding
+        setUser(account)
+        setBinding(next)
+        setPhase('active')
+        setHandoff(null)
+        setError(undefined)
+        setCreatedFailure(undefined)
+        lifecycle.current.epoch++
+      },
+      async onFailure(failure) {
+        setError(failure)
+        const code = getErrorCode(failure)
+        if (code === AuthErrorCode.REGISTRATION_SIGN_IN_REQUIRED) {
+          // The account exists but no session was published. Keep the notice, then read the
+          // authoritative context through the existing recovery path; never replay credentials.
+          setCreatedFailure(failure)
+          setError(undefined)
+          await recoverRef.current()
+          return
+        }
+        if (
+          code !== AuthErrorCode.INVALID_CREDENTIALS &&
+          code !== AuthErrorCode.RATE_LIMIT_EXCEEDED
+        )
+          return
+        // Rejection advances the server revision. Read its authoritative binding before retrying.
+        try {
+          const current = await invitationFlowClient.context(
+            binding.flowId,
+            AbortSignal.timeout(10000)
+          )
+          if (!lifecycle.current.active || lifecycle.current.epoch !== captured) return
+          if (
+            'state' in current ||
+            current.binding.flowId !== binding.flowId ||
+            current.binding.sessionBinding !== binding.sessionBinding
+          )
+            return
+          setBinding(current.binding)
+          setPhase('active')
+          setHandoff(null)
+        } catch {
+          // Failed synchronization still needs explicit recovery; never replay credentials.
+        }
+      },
+    })
+  }, [binding, actionBase, router])
+  async function recover() {
+    if (busy || !lifecycle.current.active) return
+    const captured = lifecycle.current.epoch
+    setBusy(true)
+    setError(undefined)
+    try {
+      const response = handoff
+        ? await invitationFlowClient.acknowledge(binding, handoff, AbortSignal.timeout(15000))
+        : await invitationFlowClient.context(binding.flowId, AbortSignal.timeout(10000))
+      if (!lifecycle.current.active || lifecycle.current.epoch !== captured) return
+      if (response.binding.flowId !== initial.flowId) throw changed()
+      if (
+        handoff &&
+        (!('handoff' in response) ||
+          response.handoff.attemptId !== handoff ||
+          response.binding.flowRevision !== binding.flowRevision ||
+          response.binding.sessionBinding !== binding.sessionBinding)
+      )
+        throw changed()
+      if ('state' in response) {
+        setBinding(response.binding)
+        setPhase(response.state)
+        setHandoff(response.state === 'completing_signin' ? response.handoff.attemptId : null)
+        return
+      }
+      if ('user' in response.data) {
+        await confirmed(response.binding, response.data.user, response.data.contextSession)
+        return
+      }
+      if (response.binding.sessionBinding === null) {
+        await confirmed(response.binding, null)
+      } else {
+        const profile = await invitationFlowClient.verificationStatus(
+          response.binding,
+          AbortSignal.timeout(10000)
+        )
+        if (!lifecycle.current.active || lifecycle.current.epoch !== captured) return
+        await confirmed(profile.binding, profile.data.user)
+      }
+    } catch (failure) {
+      if (lifecycle.current.active && lifecycle.current.epoch === captured) {
+        const code = getErrorCode(failure)
+        if (code === 'INVITE_INVALID_OR_EXPIRED' || code === 'INVITE_FLOW_CHANGED') {
+          lifecycle.current.epoch++
+          setUser(null)
+          setHandoff(null)
+          setCreatedFailure(undefined)
+          setPhase(code === 'INVITE_INVALID_OR_EXPIRED' ? 'unusable' : 'retired')
+        } else setError(failure)
+      }
+    } finally {
+      if (lifecycle.current.active) setBusy(false)
+    }
+  }
+  useEffect(() => {
+    recoverRef.current = recover
+  })
+  const observePending = useCallback(
+    (
+      next: InvitationFlowBinding,
+      state: 'authenticating' | 'completing_signin',
+      attemptId?: string
+    ) => {
+      setBinding(next)
+      setPhase(state)
+      setHandoff(attemptId ?? null)
+    },
+    []
+  )
+  const retire = useCallback(() => {
+    lifecycle.current.active = false
+    lifecycle.current.epoch++
+    setPhase('retired')
+    setUser(null)
+    setHandoff(null)
+    setCreatedFailure(undefined)
+  }, [])
+  return {
+    binding,
+    user,
+    phase,
+    handoff,
+    error,
+    created: createdFailure !== undefined,
+    createdFailure,
+    busy,
+    adapters,
+    recover,
+    observePending,
+    retire,
+    capture: () => lifecycle.current.epoch,
+    current: (captured: number) => lifecycle.current.active && lifecycle.current.epoch === captured,
+    updateUser(account: UserResponse) {
+      if (
+        !lifecycle.current.active ||
+        user?.id !== account.id ||
+        confirmedBinding.current !== binding.sessionBinding
+      )
+        return
+      setUser(account)
+      client.setQueryData<UserEnvelope>(userKeys.me(), (old) =>
+        old?.user?.id === account.id ? { ...old, user: account } : old
+      )
+      void client.invalidateQueries({ queryKey: userKeys.me() })
+    },
+    signedOut(next: InvitationFlowBinding) {
+      setCreatedFailure(undefined)
+      return confirmed(next, null)
+    },
+  }
+}

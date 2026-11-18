@@ -1,0 +1,79 @@
+# Operations Console
+
+The Operations Console is AMCore's optional control plane for platform
+super-administrators. It is separate from a product's own administration area:
+an organization owner or administrator does not gain Console access through
+their organization role.
+
+## Contents
+
+| Screen                                    | Use it to                                                                                                                                   |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Overview](overview.md)                   | Find recorded problems and open diagnostics; check API/files/resources, open monitoring tools and edit probe interval.                      |
+| [Background work](background-work.md)     | Diagnose registered work and use policy-eligible pause, resume, retry, cancel and cleanup.                                                  |
+| [Scheduled jobs](scheduled-jobs.md)       | Check that nightly cleanups, the GeoIP update and recovery passes keep running (view-only).                                                 |
+| [Integrations](integrations.md)           | See which outside services are set up and last confirmed, including whether the workers reach Telegram; send a test email to yourself.      |
+| [Queue board](queue-board.md)             | Look at the jobs of the background queues (view-only), opened from Background work.                                                         |
+| [Users](users.md)                         | Find users, inspect sign-in setup and memberships, send recovery/verification mail, investigate security events, manage roles and sessions. |
+| [Organizations](organizations.md)         | Create organizations and invite their first ADMIN; initial setup, inventory and members.                                                    |
+| [API keys](api-keys.md)                   | Inspect credential metadata and irreversibly revoke one or selected keys.                                                                   |
+| [Sign-in protection](account-security.md) | Manage the authenticator app and one-use backup codes after approved deployment activation.                                                 |
+| [Audit](audit.md)                         | Browse recent system events and narrow them by action, identity, or time.                                                                   |
+
+The Console also has a [configuration and deployment guide](configuration.md)
+for operators who set it up and a [development guide](development.md) for teams
+adding panels. The [persistent audit log guide](../operations/audit-log.md)
+describes how events are recorded and protected across the application; the
+[Audit screen guide](audit.md) explains how to browse them. The
+[retained runtime settings guide](../backend/settings.md) covers the operator API,
+runtime recovery and extension contract independently of the optional Console.
+
+## Get access
+
+Your account must already have the platform `SUPER_ADMIN` system role. There is
+no first-admin or self-promotion screen. A current `SUPER_ADMIN` can change a
+user's role in [Users](users.md#change-a-users-system-role); the first admin is
+created through the [bootstrap procedure](../auth/rbac.md#administering-super_admin).
+Organization roles alone do not grant access.
+
+The sign-in address depends on how the Console was configured:
+
+- **Path mode:** Sign in through the product's normal login, then open its
+  Console path. In the upstream multi-locale setup, use `/en/admin` or
+  `/ru/admin`.
+- **Host mode:** Open `https://<ADMIN_CONSOLE_HOSTNAME>/{locale}/login` and sign in
+  with your email and password.
+  A product login on another host does not sign you into the Console. Use
+  **Sign out** in the Console to end only its session. Console OAuth sign-in
+  is not supported.
+
+The protected Console shows a not-found response if access is absent or denied.
+If its access check explicitly reports a service outage, it shows an
+unavailable state instead. A `SUPER_ADMIN` demotion takes effect on the next
+protected request. See [configuration and deployment](configuration.md) for the
+session and routing details.
+
+Choose `disabled`, `path` or `host`, or rename the Console alias, through
+[Console configuration](configuration.md#topology). Disabling closes frontend entrypoints;
+it keeps source files and does not disable the generic backend admin API.
+
+## Display time zone
+
+The header's **Time** selector controls how Console dates are displayed. Choose
+**UTC** or **Local time**, determined by your browser. The local option identifies
+the zone and current UTC offset; the header shows the selected offset explicitly.
+The preference is saved for this browser origin, across reloads and Console pages,
+and defaults to UTC when storage is unavailable. It does not change stored event
+timestamps or the instants submitted in Audit queries.
+
+## Scope
+
+The Console includes the screens listed here, with user and organization detail
+pages accessible from the lists and from current identities in Audit.
+Background work provides pause, resume, retry, cancel and cleanup when the
+registered policy permits them. The queue board remains read-only.
+
+Notification deliveries and AI run executions use the common
+[Background work controls](background-work.md#ai-run-executions). Their wake queues
+remain separate. Historical metrics are not available.
+Product administration belongs in a separate area with its own roles and permissions.

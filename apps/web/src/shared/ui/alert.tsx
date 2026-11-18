@@ -1,0 +1,85 @@
+import * as React from 'react'
+import { cva, type VariantProps } from 'class-variance-authority'
+
+import { cn } from '@/shared/lib/utils'
+
+import { DismissibleAlert } from './alert-dismissible'
+
+type DismissalProps =
+  | { showCloseButton?: false; closeLabel?: never; dismissFocusTargetId?: never }
+  | { showCloseButton: true; closeLabel: string; dismissFocusTargetId: string }
+
+const alertVariants = cva(
+  'relative w-full rounded-lg border px-4 py-3 text-sm grid has-[>svg]:grid-cols-[calc(var(--spacing)*4)_1fr] grid-cols-[0_1fr] has-[>svg]:gap-x-3 gap-y-0.5 items-start [&>svg]:size-4 [&>svg]:translate-y-0.5 [&>svg]:text-current',
+  {
+    variants: {
+      variant: {
+        default: 'bg-card text-card-foreground',
+        // A tinted surface and a coloured border make a failure stand out from the white cards it
+        // sits on. The text stays in the normal foreground colour: red text on a red tint measured
+        // below the 4.5:1 WCAG AA minimum (axe `color-contrast`), so colour is carried by the
+        // border, the surface and the icon instead.
+        destructive:
+          'border-destructive/60 bg-destructive/10 text-card-foreground [&>svg]:text-destructive',
+        // Something to notice but not a failure (a conflict, an unknown result, pending impact).
+        warning: 'border-warning/60 bg-warning-soft text-card-foreground [&>svg]:text-warning',
+      },
+    },
+    defaultVariants: {
+      variant: 'default',
+    },
+  }
+)
+
+function Alert({
+  className,
+  variant,
+  showCloseButton = false,
+  closeLabel,
+  dismissFocusTargetId,
+  ...props
+}: React.ComponentProps<'div'> & VariantProps<typeof alertVariants> & DismissalProps) {
+  if (showCloseButton)
+    return (
+      <DismissibleAlert
+        role="alert"
+        {...props}
+        className={cn(alertVariants({ variant }), className, 'pr-14')}
+        closeLabel={closeLabel!}
+        dismissFocusTargetId={dismissFocusTargetId!}
+      />
+    )
+  return (
+    <div
+      data-slot="alert"
+      role="alert"
+      className={cn(alertVariants({ variant }), className)}
+      {...props}
+    />
+  )
+}
+
+function AlertTitle({ className, ...props }: React.ComponentProps<'div'>) {
+  return (
+    <div
+      data-slot="alert-title"
+      className={cn('col-start-2 line-clamp-1 min-h-4 font-medium tracking-tight', className)}
+      {...props}
+    />
+  )
+}
+
+function AlertDescription({ className, ...props }: React.ComponentProps<'div'>) {
+  return (
+    <div
+      data-slot="alert-description"
+      className={cn(
+        'text-muted-foreground col-start-2 grid justify-items-start gap-1 text-sm [&_p]:leading-relaxed',
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+export { Alert, AlertDescription, AlertTitle }

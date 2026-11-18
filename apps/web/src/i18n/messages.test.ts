@@ -1,0 +1,115 @@
+import { LOCALE_CATALOGUES, SERVED_LOCALES } from '@amcore/shared'
+import { describe, expect, it } from 'vitest'
+
+import en from '../../messages/en.json'
+import ru from '../../messages/ru.json'
+
+import { routing } from './routing'
+
+type Catalogue = Record<string, unknown>
+
+const catalogues: Record<string, Catalogue> = { en, ru }
+
+/** Flatten to dotted leaf paths, e.g. `auth.login`. */
+function leafPaths(value: unknown, prefix = ''): string[] {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return [prefix]
+  }
+  return Object.entries(value as Catalogue).flatMap(([key, child]) =>
+    leafPaths(child, prefix ? `${prefix}.${key}` : key)
+  )
+}
+
+function leafEntries(value: unknown, prefix = ''): Array<[string, unknown]> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return [[prefix, value]]
+  }
+  return Object.entries(value as Catalogue).flatMap(([key, child]) =>
+    leafEntries(child, prefix ? `${prefix}.${key}` : key)
+  )
+}
+
+/**
+ * CLDR plural categories that each locale must supply whenever a message uses
+ * an ICU `plural` argument. Russian needs `few`/`many`; supplying only
+ * `one`/`other` silently renders wrong grammar for counts like 2 or 5 — and it
+ * stays invisible while testing in English, which is exactly why this is a test
+ * and not a review checklist item.
+ *
+ * NOTE: this check is currently **idle** — no web message uses an ICU plural
+ * yet, so it passes vacuously. It is kept armed deliberately rather than
+ * backed by an invented pluralized string: it bites the moment the first real
+ * one lands. The backend email catalogue does have real plurals and its
+ * equivalent guard asserts non-vacuity.
+ */
+const REQUIRED_PLURAL_CATEGORIES: Record<string, string[]> = {
+  en: ['one', 'other'],
+  ru: ['one', 'few', 'many', 'other'],
+}
+
+describe('message catalogues', () => {
+  it('has a catalogue for every catalogue locale', () => {
+    for (const locale of LOCALE_CATALOGUES) {
+      expect(Object.keys(catalogues)).toContain(locale)
+    }
+    // Guards the reverse direction too: an orphaned catalogue for a locale the
+    // shared contract does not know would render but never be reachable.
+    expect(Object.keys(catalogues).sort()).toEqual([...LOCALE_CATALOGUES].sort())
+  })
+
+  it('routing is derived from the shared locale contract', () => {
+    expect([...routing.locales].sort()).toEqual([...SERVED_LOCALES].sort())
+    expect(SERVED_LOCALES).toContain(routing.defaultLocale)
+  })
+
+  const basePaths = leafPaths(en).sort()
+
+  it.each(LOCALE_CATALOGUES.filter((locale) => locale !== 'en'))(
+    '%s has exactly the same keys as the en source catalogue',
+    (locale) => {
+      const paths = leafPaths(catalogues[locale]).sort()
+
+      // Reported as two explicit sets rather than a bare deep-equal, so a
+      // failure names the offending keys instead of dumping both catalogues.
+      const missing = basePaths.filter((path) => !paths.includes(path))
+      const extra = paths.filter((path) => !basePaths.includes(path))
+
+      expect({ missing, extra }).toEqual({ missing: [], extra: [] })
+    }
+  )
+
+  it.each(LOCALE_CATALOGUES)('%s has no empty message values', (locale) => {
+    const empty = leafEntries(catalogues[locale])
+      .filter(([, value]) => typeof value !== 'string' || value.trim() === '')
+      .map(([path]) => path)
+
+    expect(empty).toEqual([])
+  })
+
+  // next-intl reads "." in a key as nesting and reports INVALID_KEY on every render.
+  // Data codes such as audit actions use "_" in their keys instead.
+  it.each(LOCALE_CATALOGUES)('%s has no "." inside a message key', (locale) => {
+    const dotted: string[] = []
+    const walk = (value: unknown, prefix: string) => {
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) return
+      for (const [key, child] of Object.entries(value as Catalogue)) {
+        if (key.includes('.')) dotted.push(`${prefix}${key}`)
+        walk(child, `${prefix}${key}/`)
+      }
+    }
+    walk(catalogues[locale], '')
+    expect(dotted).toEqual([])
+  })
+
+  it.each(LOCALE_CATALOGUES)('%s supplies every required plural category', (locale) => {
+    const required = REQUIRED_PLURAL_CATEGORIES[locale]
+    expect(required, `no plural categories declared for ${locale}`).toBeDefined()
+
+    const offenders = leafEntries(catalogues[locale])
+      .filter(([, value]) => typeof value === 'string' && /\{[^}]*,\s*plural\s*,/.test(value))
+      .filter(([, value]) => !required!.every((category) => (value as string).includes(category)))
+      .map(([path]) => path)
+
+    expect(offenders).toEqual([])
+  })
+})

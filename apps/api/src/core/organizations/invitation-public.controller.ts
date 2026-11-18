@@ -1,0 +1,132 @@
+import { Body, Controller, Headers, HttpCode, Post, Req, Res, UseGuards } from '@nestjs/common'
+import {
+  ApiBadRequestResponse,
+  ApiConflictResponse,
+  ApiForbiddenResponse,
+  ApiHeader,
+  ApiOperation,
+  ApiServiceUnavailableResponse,
+  ApiTags,
+  ApiTooManyRequestsResponse,
+} from '@nestjs/swagger'
+import type { Request, Response } from 'express'
+
+import { AuthType } from '@amcore/shared'
+
+import { SchemaResponse } from '../../common/schemas/schema-response.js'
+import { resolveSessionIpAddress } from '../../common/utils/verified-visitor-ip.js'
+import { EnvService } from '../../env/env.service.js'
+import { RateLimit } from '../../infrastructure/throttling/index.js'
+import { AuthService } from '../auth/auth.service.js'
+import { Auth } from '../auth/decorators/auth.decorator.js'
+import { PasswordLoginResponseDto } from '../auth/dto/index.js'
+import { negotiateLocale } from '../auth/locale-negotiation.js'
+import { ApiRegistrationPublication } from '../auth/mfa/mfa-registration.openapi.js'
+import { registrationBrowserIntent } from '../auth/mfa/mfa-registration-publication.js'
+import {
+  OrganizationContextBoundary,
+  RequestContextPolicy,
+} from '../auth/organization-context/request-context-policy.js'
+import { ApiFrontendContext } from '../frontend-context/frontend-context.openapi.js'
+import { browserFrontendContext } from '../frontend-context/frontend-context.service.js'
+import { invitationHandoffProof } from '../invitations/invitation-auth-handoff.js'
+import { InvitationContinuationService } from '../invitations/invitation-continuation.service.js'
+import { InvitationRequestGuard } from '../invitations/invitation-request.guard.js'
+
+import {
+  InvitationAdmissionDto,
+  InvitationAdmissionResponseDto,
+  InvitationContextDto,
+  InvitedRegisterDto,
+} from './dto/invitation-recipient.dto.js'
+
+@ApiFrontendContext()
+@ApiTags('auth')
+@ApiBadRequestResponse({ description: 'Invalid, expired or superseded invitation' })
+@ApiConflictResponse({ description: 'Existing account or authentication attempt' })
+@ApiForbiddenResponse({ description: 'Signup policy denied' })
+@ApiTooManyRequestsResponse({ description: 'Invitation admission/registration budget exceeded' })
+@ApiServiceUnavailableResponse({ description: 'Invitation authority unavailable' })
+@Controller('auth/invites')
+@Auth(AuthType.None)
+@OrganizationContextBoundary({ apiRoots: [] })
+@UseGuards(InvitationRequestGuard)
+export class InvitationPublicController {
+  constructor(
+    private readonly continuation: InvitationContinuationService,
+    private readonly auth: AuthService,
+    private readonly env: EnvService
+  ) {}
+
+  @Post('continuations')
+  @RequestContextPolicy({ kind: 'personal' })
+  @RateLimit({ rate: 20, per: 60000, burst: 20 })
+  @ApiOperation({
+    summary:
+      'Admit a current invitation into a30-minute scoped continuation; no account/access mutation',
+  })
+  @SchemaResponse({ type: InvitationAdmissionResponseDto, status: 201 })
+  admit(
+    @Body({ schema: InvitationAdmissionDto.schema }) dto: InvitationAdmissionDto
+  ): ReturnType<InvitationContinuationService['admit']> {
+    return this.continuation.admit(dto.token)
+  }
+
+  @Post('continuations/context')
+  @HttpCode(200)
+  @RequestContextPolicy({ kind: 'personal' })
+  @ApiHeader({ name: 'X-Invitation-Continuation', required: true })
+  @ApiOperation({
+    summary: 'Read fixed signup email for a valid bearer continuation; no account existence',
+  })
+  @SchemaResponse({ type: InvitationContextDto, status: 200 })
+  context(
+    @Headers('x-invitation-continuation') credential: string
+  ): ReturnType<InvitationContinuationService['context']> {
+    return this.continuation.context(credential)
+  }
+
+  @Post('register')
+  @ApiRegistrationPublication()
+  @RequestContextPolicy({ kind: 'personal' })
+  @RateLimit({ rate: 5, per: 3600000, burst: 5 })
+  @ApiHeader({ name: 'X-Invitation-Continuation', required: true })
+  @ApiHeader({ name: 'X-Invitation-Auth-Attempt-Id', required: false })
+  @ApiHeader({ name: 'X-Invitation-Handoff-Key', required: false })
+  @ApiOperation({
+    summary: 'Create an unverified ordinary account for the fixed invitation email; never join',
+    description:
+      'The user, its first session, the authentication handoff and its email-verification token are created in one transaction; the invitation expiry is checked last. If it fails, its writes roll back. After the commit the response can still be lost: sign in or reset the password instead of submitting again. A canonical-email conflict returns 409 EMAIL_ALREADY_EXISTS.',
+  })
+  @SchemaResponse({ type: PasswordLoginResponseDto, status: 201 })
+  async register(
+    @Body({ schema: InvitedRegisterDto.schema }) dto: InvitedRegisterDto,
+    @Headers('x-invitation-continuation') credential: string,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response
+  ): Promise<Omit<Awaited<ReturnType<AuthService['registerInvited']>>, 'refreshToken'>> {
+    const result = await this.auth.registerInvited(dto, credential, {
+      registrationBrowser: registrationBrowserIntent(req),
+      handoff: invitationHandoffProof(
+        req.headers['x-invitation-auth-attempt-id'],
+        req.headers['x-invitation-handoff-key']
+      ),
+      userAgent: req.headers['user-agent'],
+      ipAddress: resolveSessionIpAddress(req, this.env),
+      acceptedLocale: negotiateLocale(req),
+      frontend: browserFrontendContext(req),
+    })
+    res.cookie('refresh_token', result.refreshToken, {
+      httpOnly: true,
+      secure: this.env.get('NODE_ENV') === 'production',
+      sameSite: 'strict',
+      path: '/',
+      maxAge: 7 * 86400 * ('raw' in res ? 1 : 1000),
+    })
+    return {
+      user: result.user,
+      accessToken: result.accessToken,
+      ...(result.publication ? { publication: result.publication } : {}),
+    }
+  }
+}

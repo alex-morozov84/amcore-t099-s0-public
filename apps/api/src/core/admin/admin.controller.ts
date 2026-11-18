@@ -1,0 +1,548 @@
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Header,
+  Headers,
+  HttpCode,
+  HttpStatus,
+  Param,
+  Patch,
+  Post,
+  Query,
+} from '@nestjs/common'
+import {
+  ApiBearerAuth,
+  ApiHeader,
+  ApiNoContentResponse,
+  ApiOperation,
+  ApiParam,
+  ApiQuery,
+  ApiResponse,
+  ApiTags,
+} from '@nestjs/swagger'
+
+import {
+  ADMIN_ORGANIZATION_SORT_FIELDS,
+  ADMIN_USER_SORT_FIELDS,
+  adminAuditQuerySchema,
+  type AdminAuditResponse,
+  adminDetailIdSchema,
+  type AdminOrganizationDetailResponse,
+  type AdminOrganizationListResponse,
+  type AdminOverviewResponse,
+  adminSessionIdSchema,
+  type AdminSessionsListResponse,
+  type AdminUserDetailResponse,
+  type AdminUserListResponse,
+  type AdminUserResponse,
+  AuthType,
+  coerceSupportedLocale,
+  PAGINATION,
+  type RequestPrincipal,
+  SystemRole,
+} from '@amcore/shared'
+
+import { SchemaResponse } from '../../common/schemas/schema-response.js'
+import { SchemaValidationException } from '../../common/schemas/schema-validation.js'
+import type { CleanupResult } from '../../infrastructure/schedule/cleanup.service.js'
+import { RATE_LIMIT_POLICIES, RateLimit } from '../../infrastructure/throttling/index.js'
+import { Auth } from '../auth/decorators/auth.decorator.js'
+import { CurrentUser } from '../auth/decorators/current-user.decorator.js'
+import { RequireFreshAuth } from '../auth/decorators/require-fresh-auth.decorator.js'
+import { SystemRoles } from '../auth/decorators/system-roles.decorator.js'
+
+import { AdminService } from './admin.service.js'
+import { AdminAuditService } from './admin-audit.service.js'
+import { AdminDetailService } from './admin-detail.service.js'
+import { AdminOverviewService } from './admin-overview.service.js'
+import { AdminSessionsService } from './admin-sessions.service.js'
+import { AdminAuditResponseDto } from './dto/admin-audit.dto.js'
+import {
+  AdminOrganizationDetailQueryDto,
+  AdminOrganizationDetailResponseDto,
+  AdminUserDetailQueryDto,
+  AdminUserDetailResponseDto,
+} from './dto/admin-detail.dto.js'
+import { AdminOrganizationListQueryDto } from './dto/admin-organization-list-query.dto.js'
+import { AdminOrganizationListResponseDto } from './dto/admin-organization-response.dto.js'
+import { AdminOverviewResponseDto } from './dto/admin-overview-response.dto.js'
+import { AdminSessionsListResponseDto, AdminSessionsQueryDto } from './dto/admin-session.dto.js'
+import { AdminUserListQueryDto } from './dto/admin-user-list-query.dto.js'
+import { AdminUserListResponseDto, AdminUserResponseDto } from './dto/admin-user-response.dto.js'
+import { CleanupResultDto } from './dto/cleanup-result.dto.js'
+import { UpdateSystemRoleDto } from './dto/update-system-role.dto.js'
+
+/**
+ * OA-02: admin routes are bearer-only.
+ *
+ * `SystemRolesGuard` checks only `request.user.systemRole`, not the
+ * credential type or `principal.scopes`. The principal an API key
+ * produces inherits `systemRole` from the owning user
+ * (`ApiKeyGuard.canActivate` → `apiKey.user.systemRole`), so a
+ * SUPER_ADMIN-owned API key with arbitrarily narrow scopes — e.g.
+ * `['read:User']` — would otherwise satisfy the system-role check and
+ * reach handlers that perform unrestricted Prisma writes. Admin
+ * routes also have no `@CheckPolicies`, so the CASL
+ * `userPerms ∩ scopes` intersection (AK-09 / Stage 4) is not
+ * consulted here at all.
+ *
+ * `@Auth(AuthType.Bearer)` at the class level short-circuits the
+ * auth chain to the JWT branch only; an API key fails the JWT
+ * branch as a decision-class 401 (per AK-11 `isDecisionError`).
+ *
+ * See `ai/ORGANIZATIONS_ADMIN_REVIEW.md` OA-02 and ADR-033.
+ */
+@ApiTags('admin')
+@ApiBearerAuth()
+@ApiResponse({
+  status: 409,
+  description:
+    'SESSION_CHANGED — current family, account security version or actual browser authority changed; no refresh fallback',
+})
+@Controller('admin')
+@Auth(AuthType.Bearer)
+@SystemRoles(SystemRole.SuperAdmin)
+export class AdminController {
+  constructor(
+    private readonly adminService: AdminService,
+    private readonly overviewService: AdminOverviewService,
+    private readonly auditService: AdminAuditService,
+    private readonly detailService: AdminDetailService,
+    private readonly sessionsService: AdminSessionsService
+  ) {}
+
+  @Get('access')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Check Operations Console access — SUPER_ADMIN only' })
+  @ApiNoContentResponse({ description: 'Console access granted' })
+  @ApiResponse({ status: 401, description: 'Bearer JWT required; API keys rejected' })
+  @ApiResponse({ status: 403, description: 'SUPER_ADMIN required' })
+  checkAccess(): undefined {
+    return undefined
+  }
+
+  @Get('audit-logs')
+  @Header('Cache-Control', 'private, no-store')
+  @RateLimit(RATE_LIMIT_POLICIES.AUDIT_READ)
+  @ApiOperation({
+    summary: 'Browse redacted audit events — live SUPER_ADMIN bearer only',
+    description:
+      'Newest first within a fixed UTC [from,to) interval. Defaults to 7 days; maximum 31 days. ' +
+      'Current names are present-day data and may differ from the event date. ' +
+      'Background-work events expose only allowlisted command details: work/task/command IDs, operation, ' +
+      'operator reason, target count, outcome and resolution when recorded; raw metadata is never returned. ' +
+      'Each successful read is durably audited. Invalid or stale cursors require a cursor reset.',
+  })
+  @ApiQuery({ name: 'actorId', required: false, type: String, maxLength: 128 })
+  @ApiQuery({ name: 'actorType', required: false, enum: ['USER', 'API_KEY', 'SYSTEM'] })
+  @ApiQuery({ name: 'action', required: false, type: String, maxLength: 96 })
+  @ApiQuery({
+    name: 'actions',
+    required: false,
+    type: String,
+    maxLength: 969,
+    description:
+      'Comma-separated list of 1–10 exact action codes; OR semantics. Cannot combine with action.',
+  })
+  @ApiQuery({ name: 'targetId', required: false, type: String, maxLength: 128 })
+  @ApiQuery({ name: 'targetType', required: false, type: String })
+  @ApiQuery({ name: 'organizationId', required: false, type: String, maxLength: 128 })
+  @ApiQuery({
+    name: 'includeReadEvents',
+    required: false,
+    enum: ['true', 'false'],
+    description:
+      'Defaults to false; an explicit action or actions selection containing the audit-view code includes matching views',
+  })
+  @ApiQuery({
+    name: 'from',
+    required: false,
+    type: String,
+    description: 'UTC ISO lower bound, inclusive',
+  })
+  @ApiQuery({
+    name: 'to',
+    required: false,
+    type: String,
+    description: 'UTC ISO upper bound, exclusive; not in future',
+  })
+  @ApiQuery({ name: 'limit', required: false, type: Number, minimum: 1, maximum: 50, example: 25 })
+  @ApiQuery({
+    name: 'cursor',
+    required: false,
+    type: String,
+    maxLength: 512,
+    description: 'Private sealed cursor; requires the same explicit from/to and filters',
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Invalid/repeated query, range, or cursor; reset cursor',
+  })
+  @ApiResponse({ status: 401, description: 'Bearer JWT required; API keys rejected' })
+  @ApiResponse({ status: 403, description: 'Current SUPER_ADMIN role required' })
+  @ApiResponse({ status: 429, description: 'Audit read rate limit exceeded' })
+  @ApiResponse({ status: 500, description: 'Audit query or strict read-audit write failed' })
+  @ApiResponse({ status: 503, description: 'Audit dependency unavailable' })
+  @SchemaResponse({
+    type: AdminAuditResponseDto,
+    status: 200,
+    description: 'Redacted events with safe present-day identity projection and opaque cursor',
+  })
+  listAuditLogs(
+    @CurrentUser() actor: RequestPrincipal,
+    @Query() rawQuery: Record<string, unknown>
+  ): Promise<AdminAuditResponse> {
+    // Parse once: the schema transforms action lists and booleans, while the
+    // global DTO pipe would re-parse its transformed output and reject it.
+    const parsed = adminAuditQuerySchema.safeParse(rawQuery)
+    if (!parsed.success) throw new SchemaValidationException(parsed.error)
+    return this.auditService.list(parsed.data, actor)
+  }
+
+  @Get('users')
+  @ApiOperation({ summary: 'List all users — SUPER_ADMIN only' })
+  @ApiQuery({
+    name: 'page',
+    required: false,
+    type: Number,
+    minimum: 1,
+    example: PAGINATION.DEFAULT_PAGE,
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    minimum: 1,
+    maximum: PAGINATION.MAX_LIMIT,
+    example: PAGINATION.DEFAULT_LIMIT,
+  })
+  @ApiQuery({
+    name: 'search',
+    required: false,
+    type: String,
+    maxLength: 255,
+    description: 'Case-insensitive literal-contains match over name OR email',
+  })
+  @ApiQuery({ name: 'sortBy', required: false, enum: ADMIN_USER_SORT_FIELDS, example: 'createdAt' })
+  @ApiQuery({ name: 'sortOrder', required: false, enum: ['asc', 'desc'] })
+  @ApiResponse({
+    status: 400,
+    description:
+      'Invalid page/limit/sortBy/sortOrder, an oversized search term, or a repeated query key',
+  })
+  @SchemaResponse({ type: AdminUserListResponseDto, status: 200, description: 'Paginated users' })
+  findAllUsers(
+    @Query({ schema: AdminUserListQueryDto.schema }) query: AdminUserListQueryDto
+  ): Promise<AdminUserListResponse> {
+    return this.adminService.findAllUsers(query)
+  }
+
+  @Get('users/:id')
+  @Header('Cache-Control', 'private, no-store')
+  @ApiOperation({
+    summary: 'Inspect user sign-in setup and paginated memberships — SUPER_ADMIN only',
+    description:
+      'Returns password presence and unique linked provider names, never credentials. ' +
+      'Saved setup does not prove provider availability or successful sign-in. ' +
+      'Requires a current SUPER_ADMIN bearer; API keys are rejected.',
+  })
+  @ApiParam({ name: 'id', description: 'User CUID or UUID' })
+  @ApiQuery({ name: 'page', required: false, type: Number, minimum: 1 })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    minimum: 1,
+    maximum: PAGINATION.MAX_LIMIT,
+  })
+  @ApiQuery({
+    name: 'search',
+    required: false,
+    type: String,
+    maxLength: 255,
+    description: 'Case-insensitive literal-contains match over organization name or slug',
+  })
+  @ApiResponse({ status: 400, description: 'Invalid user ID, pagination or search' })
+  @ApiResponse({ status: 401, description: 'Bearer JWT required; API keys rejected' })
+  @ApiResponse({ status: 403, description: 'Current SUPER_ADMIN role required' })
+  @ApiResponse({ status: 404, description: 'User no longer exists' })
+  @ApiResponse({ status: 503, description: 'Detail dependency unavailable' })
+  @SchemaResponse({
+    type: AdminUserDetailResponseDto,
+    status: 200,
+    description:
+      'Safe user detail, password presence, linked provider names and bounded memberships',
+  })
+  findUserDetail(
+    @Param('id') id: string,
+    @Query({ schema: AdminUserDetailQueryDto.schema }) query: AdminUserDetailQueryDto
+  ): Promise<AdminUserDetailResponse> {
+    const parsed = adminDetailIdSchema.safeParse(id)
+    if (!parsed.success) throw new SchemaValidationException(parsed.error)
+    return this.detailService.user(parsed.data, query)
+  }
+
+  @Patch('users/:id')
+  @ApiOperation({ summary: 'Update user system role — SUPER_ADMIN only' })
+  @ApiParam({ name: 'id', description: 'Target user ID' })
+  // OB-06b: destructive privileged op — require a recently re-authenticated
+  // session (step-up) on top of the OB-06a current-role check.
+  @RequireFreshAuth()
+  // OB-03: narrow the global default (100/min) to 20/min for this
+  // privileged operation, per-handler. Changing the global DEFAULT policy
+  // itself would cap every route in the API at the admin limit (caught in
+  // Stage 7 final-e2e).
+  @RateLimit(RATE_LIMIT_POLICIES.PRIVILEGED_MUTATION)
+  @ApiResponse({
+    status: 400,
+    description: 'BUSINESS_RULE_VIOLATION — self-role-change or demoting the last SUPER_ADMIN',
+  })
+  @ApiResponse({ status: 401, description: 'Bearer JWT required; API keys rejected' })
+  @ApiResponse({
+    status: 403,
+    description:
+      'SUPER_ADMIN required, or STEP_UP_REQUIRED (current session proofs are not fresh enough)',
+  })
+  @ApiResponse({ status: 429, description: 'Rate limit exceeded for this privileged operation' })
+  @SchemaResponse({ type: AdminUserResponseDto, status: 200, description: 'Updated user' })
+  updateUserSystemRole(
+    @CurrentUser() actor: RequestPrincipal,
+    @Param('id') id: string,
+    @Body({ schema: UpdateSystemRoleDto.schema }) dto: UpdateSystemRoleDto
+  ): Promise<AdminUserResponse> {
+    return this.adminService.updateUserSystemRole(id, dto.systemRole, actor)
+  }
+
+  @Get('users/:id/sessions')
+  @Header('Cache-Control', 'private, no-store')
+  @ApiOperation({
+    summary: "List another user's active sessions — SUPER_ADMIN only",
+    description:
+      'Active (non-revoked, non-expired) sessions only, one per logical session family. ' +
+      'Each successful read is itself audited (bounded page/limit/result-count only), ' +
+      'hidden from Audit browsing by default.',
+  })
+  @ApiParam({ name: 'id', description: 'Target user CUID or UUID' })
+  @ApiQuery({ name: 'page', required: false, type: Number, minimum: 1 })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    minimum: 1,
+    maximum: PAGINATION.MAX_LIMIT,
+  })
+  @ApiHeader({
+    name: 'accept-language',
+    required: false,
+    description:
+      "Display locale for each session's approximate-location city name ('en'/'ru'); " +
+      'unsupported or absent falls back to en.',
+  })
+  @ApiResponse({ status: 400, description: 'Invalid user ID or pagination' })
+  @ApiResponse({ status: 401, description: 'Bearer JWT required; API keys rejected' })
+  @ApiResponse({ status: 403, description: 'Current SUPER_ADMIN role required' })
+  @ApiResponse({ status: 404, description: 'User no longer exists' })
+  @SchemaResponse({
+    type: AdminSessionsListResponseDto,
+    status: 200,
+    description: 'Paginated active sessions',
+  })
+  listUserSessions(
+    @CurrentUser() actor: RequestPrincipal,
+    @Param('id') id: string,
+    @Query({ schema: AdminSessionsQueryDto.schema }) query: AdminSessionsQueryDto,
+    @Headers('accept-language') acceptLanguage: string | undefined
+  ): Promise<AdminSessionsListResponse> {
+    const userId = adminDetailIdSchema.safeParse(id)
+    if (!userId.success) throw new SchemaValidationException(userId.error)
+    return this.sessionsService.list(
+      userId.data,
+      query,
+      coerceSupportedLocale(acceptLanguage),
+      actor
+    )
+  }
+
+  @Delete('users/:id/sessions/:sessionId')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: "Revoke one of another user's sessions — SUPER_ADMIN only" })
+  @ApiParam({ name: 'id', description: 'Target user CUID or UUID' })
+  @ApiParam({ name: 'sessionId', description: 'Opaque admin session identity (session family)' })
+  // OB-06b: destructive privileged op — require step-up freshness.
+  @RequireFreshAuth()
+  @RateLimit(RATE_LIMIT_POLICIES.PRIVILEGED_MUTATION)
+  @ApiNoContentResponse({ description: 'Session revoked (or already inactive — idempotent)' })
+  @ApiResponse({
+    status: 400,
+    description: 'BUSINESS_RULE_VIOLATION — cannot revoke your own session through this action',
+  })
+  @ApiResponse({ status: 401, description: 'Bearer JWT required; API keys rejected' })
+  @ApiResponse({
+    status: 403,
+    description:
+      'SUPER_ADMIN required, or STEP_UP_REQUIRED (session not recently re-authenticated)',
+  })
+  @ApiResponse({ status: 404, description: 'Session family absent or belongs to another user' })
+  @ApiResponse({ status: 429, description: 'Rate limit exceeded for this privileged operation' })
+  async revokeUserSession(
+    @CurrentUser() actor: RequestPrincipal,
+    @Param('id') id: string,
+    @Param('sessionId') sessionId: string
+  ): Promise<void> {
+    const userId = adminDetailIdSchema.safeParse(id)
+    if (!userId.success) throw new SchemaValidationException(userId.error)
+    const familyId = adminSessionIdSchema.safeParse(sessionId)
+    if (!familyId.success) throw new SchemaValidationException(familyId.error)
+    await this.sessionsService.revokeOne(userId.data, familyId.data, actor)
+  }
+
+  @Delete('users/:id/sessions')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: "Revoke all of another user's active sessions — SUPER_ADMIN only" })
+  @ApiParam({ name: 'id', description: 'Target user CUID or UUID' })
+  // OB-06b: destructive privileged op — require step-up freshness.
+  @RequireFreshAuth()
+  @RateLimit(RATE_LIMIT_POLICIES.PRIVILEGED_MUTATION)
+  @ApiNoContentResponse({
+    description: 'All active sessions revoked (204 even if none were active)',
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'BUSINESS_RULE_VIOLATION — cannot revoke your own sessions through this action',
+  })
+  @ApiResponse({ status: 401, description: 'Bearer JWT required; API keys rejected' })
+  @ApiResponse({
+    status: 403,
+    description:
+      'SUPER_ADMIN required, or STEP_UP_REQUIRED (session not recently re-authenticated)',
+  })
+  @ApiResponse({ status: 429, description: 'Rate limit exceeded for this privileged operation' })
+  async revokeAllUserSessions(
+    @CurrentUser() actor: RequestPrincipal,
+    @Param('id') id: string
+  ): Promise<void> {
+    const userId = adminDetailIdSchema.safeParse(id)
+    if (!userId.success) throw new SchemaValidationException(userId.error)
+    await this.sessionsService.revokeAll(userId.data, actor)
+  }
+
+  @Post('cleanup')
+  @ApiOperation({ summary: 'Manually trigger expired records cleanup — SUPER_ADMIN only' })
+  // OB-06b: destructive privileged op — require step-up freshness.
+  @RequireFreshAuth()
+  // OB-03: heavy DB sweep — narrow to 5/min for this handler. Same
+  // per-handler-override pattern as above.
+  @RateLimit(RATE_LIMIT_POLICIES.EXPENSIVE_ACTION)
+  @SchemaResponse({ type: CleanupResultDto, status: 200, description: 'Cleanup counts' })
+  runCleanup(@CurrentUser() actor: RequestPrincipal): Promise<CleanupResult> {
+    return this.adminService.runCleanup(actor)
+  }
+
+  @Get('organizations')
+  @ApiOperation({ summary: 'List all organizations — SUPER_ADMIN only' })
+  @ApiQuery({
+    name: 'page',
+    required: false,
+    type: Number,
+    minimum: 1,
+    example: PAGINATION.DEFAULT_PAGE,
+  })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    minimum: 1,
+    maximum: PAGINATION.MAX_LIMIT,
+    example: PAGINATION.DEFAULT_LIMIT,
+  })
+  @ApiQuery({
+    name: 'search',
+    required: false,
+    type: String,
+    maxLength: 255,
+    description: 'Case-insensitive literal-contains match over name OR slug',
+  })
+  @ApiQuery({
+    name: 'sortBy',
+    required: false,
+    enum: ADMIN_ORGANIZATION_SORT_FIELDS,
+    example: 'createdAt',
+  })
+  @ApiQuery({ name: 'sortOrder', required: false, enum: ['asc', 'desc'] })
+  @ApiResponse({
+    status: 400,
+    description:
+      'Invalid page/limit/sortBy/sortOrder, an oversized search term, or a repeated query key',
+  })
+  @SchemaResponse({
+    type: AdminOrganizationListResponseDto,
+    status: 200,
+    description: 'Paginated organizations',
+  })
+  findAllOrganizations(
+    @Query({ schema: AdminOrganizationListQueryDto.schema }) query: AdminOrganizationListQueryDto
+  ): Promise<AdminOrganizationListResponse> {
+    return this.adminService.findAllOrganizations(query)
+  }
+
+  @Get('organizations/:id')
+  @Header('Cache-Control', 'private, no-store')
+  @ApiOperation({
+    summary: 'Inspect one organization and searchable paginated members — SUPER_ADMIN only',
+  })
+  @ApiParam({ name: 'id', description: 'Organization CUID or UUID' })
+  @ApiQuery({ name: 'page', required: false, type: Number, minimum: 1 })
+  @ApiQuery({
+    name: 'limit',
+    required: false,
+    type: Number,
+    minimum: 1,
+    maximum: PAGINATION.MAX_LIMIT,
+  })
+  @ApiQuery({
+    name: 'search',
+    required: false,
+    type: String,
+    maxLength: 255,
+    description: 'Case-insensitive literal-contains match over member name or email',
+  })
+  @ApiResponse({ status: 400, description: 'Invalid organization ID, pagination or search' })
+  @ApiResponse({ status: 401, description: 'Bearer JWT required; API keys rejected' })
+  @ApiResponse({ status: 403, description: 'Current SUPER_ADMIN role required' })
+  @ApiResponse({ status: 404, description: 'Organization no longer exists' })
+  @ApiResponse({ status: 503, description: 'Detail dependency unavailable' })
+  @SchemaResponse({
+    type: AdminOrganizationDetailResponseDto,
+    status: 200,
+    description: 'Safe organization detail and bounded members',
+  })
+  findOrganizationDetail(
+    @Param('id') id: string,
+    @Query({ schema: AdminOrganizationDetailQueryDto.schema })
+    query: AdminOrganizationDetailQueryDto
+  ): Promise<AdminOrganizationDetailResponse> {
+    const parsed = adminDetailIdSchema.safeParse(id)
+    if (!parsed.success) throw new SchemaValidationException(parsed.error)
+    return this.detailService.organization(parsed.data, query)
+  }
+
+  @Get('overview')
+  @Header('Cache-Control', 'private, no-store')
+  @ApiOperation({ summary: 'Console Overview status — SUPER_ADMIN only' })
+  @SchemaResponse({
+    type: AdminOverviewResponseDto,
+    status: 200,
+    description:
+      'This API instance’s readiness, declared deployment metadata and independent local resource samples. ' +
+      'Always 200 even when the instance is not ready (see `readiness`); an HTTP 5xx here ' +
+      'means the observation itself failed, not that the instance is unhealthy.',
+  })
+  @ApiResponse({ status: 401, description: 'Bearer JWT required; API keys rejected' })
+  @ApiResponse({ status: 403, description: 'SUPER_ADMIN required' })
+  @ApiResponse({ status: 500, description: 'Unexpected observation provider failure' })
+  getOverview(): Promise<AdminOverviewResponse> {
+    return this.overviewService.getOverview()
+  }
+}

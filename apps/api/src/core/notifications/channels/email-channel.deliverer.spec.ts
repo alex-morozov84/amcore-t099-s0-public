@@ -1,0 +1,310 @@
+import { z } from 'zod'
+
+import { coerceSupportedLocale, localePathPrefix } from '@amcore/shared'
+
+import { preparationDouble } from '../../../../test/fixtures/extension-contracts/preparation-double'
+
+import type { Notification } from '@/generated/prisma/client'
+
+// Importing EmailService pulls the email template chain (@react-email/render +
+// @formatjs/intl, ESM); mock them so the Jest (CommonJS) project can load this spec.
+// The deliverer itself no longer uses @formatjs/intl — these only satisfy the import graph.
+jest.mock('@react-email/render', () => ({ render: jest.fn(async () => '<html></html>') }))
+jest.mock('@formatjs/intl', () => ({ createIntl: jest.fn(() => ({ formatMessage: jest.fn() })) }))
+
+import type { ClaimedDelivery } from '../dispatch/notification-dispatch.types'
+import {
+  NotificationCategory,
+  NotificationChannel,
+  NotificationContentClass,
+} from '../notification.constants'
+import { NotificationDefinitionRegistry } from '../notification-definition.registry'
+import type { NotificationDefinition } from '../notification-definition.types'
+
+import type { DeliveryAdmission, DeliveryContext } from './channel-deliverer.types'
+import { EmailChannelDeliverer } from './email-channel.deliverer'
+
+import type { EnvService } from '@/env/env.service'
+import type { EmailService } from '@/infrastructure/email'
+import { emailMessages } from '@/infrastructure/email/messages'
+
+const base = {
+  category: NotificationCategory.ACCOUNT,
+  schemaVersion: 1,
+  defaultChannels: [NotificationChannel.IN_APP, NotificationChannel.EMAIL],
+  mandatoryChannels: [],
+  externalModeByChannel: {},
+  safePayload: (p: unknown) => p as Record<string, unknown>,
+  renderInApp: () => ({ title: 'in-app', body: 'in-app' }),
+} as const
+
+const detailedDef: NotificationDefinition = {
+  ...base,
+  type: 'account.detail',
+  contentClass: NotificationContentClass.PUBLIC, // → email detailed
+  supportedChannels: [NotificationChannel.IN_APP, NotificationChannel.EMAIL],
+  payloadSchema: z.object({ v: z.string(), secret: z.string().optional() }),
+  // Allowlist: only `v` crosses the external boundary — `secret` never does.
+  projectExternal: (_channel, payload) => ({ v: (payload as { v: string }).v }),
+  // Renders ONLY from the projection, so it cannot read a non-allowlisted field.
+  renderExternal: {
+    email: (projection) => ({
+      title: `Detailed ${String(projection.v)}`,
+      body: 'Detailed body',
+    }),
+  },
+}
+
+const genericDef: NotificationDefinition = {
+  ...base,
+  type: 'account.generic',
+  contentClass: NotificationContentClass.SENSITIVE, // → email generic
+  supportedChannels: [NotificationChannel.IN_APP, NotificationChannel.EMAIL],
+  payloadSchema: z.object({}),
+}
+
+// Note: a SECRET definition cannot be constructed here — the registry rejects it at
+// registration (ADR-052), so the deliverer's `forbidden` branch is unreachable defensive
+// code and is intentionally not unit-tested.
+
+const claim = (overrides: Partial<ClaimedDelivery> = {}): ClaimedDelivery => ({
+  id: 'd1',
+  notificationId: 'n1',
+  channel: NotificationChannel.EMAIL,
+  targetKey: 'to@example.com',
+  targetRef: null,
+  destinationSnapshot: null,
+  locale: 'ru',
+  attemptNumber: 1,
+  maxAttempts: 5,
+  leaseToken: 'lease',
+  ...overrides,
+})
+
+const notification = (overrides: Partial<Notification> = {}): Notification =>
+  ({
+    id: 'n1',
+    schemaVersion: 1,
+    type: 'account.detail',
+    payload: { v: 'x' },
+    action: null,
+    ...overrides,
+  }) as Notification
+
+describe('EmailChannelDeliverer', () => {
+  let email: jest.Mocked<
+    Pick<EmailService, 'renderTemplate' | 'sendPreparedNotification' | 'queue'>
+  >
+  let env: jest.Mocked<Pick<EnvService, 'get'>>
+
+  /** Admission double: authorizes the single transport call immediately (records the signal). */
+  let admissionSend: jest.Mock
+  const admission: DeliveryAdmission = {
+    send: (transport) => admissionSend(transport),
+  }
+
+  const build = (
+    defs: NotificationDefinition[]
+  ): { deliver: (context: DeliveryContext) => ReturnType<EmailChannelDeliverer['deliver']> } => {
+    const real = new EmailChannelDeliverer(
+      new NotificationDefinitionRegistry(defs.map((definition) => ({ definition, current: true }))),
+      email as unknown as EmailService,
+      env as unknown as EnvService,
+      preparationDouble()
+    )
+    return { deliver: (context: DeliveryContext) => real.deliver(context, admission) }
+  }
+
+  beforeEach(() => {
+    admissionSend = jest.fn((transport: (signal: AbortSignal) => Promise<unknown>) =>
+      transport(new AbortController().signal)
+    )
+    email = {
+      renderTemplate: jest.fn().mockResolvedValue({ html: '<p>', text: 'p', subject: 's' }),
+      sendPreparedNotification: jest.fn().mockResolvedValue({ id: 'prov-1', success: true }),
+      queue: jest.fn(),
+    }
+    env = { get: jest.fn().mockReturnValue('https://app.example') }
+  })
+
+  it('renders detailed content + forwards the stable provider idempotency key, never queues', async () => {
+    const deliverer = build([detailedDef])
+    const result = await deliverer.deliver({ delivery: claim(), notification: notification() })
+
+    expect(email.renderTemplate).toHaveBeenCalledWith(
+      'notification',
+      expect.objectContaining({
+        title: 'Detailed x',
+        body: 'Detailed body',
+        locale: coerceSupportedLocale('ru'),
+      }),
+      'worker'
+    )
+    expect(email.sendPreparedNotification).toHaveBeenCalledWith(
+      expect.any(String),
+      'notification-delivery:d1',
+      expect.any(AbortSignal)
+    )
+    expect(email.queue).not.toHaveBeenCalled()
+    expect(result).toEqual({ status: 'delivered', providerMessageId: 'prov-1' })
+  })
+
+  it('detailed email renders only from the projectExternal allowlist, never the raw payload', async () => {
+    const deliverer = build([detailedDef])
+    await deliverer.deliver({
+      delivery: claim(),
+      notification: notification({ payload: { v: 'hello', secret: 'leak' } }),
+    })
+    const data = email.renderTemplate.mock.calls[0]![1]
+    // Allowlisted field is rendered; the non-allowlisted `secret` never reaches the email.
+    expect(data).toEqual(expect.objectContaining({ title: 'Detailed hello' }))
+    expect(JSON.stringify(data)).not.toContain('leak')
+  })
+
+  it('uses neutral generic content for a SENSITIVE definition (never reads the payload)', async () => {
+    const deliverer = build([genericDef])
+    await deliverer.deliver({
+      delivery: claim(),
+      notification: notification({ type: 'account.generic', payload: { secret: 'leak' } }),
+    })
+    expect(email.renderTemplate).toHaveBeenCalledWith(
+      'notification',
+      expect.objectContaining({
+        title: emailMessages[coerceSupportedLocale('ru')]['notification.genericTitle'],
+      }),
+      'worker'
+    )
+  })
+
+  it('refuses an unregistered stored version without transport I/O', async () => {
+    const deliverer = build([])
+    const result = await deliverer.deliver({
+      delivery: claim(),
+      notification: notification({ type: 'account.unknown' }),
+    })
+    expect(result).toEqual({ status: 'permanent', errorCode: 'notification_version_unavailable' })
+    expect(email.sendPreparedNotification).not.toHaveBeenCalled()
+  })
+
+  it('adds a CTA to the trusted app base when the notification carries an action', async () => {
+    const deliverer = build([detailedDef])
+    await deliverer.deliver({
+      delivery: claim(),
+      notification: notification({ action: { route: 'account.settings' } as never }),
+    })
+    expect(email.renderTemplate).toHaveBeenCalledWith(
+      'notification',
+      // Locale-prefixed when the build serves several locales: an email CTA cannot rely on a
+      // cookie or Accept-Language the recipient's browser may not have. The delivery is for `ru`;
+      // a build that does not serve it uses its default, and one locale means a bare link.
+      expect.objectContaining({
+        actionUrl: `https://app.example${localePathPrefix(coerceSupportedLocale('ru'))}`,
+      }),
+      'worker'
+    )
+  })
+
+  it('permanently fails (no send) when a detailed payload is invalid', async () => {
+    const deliverer = build([detailedDef])
+    const result = await deliverer.deliver({
+      delivery: claim(),
+      notification: notification({ payload: { v: 123 } as never }),
+    })
+    expect(result).toEqual({ status: 'permanent', errorCode: 'email_payload_invalid' })
+    expect(email.sendPreparedNotification).not.toHaveBeenCalled()
+  })
+
+  it('maps a deterministic provider failure to permanent and a transient one to transient', async () => {
+    const deliverer = build([detailedDef])
+
+    email.sendPreparedNotification.mockResolvedValueOnce({
+      id: '',
+      success: false,
+      retryable: false,
+    })
+    expect(await deliverer.deliver({ delivery: claim(), notification: notification() })).toEqual({
+      status: 'permanent',
+      errorCode: 'email_provider_permanent',
+    })
+
+    email.sendPreparedNotification.mockResolvedValueOnce({
+      id: '',
+      success: false,
+      retryable: true,
+    })
+    expect(await deliverer.deliver({ delivery: claim(), notification: notification() })).toEqual({
+      status: 'transient',
+      errorCode: 'email_provider_transient',
+    })
+  })
+
+  it('permanently fails on a deterministic render error', async () => {
+    const deliverer = build([detailedDef])
+    email.renderTemplate.mockRejectedValueOnce(new Error('render boom'))
+    const result = await deliverer.deliver({ delivery: claim(), notification: notification() })
+    expect(result).toEqual({ status: 'permanent', errorCode: 'email_render_failed' })
+  })
+
+  describe('actual-start admission and Retry-After', () => {
+    it('admits AFTER rendering and immediately before the single send, forwarding the attempt signal', async () => {
+      const deliverer = build([detailedDef])
+      const order: string[] = []
+      email.renderTemplate.mockImplementation(async () => {
+        order.push('render')
+        return { html: '<p>', text: 'p', subject: 's' }
+      })
+      admissionSend.mockImplementation(async (transport: (s: AbortSignal) => Promise<unknown>) => {
+        order.push('admit')
+        return transport(new AbortController().signal)
+      })
+      email.sendPreparedNotification.mockImplementation(async () => {
+        order.push('send')
+        return { id: 'prov-1', success: true }
+      })
+
+      await deliverer.deliver({ delivery: claim(), notification: notification() })
+
+      expect(order).toEqual(['render', 'admit', 'send'])
+      expect(email.sendPreparedNotification).toHaveBeenCalledWith(
+        expect.any(String),
+        'notification-delivery:d1',
+        expect.any(AbortSignal)
+      )
+    })
+
+    it('makes ZERO sends and returns not_started when admission refuses', async () => {
+      const deliverer = build([detailedDef])
+      admissionSend.mockResolvedValue({ status: 'not_started', reason: 'lease_expired' })
+      const result = await deliverer.deliver({ delivery: claim(), notification: notification() })
+      expect(result).toEqual({ status: 'not_started', reason: 'lease_expired' })
+      expect(email.sendPreparedNotification).not.toHaveBeenCalled()
+    })
+
+    it('turns a normalized provider retry delay into a retry floor', async () => {
+      const deliverer = build([detailedDef])
+      email.sendPreparedNotification.mockResolvedValueOnce({
+        id: '',
+        success: false,
+        retryable: true,
+        retryAfterMs: 120_000,
+      })
+      expect(await deliverer.deliver({ delivery: claim(), notification: notification() })).toEqual({
+        status: 'transient',
+        errorCode: 'email_provider_transient',
+        retryAfterMs: 120_000,
+      })
+    })
+
+    it('keeps the ordinary backoff (no floor) when the transport gave no signal', async () => {
+      const deliverer = build([detailedDef])
+      email.sendPreparedNotification.mockResolvedValueOnce({
+        id: '',
+        success: false,
+        retryable: true,
+      })
+      const result = await deliverer.deliver({ delivery: claim(), notification: notification() })
+      expect(result).toEqual({ status: 'transient', errorCode: 'email_provider_transient' })
+      expect(result).not.toHaveProperty('retryAfterMs')
+    })
+  })
+})

@@ -1,0 +1,514 @@
+# Operations Console Configuration and Deployment
+
+Start with the [Operations Console user guide](README.md) for the capability and
+access boundary. This page covers topology and deployment.
+
+## Topology
+
+The build chooses how the Console is served in
+`packages/shared/src/config/admin-console.json`:
+
+```json
+{ "version": 1, "mode": "path", "alias": "admin" }
+```
+
+| `mode`           | Result                                                                                                                                     |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `path` (shipped) | Console pages on the product host with the normal product login: `/en/admin` and `/ru/admin`, or `/admin` when the build serves one locale |
+| `host`           | Console pages on their own host (`ADMIN_CONSOLE_HOSTNAME`), with a separate session. See below                                             |
+| `disabled`       | Console pages and guarded BFF methods refuse with 404 before session, Redis or API work; unsupported HTTP methods can return 405           |
+
+`alias` is the page path segment **and** the name of the folder
+`apps/web/src/app/[locale]/<alias>`. To rename it, rename the folder and edit the file
+in one change; `node scripts/check-product-admin-placement.mjs` (part of the web build)
+refuses an alias that has no folder, equals the product-administration alias, or collides
+with another route or public file. The folder stays in every build, `disabled` included.
+The internal BFF namespace is `app/api/console/**`.
+
+To change the mode or alias:
+
+1. Edit `admin-console.json`. When changing the alias, move the entire
+   `apps/web/src/app/[locale]/<old-alias>` directory to the new alias in the same change.
+   Do not leave a redirecting copy. Keep `alias` and the folder when disabling Console.
+2. Validate placement and regenerate the Console edge blocks:
+
+   ```bash
+   node scripts/render-console-edge.mjs --write
+   node scripts/check-product-admin-placement.mjs
+   ```
+
+   The generator checks both settings files with the same rules as the build first and writes
+   nothing when one is wrong. It updates `docker/caddy/Caddyfile.console-host` and
+   `docker/nginx/operations-console.conf`. Run it for every mode or alias change.
+   The web build runs `--check` and refuses stale output. If locales also change,
+   follow the [locale procedure](../frontend/i18n-and-errors.md#task-choose-the-served-locales),
+   including regeneration of product-admin mappings.
+
+3. Run `pnpm build`. Review and commit the settings, any moved routes, and changed edge files.
+   Do not commit `dist` or `.next`. A Console-only change needs rebuilt shared and web artifacts;
+   a locale change also requires matching API and worker images.
+4. Deploy the matching web image and edge configuration. For host mode, set
+   `ADMIN_CONSOLE_HOSTNAME` on the web service at runtime and configure DNS/TLS as below.
+   Keep traffic closed during an inconsistent image/edge transition. Use the deployment
+   guide's [ordered rollout](../operations/deployment.md#production-rollout-via-registry-image-pull-path)
+   and retain the previous image and configuration together for rollback.
+5. Verify the chosen mode. In path mode, sign in through the **product login** as a
+   `SUPER_ADMIN`, then open the Console overview. The Console-specific login page is host-only
+   and returns 404 in path mode. In host mode use the Console host's public login page.
+   After an alias move, check navigation at the new alias and a 404 at the old path (the
+   folder no longer exists; in host mode the edge also answers 404 for the physical alias).
+   In disabled mode, test the Console page and a real BFF endpoint such as
+   `GET /api/console/access`: both must refuse without session/API work.
+
+`ADMIN_CONSOLE_HOSTNAME` never enables Console by itself. Builds in path or disabled mode
+ignore it. The mode and alias come from the settings embedded during the build.
+
+Examples below use alias `admin`. With several served locales the path-mode overview is
+`/en/admin` or `/ru/admin`; with one it is `/admin`. For **Russian-only** builds,
+`/ru/admin` redirects to `/admin`, and `/en/admin` returns 404. In disabled mode the
+redirect destination also refuses access. For English-only builds exchange `en` and `ru`.
+An unsupported HTTP method may receive 405, including explicit read-only refusal methods;
+it does not reach session, Redis or backend work.
+
+```text
+Settings + physical folder -> placement check -> generated edge -> build
+                                                                    |
+Matching image + edge + runtime host -> deploy -> verify or restore previous set
+```
+
+The Console builds on backend foundations that work without it: `SystemRole`,
+`/api/v1/admin/**`, fresh-auth, audit, health, and metrics, for automation or
+custom clients.
+
+## Path-mode deployment and session
+
+Path mode needs no `ADMIN_CONSOLE_HOSTNAME` and creates no separate console
+cookie. It uses the product host, the normal product login, and the existing
+`amcore_session` BFF vault; the live `SUPER_ADMIN` probe remains an additional
+admission check.
+
+For the bundled product-web Caddy reference, set the product host and enable the
+profiled edge service:
+
+```bash
+CADDY_WEB_DOMAIN="app.example.com" \
+docker compose --profile edge \
+  -f docker-compose.yml -f docker/compose/web.yml up -d
+```
+
+The Console is then available under `/{locale}/<alias>` on that host, or
+`/<alias>` with one served locale. A
+bring-your-own proxy serves the same application normally; it needs no
+host-to-physical-path mapping in path mode.
+
+## Host-mode session boundary
+
+Host mode is a build-time choice made in
+`packages/shared/src/config/admin-console.json` (see [Topology](#topology)). Setting only
+`ADMIN_CONSOLE_HOSTNAME` does not switch the mode: a path-mode build ignores it, keeps
+the Console under its configured alias on the product host and serves no Console on the
+console host. The managed stand makes the same change in its snapshot, and
+`pnpm test:console-session-e2e` exercises the result in an isolated lane. Verify your
+own deployment before you rely on it.
+
+Host mode is a separate browser trust boundary:
+
+- Credential login admits only a live `SUPER_ADMIN` and sets
+  `__Host-amcore_console_session`.
+- The cookie is `Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/`, and has no
+  `Domain`.
+- Its Redis vault uses `web:console-session:v1:*`; every entry has
+  `audience: 'console'`.
+- Product `amcore_session` / `web:session:v1:*` state is rejected by the
+  console, and console state is rejected by product BFF routes.
+- Login and logout require `Origin` or `Referer` to match the exact configured
+  HTTPS console origin. Missing, malformed, product, or sibling origins fail.
+
+OAuth is intentionally unsupported because the existing callback has one
+frontend origin and cannot establish the console audience. It needs a separate
+multi-origin design before it can be added safely.
+
+## Reference Caddy deployment
+
+The host-mode nginx and Caddy references forward the exact
+`/api/deployment-version` path directly to web, without the `/api/console/`
+rewrite. This public signal needs no Console session; ordinary Console API
+paths keep their existing rewrite. Preserve this exception in a custom edge.
+
+Point DNS for both names at the edge, set both public hosts, and explicitly
+enable the profiled edge service. Public Caddy deployments obtain TLS in the
+usual Caddy flow; nginx deployments must provide the certificate paths shown in
+the reference file.
+
+```bash
+CADDY_WEB_DOMAIN="app.example.com" \
+ADMIN_CONSOLE_HOSTNAME="console.example.com" \
+docker compose --profile edge \
+  -f docker-compose.yml -f docker/compose/console-host.yml up -d
+```
+
+In a production rollout that saves `COMPOSE_FILE`, use `docker/compose/console-host.yml`
+instead of `web.yml` and keep every other overlay; see the
+[deployment guide](../operations/deployment.md#operations-console-host-mode-reference).
+
+The base Caddy profile is API-only. Only the host override mounts the console
+Caddyfile, and missing hostnames fail validation. For nginx, adapt and include
+`docker/nginx/operations-console.conf` with the real domains and certificates.
+
+`ADMIN_CONSOLE_ORIGIN` is optional on port 443 (empty means `https://<ADMIN_CONSOLE_HOSTNAME>`).
+Set it to the exact origin when the public port differs, for example
+`https://console.example.com:8443`. Both references forward the
+complete public `Host` authority, port included (nginx `$http_host`, Caddy `{hostport}`).
+The Console guard matches the configured host and port. A different port or product host
+is rejected. If you write your own edge, keep that header; `$host` in nginx drops the port.
+See [deployment](../operations/deployment.md#operations-console-host-mode-reference).
+
+Keep `web` private to the proxy network. Do not expose its port publicly. Both
+reference proxies reject unknown hosts and direct physical `/<alias>` paths,
+preserve assets/API/CSP paths, and map only public console pages and API paths.
+See the authoritative [proxy and TLS mapping
+tables](../operations/deployment.md#operations-console-host-mode-reference).
+
+## Overview metadata and resource settings
+
+API build identity is generated by the API build command: product version from
+the root manifest, compiled-artifact fingerprint and a genuinely available source
+commit. CI passes the checkout SHA automatically; local dirty/watch sources do not
+claim an exact commit. No per-deploy manual identity entry is required.
+Legacy APP_VERSION/APP_COMMIT metrics labels remain separate from artifact facts;
+optional runtime labels are not displayed as proof of an environment.
+
+The resource comparison settings are `DATABASE_POOL_MAX`,
+`DATABASE_POOL_WAITING_THRESHOLD`, `HEALTH_MEMORY_HEAP_BYTES` and
+`HEALTH_DISK_THRESHOLD_PERCENT`. A blank heap setting preserves the existing probe-specific
+health defaults: 1 GiB for readiness and 1.5 GiB for liveness. Overview samples only the
+responding API process; it does not collect worker resource data. Filesystem
+sampling always uses `/` inside that API container.
+
+Build the web artifact with `NEXT_DEPLOYMENT_ID` to supply its ID, or let the
+build generate one. Overview shows the compiled ID supplied by the responding
+web server; it does not necessarily identify the JavaScript already loaded in a
+tab. Setting the
+variable on an already built web container does not change it. See
+[deployment identity](../operations/deployment.md) for build and rollout behavior.
+
+## External tool links
+
+The [Overview](overview.md) has an **External tools** card with links to the
+monitoring tools your team runs. The Console does not install, proxy or embed
+them: each link opens the tool in a new tab, and you sign in to the tool
+separately. Only a `SUPER_ADMIN` can open the Console, so only a `SUPER_ADMIN`
+sees the card. Organization owners and administrators get a not-found page
+instead of the Console.
+
+### What AMCore provides and what you deploy
+
+AMCore does not install or run these tools in production. Plan to deploy them
+yourself and then set their addresses below.
+
+| Tool    | Provided by AMCore                                                                         | You deploy                                               |
+| ------- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------- |
+| Metrics | The metrics endpoint, an overview dashboard file, and a dev-only `monitoring` profile      | Your own Prometheus and Grafana                          |
+| Alerts  | Alert rules, runbooks and an example Alertmanager setup                                    | Your own Alertmanager and its receivers                  |
+| Logs    | Structured log output, and an opt-in overlay that collects and searches it (Loki, Grafana) | The overlay, a log system of your choice, or none at all |
+
+The `monitoring` profile starts Prometheus, Grafana and Alertmanager for local
+verification and is never part of the production Compose files. See the
+[observability guide](../operations/observability.md) for the dashboard, rules
+and runbooks.
+
+### Set the addresses
+
+Set the addresses in the environment of the **web service**. With the bundled
+Compose file this is the `web` container, which reads them from the `.env` file
+next to `docker-compose.yml`. With another Compose file or platform, set the same
+variables in the web container's environment by the means that platform offers.
+
+| Variable                    | Link on the card | Typical target                                   |
+| --------------------------- | ---------------- | ------------------------------------------------ |
+| `ADMIN_CONSOLE_METRICS_URL` | Metrics          | A Grafana dashboard, such as the AMCore overview |
+| `ADMIN_CONSOLE_LOGS_URL`    | Logs             | The log search page of your logging system       |
+| `ADMIN_CONSOLE_ALERTS_URL`  | Alerts           | Alertmanager, or Grafana alerting                |
+
+```bash
+ADMIN_CONSOLE_METRICS_URL=https://grafana.example.com/d/amcore-overview
+ADMIN_CONSOLE_ALERTS_URL=https://alerts.example.com
+```
+
+An empty or missing variable means "not configured". Each configured tool is a
+link labelled with its name: **Metrics**, **Logs** or **Alerts**. Leave
+`ADMIN_CONSOLE_LOGS_URL` empty if you run no log search system: the start-up check
+accepts a Grafana address for it, but it cannot know whether that Grafana has a
+log data source, and without one the link opens an empty page.
+
+When all three are empty, the card shows the single line "External tools are not
+configured." instead of one row per tool. When only some are set, each unset tool
+is listed as "not configured". The **How to connect** link, which opens this
+section, stays on the card in both cases and disappears only when all three tools
+are set.
+
+An address must be an absolute `https` URL with a host name or an IPv4 address; a
+port is allowed (`https://grafana.example.com:8443/d/x`). Plain `http` is accepted
+only for `localhost` and `127.0.0.1`. IPv6 addresses in brackets are refused. Path,
+query and fragment are kept, so a link can open one dashboard. These values are
+refused:
+
+- addresses with a user name or password (`https://user:pw@host/`);
+- wildcard hosts such as `https://*.example.com`, and relative or scheme-less
+  values (`//host/d/x`, `host/d/x`);
+- values with spaces or control characters, or longer than 2048 characters;
+- other schemes, such as `javascript:` or `ftp:`;
+- `http` addresses of any other host, such as `http://grafana.internal:3000`.
+
+A value that is set but refused stops the **web service** at start-up. That is
+the whole web application, including the product's own pages, not only the
+Console: the process exits and prints the name of the offending variable on
+standard error. With the bundled Compose file, read it with
+`docker compose logs web`. For the metrics variable the message is:
+
+```text
+ADMIN_CONSOLE_METRICS_URL must be an absolute https URL (or a loopback http URL) without credentials, spaces or wildcards
+```
+
+Correct the value and start the web service again. A tool that can be reached
+only over plain `http` needs TLS in front of it before it can be linked; until
+then leave its variable empty.
+
+The Console reads the addresses from the web container's environment while it
+serves the page, so a new value needs no rebuild. A container's environment is
+fixed when the container is created, so the container must be **recreated** to
+receive a new value. With the bundled Compose file, run
+`docker compose up -d web`; `docker compose restart web` keeps the old
+environment. Then open the Overview and check the card.
+
+For the local `monitoring` profile ([observability guide](../operations/observability.md#local-verification-harness))
+you can set:
+
+```bash
+ADMIN_CONSOLE_METRICS_URL=http://localhost:3001
+ADMIN_CONSOLE_ALERTS_URL=http://localhost:9093
+```
+
+These loopback addresses open the tool on the machine of whoever clicks the link,
+so they work only in a browser on the same machine as the stack. Compose leaves
+all three variables empty by default, so the card never links to a tool that is
+not running.
+
+What the card does and does not prove:
+
+- A link means an address is configured. The Console does not contact the tool,
+  so it cannot tell whether the tool is running or whether you may sign in. A
+  mistyped but valid-looking address, such as a wrong host name, is not detected;
+  the link fails when someone opens it.
+- A **Logs** link does not prove that log collection is installed. AMCore ships
+  log search only as an opt-in overlay; see [Search application logs](../operations/log-search.md).
+  A link to its Grafana needs an SSH tunnel to the Docker host.
+- Never put a token, API key or password in these addresses, in the path, the
+  query or the fragment. The card is shown to every `SUPER_ADMIN`, the address
+  appears in the page and in browser history, and the start-up check cannot detect
+  a secret in any of those parts.
+- The card is part of the Console page. When the API cannot confirm that you are
+  a `SUPER_ADMIN`, the Console shows no page content and no links: a
+  "temporarily unavailable" notice, or a not-found page when the API is not
+  reachable at all. Keep direct bookmarks to your monitoring tools for that case.
+
+The links carry no Console session or token, and the browser sends no `Referer`
+to the tool. Single sign-on between the Console and these tools is not provided.
+
+### Metrics around an observation
+
+To open charts around a summary result, set the optional web variable
+`ADMIN_CONSOLE_METRICS_GRAFANA_URL` to an existing Grafana dashboard URL:
+
+```bash
+ADMIN_CONSOLE_METRICS_GRAFANA_URL=https://grafana.example.com/d/amcore-overview/overview
+```
+
+This is separate from `ADMIN_CONSOLE_METRICS_URL`, the plain **Metrics** link.
+That link can still point to a tool home page. The contextual address must have
+`/d/<uid>` or `/d/<uid>/<slug>` after any Grafana subpath. A home page, Explore
+or `/d-solo/` is incompatible. The same safe-address rules above apply.
+An empty value hides contextual links; an invalid configured value stops web at
+startup and names the variable. It does not reveal its configured value.
+
+1. Copy a dashboard URL from the Grafana your operators can access. Remove
+   credentials or secrets from its path, query and fragment.
+2. Set the variable in the web environment. With bundled Compose, run
+   `docker compose up -d web` with your usual Compose files to recreate web.
+3. Open a timed result under **Needs attention** and select **Metrics around this time**.
+   Grafana opens in a new tab and uses its own login.
+4. Check the selected interval: 15 minutes before and after that result's time.
+   An old result can have no retained chart data. Missing data does not prove recovery.
+
+```text
+Stored observation time -> absolute 30-minute interval -> Grafana dashboard
+```
+
+The Console replaces `from`/`to` with epoch milliseconds and removes conflicting
+`time`/`time.window`. It preserves other dashboard parameters and the fragment.
+It adds no user, job or delivery identifiers and sends no credentials. The web
+server never contacts Grafana. A missing or unrepresentable observation time hides
+the contextual link. No monitoring stack is installed by setting this variable.
+
+### Find in logs links
+
+Start the [log-search overlay](../operations/log-search.md#install) first. Then the Console can open the log
+search for one ID with a **Find in logs** link. Set one more variable in the web service
+environment, in the same way as the three above:
+
+```bash
+ADMIN_CONSOLE_LOGS_GRAFANA_URL=http://localhost:3002
+```
+
+| Question                                 | Answer                                                                                                                                                                                                                                                                                                                                                                               |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| What value do I set?                     | The address of the Grafana from the overlay. It follows the address rules above. A path is allowed (`https://host.example.com/grafana`).                                                                                                                                                                                                                                             |
+| Which value with the overlay?            | `http://localhost:3002`. The overlay's Grafana listens on `127.0.0.1` of the Docker host, so the link works only while **your** SSH tunnel is open.                                                                                                                                                                                                                                  |
+| Do I also need `ADMIN_CONSOLE_LOGS_URL`? | No. That variable only sets the plain **Logs** link on the Overview card. The two are independent.                                                                                                                                                                                                                                                                                   |
+| Can I use my own Grafana?                | Only with a [managed Loki](../operations/log-search.md#use-a-managed-loki-instead): your Grafana needs a Loki data source with the **uid** `amcore-loki` (the name does not matter) that reads that Loki. The overlay's own Loki publishes no port and allows no other service on its network, so with the overlay use the overlay's Grafana. A different uid opens an empty search. |
+| Can the address use plain `http`?        | Only for `localhost` and `127.0.0.1`. For any other host use `https`, for example behind a reverse proxy.                                                                                                                                                                                                                                                                            |
+| What if it is empty?                     | No **Find in logs** links appear and nothing else changes. When **Logs** is set, the card says "Log links on jobs and audit events: not configured."                                                                                                                                                                                                                                 |
+
+Where the links appear:
+
+| Screen                                          | ID that is searched                           |
+| ----------------------------------------------- | --------------------------------------------- |
+| [Background work](background-work.md) job cards | The job, delivery or run ID shown on the card |
+| [Audit](audit.md) command details               | The task ID                                   |
+| [Audit](audit.md) event                         | The request ID, when the event has one        |
+
+Each link opens Grafana in a new tab and runs `{service=~"api|worker"} |= "<ID>"` over the last
+7 days, the default retention of the overlay. If your retention is longer, widen the time range in
+Grafana. What a search finds:
+
+- The link searches the `api` and `worker` services. The `web` service has its own lines; search
+  them by hand ([Find a request](../operations/log-search.md#find-a-request)).
+- A queued job: the API line that queued it and the worker lines of its run.
+- A notification delivery or an AI run: only the lines that the worker logged with that ID. Many
+  deliveries log only failures, so an empty result does not mean the delivery did not happen.
+- A request ID: all API and worker lines of that request. The ID is a search aid that the caller can
+  choose; it does not prove who made the request.
+- An ID older than the retention, or a line that was never logged: no result. Grafana then shows an
+  empty list; check [what is lost and kept](../operations/log-search.md#what-fails-and-what-is-lost).
+
+If a link does not work, check in this order:
+
+1. **Connection error.** The SSH tunnel to the Grafana is not open, or it uses another port than the
+   address. The overlay's Grafana is not running (`docker compose ps logs-grafana`). The address has a
+   typo. The `web` container was restarted, not recreated, after you set the variable.
+2. **Grafana asks for a login.** Sign in with its own user; the Console sends no credentials.
+3. **An empty list.** The ID is older than the retention (7 days by default), the line was never
+   logged, or the data source uid is not `amcore-loki`. Check the pipeline with a fresh request
+   ([Find a request](../operations/log-search.md#find-a-request)).
+
+The Console only builds the address. It sends no token or session, and Grafana asks for its own login.
+A set but unusable value stops the web service at start-up with the variable's name, like the
+addresses above; recreate the container to apply a new value: run `docker compose up -d web` with the same `-f` files that you use to start the stack (for the production setup with the overlay: `docker compose -f docker-compose.yml -f docker/compose/prod.yml -f docker/compose/logs.yml up -d web`). Only IDs
+made of letters, digits and `. _ : -` get a link.
+
+### Documentation links
+
+The **Recovery instructions** link is always shown. It opens the
+`docs/operations/runbooks` folder of the upstream repository,
+`https://github.com/alex-morozov84/AMCore`, on GitHub. The **How to connect**
+link and the guide links on the Background work and Overview storage screens use
+the same base. The base is not an environment variable: it is the constant
+`DOCS_REPOSITORY_URL` in `apps/web/src/shared/lib/console-docs-links.ts`, so
+changing it needs a rebuild of the web image (with the bundled Compose file,
+`docker compose build web`, then `docker compose up -d web`). Every address
+points to the `main` branch, which can be newer than the version you deployed, so
+a guide may describe behavior your deployment does not have yet.
+
+The constant holds a repository root, such as `https://github.com/your-org/your-repo`.
+The functions `docsPageHref` and `docsFolderHref` in the same file build each
+address as `<root>/blob/main/<page path>` for a page and
+`<root>/tree/main/<folder path>` for a folder. A fork that keeps its
+documentation in a GitHub repository changes only the constant. A documentation
+site with a different path scheme, such as `https://docs.example.com`, also needs
+those two functions changed.
+
+## Database prerequisite: `pg_trgm` (Users/Organizations search)
+
+The Users and Organizations panels' search (ADR-082) is backed by
+PostgreSQL's `pg_trgm` extension. The console's own migration installs it
+(`CREATE EXTENSION IF NOT EXISTS pg_trgm`) — it is a PG13+ _trusted_
+extension, installable by any role with `CREATE` on the target database,
+no superuser grant required, and ships in the stock `postgres` Docker
+image this project runs by default. If you follow [Production Database
+Role Separation](../operations/database-role-separation.md), this means
+the migration-only `amcore_migrator` role can install it; the runtime
+`amcore_runtime` role neither installs nor owns it and only ever queries
+through the resulting indexes.
+
+If you deploy against a managed Postgres provider, confirm it specifically
+allows `pg_trgm` **before** running migrations against it — it is a
+commonly allowlisted contrib extension, but "commonly" is not a
+guarantee for your specific provider and plan tier. A provider that
+disallows it must fail the migration visibly; there is no supported
+fallback that silently serves search without the index it depends on.
+
+## Console URLs in browser history and logs
+
+Users and Organizations searches put the entered name, email, or slug in the
+page URL. Audit URLs contain exact actor, target, and organization filter IDs
+and an encrypted page cursor. The cursor hides its internal anchor and contains
+no raw audit-row ID. Audit current-name lookup text is sent in a same-origin
+POST body and stays out of URL history. Treat all of these URL values as
+operator input that may reveal personal or organizational information:
+
+- **The browser address bar and history**, on whichever machine the
+  operator is using. These views can be reloaded, bookmarked, or shared;
+  review the URL before pasting it into a chat or ticket.
+- **This API's request access logs and exception path fields** redact search
+  terms and audit ID/cursor values in structured query and URL fields.
+  Error-response paths are redacted too.
+- **A reverse-proxy access log** (Caddy, nginx, or any edge proxy in
+  front of either topology — **path mode and host mode alike**) is
+  outside this application's runtime and is not redacted by the shipped
+  reference configs. If your deployment retains proxy access logs and
+  that matters for your privacy posture, configure your proxy's own log
+  format to omit or truncate query strings for console routes.
+
+## Queue board
+
+The [queue board](queue-board.md) is opened from Background work through a fixed bridge in
+the Console's own server; it has no setting of its own besides the API's `ENABLE_BULL_BOARD`.
+
+- **Address.** Path mode serves it at `/api/console/bull-board/` on the product host. Host mode
+  serves it at `/api/bull-board/` on the Console host: the reference nginx and Caddy
+  configurations already map `/api/*` to `/api/console/*` there, so the board needs no extra rule.
+  The mapping must rewrite only the leading `/api/`, because the board's own data paths
+  (`/api/bull-board/api/queues`) contain a second one; the references do (anchored in nginx,
+  `uri replace … 1` in Caddy), and the board's root `/api/bull-board/` is mapped to the slashless
+  physical route by an explicit rule in both (otherwise Next.js's own trailing-slash redirect would
+  expose `/api/console/`). Keep both, and no caching, in a custom edge.
+- **Enabling.** In production set `ENABLE_BULL_BOARD=true` in the environment of the API process
+  and restart it; `.env` cannot enable it. The board is never served by the `worker` role.
+  Enabling it does not allow any action.
+- **What reaches the API.** The bridge reaches only the board's own mount
+  (`/api/v1/admin/queues`) with your Console session's bearer token. It forwards only `GET` and
+  `HEAD`, checks the path and the four query keys the board uses, drops every browser cookie and
+  header except a few, follows no redirect and serves nothing that does not carry the board's own
+  security policy. The generic product proxy refuses that path.
+- **Session.** In host mode the Console's own session is used and the product session is not
+  accepted; in path mode the product session is used, as for every other Console route. A
+  `SUPER_ADMIN` demotion applies on the next request; revoking the API session from elsewhere can
+  take up to the access token's lifetime (see [who can open it](queue-board.md#who-can-open-it)).
+
+## Troubleshooting
+
+- Startup fails in host mode: confirm `mode` in `admin-console.json` is `host` and
+  `ADMIN_CONSOLE_HOSTNAME` is a lowercase FQDN.
+- Caddy is absent after `compose up`: confirm `--profile edge` was supplied.
+- Console pages answer 404 although the Console is on: confirm `mode` is not `disabled`
+  and that the web image was rebuilt after the edit.
+- A public redirect exposes the physical slug: stop relying on the deployment
+  and correct the proxy mapping.
+- `web:3000` is publicly reachable: close the port or firewall exception; host
+  validation assumes the proxy and private container network are the boundary.
+- A valid account receives not found: verify it has the current
+  `SystemRole.SUPER_ADMIN` and that the API access probe is reachable.
+- Background work says the queue board is not enabled: see
+  [Enabling the board](queue-board.md#enabling-the-board). If it says it could not be opened,
+  check that the API is reachable from the web server and that nothing caches or rewrites
+  `/api/bull-board/` (host mode) or `/api/console/bull-board/` (path mode).

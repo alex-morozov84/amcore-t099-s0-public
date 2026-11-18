@@ -1,0 +1,809 @@
+import type { PinoLogger } from 'nestjs-pino'
+
+import { DEFAULT_LOCALE } from '@amcore/shared'
+
+import { NotFoundException } from '../../common/exceptions'
+import { GeoIpService } from '../../infrastructure/geoip/geoip.service'
+
+import {
+  createMockContext,
+  installOrdinaryPrimaryFixture,
+  type MockContext,
+  mockContextToPrisma,
+} from './auth-context.testkit'
+import { SessionService } from './session.service'
+import { TokenService } from './token.service'
+
+import { type Session, SystemRole, type User } from '@/generated/prisma/client'
+
+describe('SessionService', () => {
+  let sessionService: SessionService
+  let mockCtx: MockContext
+  let tokenService: jest.Mocked<TokenService>
+  let mockLogger: jest.Mocked<PinoLogger>
+
+  const mockUser: User = {
+    id: 'user-123',
+    email: 'test@example.com',
+    emailCanonical: 'test@example.com',
+    emailVerified: false,
+    passwordHash: 'hashed-password',
+    name: 'Test User',
+    avatarKey: null,
+    avatarGeneration: 0,
+    phone: null,
+    locale: 'ru',
+    timezone: 'Europe/Moscow',
+    createdAt: new Date('2024-01-01'),
+    updatedAt: new Date('2024-01-01'),
+    lastLoginAt: new Date('2024-01-01'),
+    systemRole: SystemRole.USER,
+  }
+
+  const mockSession: Session = {
+    id: 'session-123',
+    userId: 'user-123',
+    familyId: 'family-123',
+    refreshToken: 'hashed-token',
+    userAgent: 'Mozilla/5.0',
+    ipAddress: '192.168.1.1',
+    expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+    revokedAt: null,
+    revocationReason: null,
+    lastAuthAt: new Date('2024-01-01'),
+    createdAt: new Date(),
+  }
+
+  beforeEach(() => {
+    mockCtx = createMockContext()
+    installOrdinaryPrimaryFixture(mockCtx, mockUser)
+    mockCtx.prisma.user.findUnique.mockImplementation(((args: { where: { id?: string } }) =>
+      Promise.resolve({
+        ...mockUser,
+        id: args.where.id ?? mockUser.id,
+        mfaAccount: null,
+        mfaFactor: null,
+      })) as unknown as typeof mockCtx.prisma.user.findUnique)
+
+    tokenService = {
+      generateRefreshToken: jest.fn(),
+      hashRefreshToken: jest.fn(),
+      getRefreshTokenExpiration: jest.fn(),
+      generateAccessToken: jest.fn(),
+      verifyAccessToken: jest.fn(),
+    } as unknown as jest.Mocked<TokenService>
+
+    mockLogger = {
+      setContext: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+      debug: jest.fn(),
+    } as unknown as jest.Mocked<PinoLogger>
+
+    const geoIp = {
+      resolve: jest.fn().mockReturnValue(null),
+    } as unknown as jest.Mocked<GeoIpService>
+
+    const prisma = mockContextToPrisma(mockCtx)
+    sessionService = new SessionService(prisma, tokenService, geoIp, mockLogger)
+
+    mockCtx.prisma.$transaction.mockImplementation(async (callback: any) =>
+      callback(mockCtx.prisma)
+    )
+  })
+
+  describe('createSession', () => {
+    it('should create session and return session with raw refresh token', async () => {
+      const rawToken = 'raw-refresh-token-abc123'
+      const hashedToken = 'hashed-abc123'
+      const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+      const session = {
+        ...mockSession,
+        refreshToken: hashedToken,
+        expiresAt,
+      }
+
+      tokenService.generateRefreshToken.mockReturnValue(rawToken)
+      tokenService.hashRefreshToken.mockReturnValue(hashedToken)
+      tokenService.getRefreshTokenExpiration.mockReturnValue(expiresAt)
+
+      mockCtx.prisma.session.create.mockResolvedValue(session)
+
+      const result = await sessionService.createSession({
+        userId: 'user-123',
+        userAgent: 'Mozilla/5.0',
+        ipAddress: '192.168.1.1',
+      })
+
+      expect(tokenService.generateRefreshToken).toHaveBeenCalled()
+      expect(tokenService.hashRefreshToken).toHaveBeenCalledWith(rawToken)
+      expect(tokenService.getRefreshTokenExpiration).toHaveBeenCalled()
+
+      expect(mockCtx.prisma.session.create).toHaveBeenCalledWith({
+        data: {
+          userId: 'user-123',
+          familyId: expect.any(String),
+          refreshToken: hashedToken,
+          userAgent: 'Mozilla/5.0',
+          ipAddress: '192.168.1.1',
+          expiresAt,
+          lastAuthAt: expect.any(Date),
+        },
+      })
+
+      expect(result).toEqual({ session, refreshToken: rawToken })
+    })
+
+    it('should create session without userAgent and ipAddress', async () => {
+      const rawToken = 'raw-token'
+      const hashedToken = 'hashed-token'
+
+      tokenService.generateRefreshToken.mockReturnValue(rawToken)
+      tokenService.hashRefreshToken.mockReturnValue(hashedToken)
+      tokenService.getRefreshTokenExpiration.mockReturnValue(new Date())
+
+      mockCtx.prisma.session.create.mockResolvedValue(mockSession)
+
+      const result = await sessionService.createSession({
+        userId: 'user-456',
+      })
+
+      expect(mockCtx.prisma.session.create).toHaveBeenCalledWith({
+        data: {
+          userId: 'user-456',
+          familyId: expect.any(String),
+          refreshToken: hashedToken,
+          userAgent: null,
+          ipAddress: undefined,
+          expiresAt: expect.any(Date),
+          lastAuthAt: expect.any(Date),
+        },
+      })
+
+      expect(result).toEqual({ session: mockSession, refreshToken: rawToken })
+    })
+
+    it('should handle prisma create errors', async () => {
+      tokenService.generateRefreshToken.mockReturnValue('token')
+      tokenService.hashRefreshToken.mockReturnValue('hash')
+      tokenService.getRefreshTokenExpiration.mockReturnValue(new Date())
+
+      const error = new Error('Database error')
+      mockCtx.prisma.session.create.mockRejectedValue(error)
+
+      await expect(
+        sessionService.createSession({
+          userId: 'user-123',
+        })
+      ).rejects.toThrow('Database error')
+    })
+  })
+
+  describe('findByRefreshToken', () => {
+    it('should find session with user by hashed token', async () => {
+      const sessionWithUser = {
+        ...mockSession,
+        user: mockUser,
+      }
+
+      mockCtx.prisma.session.findUnique.mockResolvedValue(sessionWithUser)
+
+      const result = await sessionService.findByRefreshToken('hashed-token-123')
+
+      expect(mockCtx.prisma.session.findUnique).toHaveBeenCalledWith({
+        where: { refreshToken: 'hashed-token-123' },
+        include: { user: true },
+      })
+
+      expect(result).toEqual(sessionWithUser)
+    })
+
+    it('should return null if session not found', async () => {
+      mockCtx.prisma.session.findUnique.mockResolvedValue(null)
+
+      const result = await sessionService.findByRefreshToken('non-existent-token')
+
+      expect(result).toBeNull()
+    })
+
+    it('should handle database errors', async () => {
+      const error = new Error('Connection timeout')
+      mockCtx.prisma.session.findUnique.mockRejectedValue(error)
+
+      await expect(sessionService.findByRefreshToken('token')).rejects.toThrow('Connection timeout')
+    })
+  })
+
+  describe('validateRefreshToken', () => {
+    it('should return active session', async () => {
+      mockCtx.prisma.session.findUnique.mockResolvedValue({
+        ...mockSession,
+        user: mockUser,
+      } as Session & { user: User })
+
+      const result = await sessionService.validateRefreshToken('hashed-token')
+
+      expect(result.user).toEqual(mockUser)
+    })
+
+    it('should revoke token family on rotated token reuse', async () => {
+      mockCtx.prisma.session.findUnique.mockResolvedValue({
+        ...mockSession,
+        revokedAt: new Date(),
+        revocationReason: 'rotated',
+        user: mockUser,
+      } as Session & { user: User })
+      mockCtx.prisma.session.updateMany.mockResolvedValue({ count: 1 })
+
+      await expect(sessionService.validateRefreshToken('hashed-token')).rejects.toThrow(
+        'Refresh token is no longer valid'
+      )
+
+      expect(mockCtx.prisma.session.updateMany).toHaveBeenCalledWith({
+        where: {
+          userId: 'user-123',
+          familyId: 'family-123',
+          revokedAt: null,
+        },
+        data: {
+          revokedAt: expect.any(Date),
+          revocationReason: 'reuse-detected',
+        },
+      })
+    })
+  })
+
+  describe('rotateRefreshToken', () => {
+    it.each(['pending', 'aborted'])(
+      'does not rotate a %s authentication handoff',
+      async (status) => {
+        mockCtx.prisma.session.findUnique.mockResolvedValue(mockSession)
+        mockCtx.prisma.$queryRaw.mockResolvedValue([{ status }])
+        await expect(
+          sessionService.rotateRefreshToken('tagged-token', {
+            userId: mockSession.userId,
+          })
+        ).rejects.toMatchObject({ errorCode: 'AUTH_HANDOFF_INVALID' })
+        expect(mockCtx.prisma.session.create).not.toHaveBeenCalled()
+        expect(mockCtx.prisma.session.updateMany).not.toHaveBeenCalled()
+      }
+    )
+
+    it('should revoke old session and create new one in the same family', async () => {
+      const oldHashedToken = 'old-hashed-token'
+      const newRawToken = 'new-raw-token'
+      const newHashedToken = 'new-hashed-token'
+
+      tokenService.generateRefreshToken.mockReturnValue(newRawToken)
+      tokenService.hashRefreshToken.mockReturnValue(newHashedToken)
+      tokenService.getRefreshTokenExpiration.mockReturnValue(new Date())
+
+      mockCtx.prisma.session.findUnique.mockResolvedValue({
+        ...mockSession,
+        refreshToken: oldHashedToken,
+      })
+      mockCtx.prisma.session.updateMany.mockResolvedValue({ count: 1 })
+      mockCtx.prisma.session.create.mockResolvedValue({
+        ...mockSession,
+        familyId: 'family-123',
+        refreshToken: newHashedToken,
+      })
+
+      const result = await sessionService.rotateRefreshToken(oldHashedToken, {
+        userId: 'user-123',
+        userAgent: 'Chrome',
+        ipAddress: '10.0.0.1',
+      })
+
+      expect(mockCtx.prisma.session.findUnique).toHaveBeenCalledWith({
+        where: { refreshToken: oldHashedToken },
+      })
+
+      expect(mockCtx.prisma.session.updateMany).toHaveBeenCalledWith({
+        where: {
+          refreshToken: oldHashedToken,
+          revokedAt: null,
+        },
+        data: {
+          revokedAt: expect.any(Date),
+          revocationReason: 'rotated',
+        },
+      })
+
+      expect(mockCtx.prisma.session.create).toHaveBeenCalledWith({
+        data: {
+          userId: 'user-123',
+          familyId: 'family-123',
+          refreshToken: newHashedToken,
+          userAgent: 'Chrome',
+          ipAddress: '10.0.0.1',
+          expiresAt: expect.any(Date),
+          // Carried forward from the rotated session, NOT renewed (OB-06b).
+          lastAuthAt: mockSession.lastAuthAt,
+        },
+      })
+
+      expect(result).toEqual({
+        refreshToken: newRawToken,
+        sessionId: mockSession.id,
+        accessClaims: {
+          sub: mockUser.id,
+          email: mockUser.email,
+          systemRole: mockUser.systemRole,
+          sid: mockSession.id,
+        },
+      })
+    })
+
+    it('should throw unauthorized if old session not found', async () => {
+      mockCtx.prisma.session.findUnique.mockResolvedValue(null)
+
+      await expect(
+        sessionService.rotateRefreshToken('non-existent', {
+          userId: 'user-123',
+        })
+      ).rejects.toThrow('Invalid refresh token')
+    })
+
+    it('rejects a request that tries to rotate a different owner without revoking the source', async () => {
+      mockCtx.prisma.session.findUnique.mockResolvedValue(mockSession)
+      await expect(
+        sessionService.rotateRefreshToken('old-hash', { userId: 'other-owner' })
+      ).rejects.toMatchObject({ errorCode: 'TOKEN_INVALID' })
+      expect(mockCtx.prisma.session.updateMany).not.toHaveBeenCalled()
+      expect(mockCtx.prisma.session.create).not.toHaveBeenCalled()
+    })
+
+    it('should preserve user context during rotation', async () => {
+      installOrdinaryPrimaryFixture(mockCtx, { ...mockUser, id: 'user-456' })
+      tokenService.generateRefreshToken.mockReturnValue('new-token')
+      tokenService.hashRefreshToken.mockReturnValue('new-hash')
+      tokenService.getRefreshTokenExpiration.mockReturnValue(new Date(Date.now() + 86_400_000))
+
+      mockCtx.prisma.session.findUnique.mockResolvedValue({
+        ...mockSession,
+        userId: 'user-456',
+        refreshToken: 'old-hash',
+      })
+      mockCtx.prisma.session.updateMany.mockResolvedValue({ count: 1 })
+      mockCtx.prisma.session.create.mockResolvedValue({
+        ...mockSession,
+        userId: 'user-456',
+        refreshToken: 'new-hash',
+      })
+
+      await sessionService.rotateRefreshToken('old-hash', {
+        userId: 'user-456',
+        userAgent: 'Safari',
+        ipAddress: '192.168.1.100',
+      })
+
+      expect(mockCtx.prisma.session.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            userId: 'user-456',
+            familyId: 'family-123',
+            userAgent: 'Safari',
+            ipAddress: '192.168.1.100',
+          }),
+        })
+      )
+    })
+
+    it('should revoke the whole family when a rotated token is reused', async () => {
+      tokenService.generateRefreshToken.mockReturnValue('new-token')
+      tokenService.hashRefreshToken.mockReturnValue('new-hash')
+      tokenService.getRefreshTokenExpiration.mockReturnValue(new Date())
+
+      mockCtx.prisma.session.findUnique.mockResolvedValue({
+        ...mockSession,
+        refreshToken: 'old-hash',
+        revokedAt: new Date(),
+        revocationReason: 'rotated',
+      })
+      mockCtx.prisma.session.updateMany.mockResolvedValue({ count: 1 })
+
+      await expect(
+        sessionService.rotateRefreshToken('old-hash', {
+          userId: 'user-123',
+        })
+      ).rejects.toThrow('Refresh token is no longer valid')
+
+      expect(mockCtx.prisma.session.updateMany).toHaveBeenCalledWith({
+        where: {
+          userId: 'user-123',
+          familyId: 'family-123',
+          revokedAt: null,
+        },
+        data: {
+          revokedAt: expect.any(Date),
+          revocationReason: 'reuse-detected',
+        },
+      })
+      expect(mockCtx.prisma.session.create).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('deleteByRefreshToken', () => {
+    beforeEach(() => mockCtx.prisma.session.findUnique.mockResolvedValue(mockSession))
+    it('should delete session by hashed token', async () => {
+      mockCtx.prisma.session.deleteMany.mockResolvedValue({ count: 1 })
+
+      await sessionService.deleteByRefreshToken('hashed-token-123')
+
+      expect(mockCtx.prisma.session.deleteMany).toHaveBeenCalledWith({
+        where: { userId: mockSession.userId, familyId: mockSession.familyId },
+      })
+    })
+
+    it('should not throw error if session not found', async () => {
+      mockCtx.prisma.session.findUnique.mockResolvedValue(null)
+      mockCtx.prisma.session.deleteMany.mockResolvedValue({ count: 0 })
+
+      await expect(sessionService.deleteByRefreshToken('non-existent')).resolves.not.toThrow()
+    })
+
+    it('should handle database errors gracefully', async () => {
+      mockCtx.prisma.session.deleteMany.mockRejectedValue(new Error('DB error'))
+
+      await expect(sessionService.deleteByRefreshToken('token')).rejects.toThrow('DB error')
+    })
+  })
+
+  describe('touchLastAuth (OB-06b)', () => {
+    it('bumps lastAuthAt only for the caller’s own live session and returns count', async () => {
+      mockCtx.prisma.session.updateMany.mockResolvedValue({ count: 1 })
+
+      const count = await sessionService.touchLastAuth('session-1', 'user-1')
+
+      expect(count).toBe(1)
+      expect(mockCtx.prisma.session.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'session-1',
+          userId: 'user-1',
+          revokedAt: null,
+          expiresAt: { gt: expect.any(Date) },
+        },
+        data: { lastAuthAt: expect.any(Date) },
+      })
+    })
+
+    it('returns 0 when no live session matches (revoked / expired / gone)', async () => {
+      mockCtx.prisma.session.updateMany.mockResolvedValue({ count: 0 })
+
+      await expect(sessionService.touchLastAuth('sid', 'user-1')).resolves.toBe(0)
+    })
+  })
+
+  describe('hasLiveSession (OB-06b)', () => {
+    it('returns true for a live session owned by the user', async () => {
+      mockCtx.prisma.session.count.mockResolvedValue(1)
+
+      await expect(sessionService.hasLiveSession('sid', 'user-1')).resolves.toBe(true)
+      expect(mockCtx.prisma.session.count).toHaveBeenCalledWith({
+        where: {
+          id: 'sid',
+          userId: 'user-1',
+          revokedAt: null,
+          expiresAt: { gt: expect.any(Date) },
+        },
+      })
+    })
+
+    it('returns false when none match (revoked / expired / gone / wrong owner)', async () => {
+      mockCtx.prisma.session.count.mockResolvedValue(0)
+
+      await expect(sessionService.hasLiveSession('sid', 'user-1')).resolves.toBe(false)
+    })
+  })
+
+  describe('getUserSessions', () => {
+    const sessions: Session[] = [
+      {
+        id: 'session-1',
+        userId: 'user-123',
+        familyId: 'family-1',
+        refreshToken: 'hash-1',
+        userAgent: 'Chrome',
+        ipAddress: '192.168.1.1',
+        expiresAt: new Date(),
+        revokedAt: null,
+        revocationReason: null,
+        lastAuthAt: new Date('2024-01-01'),
+        createdAt: new Date('2024-01-01'),
+      },
+      {
+        id: 'session-2',
+        userId: 'user-123',
+        familyId: 'family-2',
+        refreshToken: 'hash-2',
+        userAgent: 'Firefox',
+        ipAddress: '192.168.1.2',
+        expiresAt: new Date(),
+        revokedAt: null,
+        revocationReason: null,
+        lastAuthAt: new Date('2024-01-02'),
+        createdAt: new Date('2024-01-02'),
+      },
+    ]
+
+    it('returns paginated envelope with current flag (OB-05)', async () => {
+      mockCtx.prisma.session.findMany.mockResolvedValue(sessions)
+      mockCtx.prisma.session.count.mockResolvedValue(2)
+
+      const result = await sessionService.getUserSessions(
+        'user-123',
+        'hash-1',
+        1,
+        20,
+        DEFAULT_LOCALE
+      )
+
+      expect(mockCtx.prisma.session.findMany).toHaveBeenCalledWith({
+        where: {
+          userId: 'user-123',
+          revokedAt: null,
+          expiresAt: { gt: expect.any(Date) },
+        },
+        skip: 0,
+        take: 20,
+        orderBy: [{ createdAt: 'desc' }, { id: 'asc' }],
+      })
+
+      expect(result.total).toBe(2)
+      expect(result.page).toBe(1)
+      expect(result.limit).toBe(20)
+      expect(result.data).toHaveLength(2)
+      expect(result.data[0]!.current).toBe(true) // hash-1
+      expect(result.data[1]!.current).toBe(false) // hash-2
+    })
+
+    it('returns envelope without current flag when no currentTokenHash provided', async () => {
+      mockCtx.prisma.session.findMany.mockResolvedValue(sessions)
+      mockCtx.prisma.session.count.mockResolvedValue(2)
+
+      const result = await sessionService.getUserSessions(
+        'user-123',
+        undefined,
+        1,
+        20,
+        DEFAULT_LOCALE
+      )
+
+      expect(result.data).toHaveLength(2)
+      expect(result.data[0]!.current).toBe(false)
+      expect(result.data[1]!.current).toBe(false)
+    })
+
+    it('returns empty envelope when user has no sessions', async () => {
+      mockCtx.prisma.session.findMany.mockResolvedValue([])
+      mockCtx.prisma.session.count.mockResolvedValue(0)
+
+      const result = await sessionService.getUserSessions(
+        'user-no-sessions',
+        undefined,
+        1,
+        20,
+        DEFAULT_LOCALE
+      )
+
+      expect(result.data).toEqual([])
+      expect(result.total).toBe(0)
+      expect(result.page).toBe(1)
+      expect(result.limit).toBe(20)
+    })
+
+    it('maps session fields correctly with ISO-string createdAt', async () => {
+      mockCtx.prisma.session.findMany.mockResolvedValue([sessions[0]!])
+      mockCtx.prisma.session.count.mockResolvedValue(1)
+
+      const result = await sessionService.getUserSessions(
+        'user-123',
+        undefined,
+        1,
+        20,
+        DEFAULT_LOCALE
+      )
+
+      expect(result.data[0]).toBeDefined()
+      expect(result.data[0]!).toEqual({
+        id: 'session-1',
+        userAgent: 'Chrome',
+        ipAddress: '192.168.1.1',
+        location: null,
+        createdAt: sessions[0]!.createdAt.toISOString(),
+        current: false,
+      })
+    })
+
+    it('applies skip/take and deterministic ORDER BY (ADR-036)', async () => {
+      mockCtx.prisma.session.findMany.mockResolvedValue(sessions)
+      mockCtx.prisma.session.count.mockResolvedValue(2)
+
+      await sessionService.getUserSessions('user-123', undefined, 2, 10, DEFAULT_LOCALE)
+
+      expect(mockCtx.prisma.session.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          skip: 10,
+          take: 10,
+          orderBy: [{ createdAt: 'desc' }, { id: 'asc' }],
+        })
+      )
+    })
+  })
+
+  describe('deleteSession', () => {
+    beforeEach(() => mockCtx.prisma.session.findFirst.mockResolvedValue(mockSession))
+    it('should delete specific session for user', async () => {
+      mockCtx.prisma.session.deleteMany.mockResolvedValue({ count: 1 })
+
+      await sessionService.deleteSession('session-123', 'user-123')
+
+      expect(mockCtx.prisma.session.deleteMany).toHaveBeenCalledWith({
+        where: {
+          familyId: 'family-123',
+          userId: 'user-123',
+        },
+      })
+    })
+
+    it('should throw NotFoundException if userId mismatch', async () => {
+      mockCtx.prisma.session.findFirst.mockResolvedValue(null)
+      mockCtx.prisma.session.deleteMany.mockResolvedValue({ count: 0 })
+
+      await expect(sessionService.deleteSession('session-123', 'wrong-user')).rejects.toThrow(
+        NotFoundException
+      )
+
+      expect(mockCtx.prisma.session.deleteMany).not.toHaveBeenCalled()
+    })
+
+    it('should throw NotFoundException for non-existent session', async () => {
+      mockCtx.prisma.session.findFirst.mockResolvedValue(null)
+      mockCtx.prisma.session.deleteMany.mockResolvedValue({ count: 0 })
+
+      await expect(sessionService.deleteSession('non-existent', 'user-123')).rejects.toThrow(
+        NotFoundException
+      )
+    })
+  })
+
+  describe('deleteOtherSessions', () => {
+    beforeEach(() => mockCtx.prisma.session.findUnique.mockResolvedValue(mockSession))
+    it('should delete all sessions except current', async () => {
+      mockCtx.prisma.session.deleteMany.mockResolvedValue({ count: 3 })
+
+      await sessionService.deleteOtherSessions('user-123', 'current-hash')
+
+      expect(mockCtx.prisma.session.deleteMany).toHaveBeenCalledWith({
+        where: {
+          userId: 'user-123',
+          familyId: { not: mockSession.familyId },
+        },
+      })
+    })
+
+    it('should return without error if no other sessions exist', async () => {
+      mockCtx.prisma.session.deleteMany.mockResolvedValue({ count: 0 })
+
+      await expect(
+        sessionService.deleteOtherSessions('user-123', 'only-session')
+      ).resolves.not.toThrow()
+    })
+
+    it('should handle deletion of multiple sessions', async () => {
+      installOrdinaryPrimaryFixture(mockCtx, { ...mockUser, id: 'user-with-many' })
+      mockCtx.prisma.session.findUnique.mockResolvedValue({
+        ...mockSession,
+        userId: 'user-with-many',
+      })
+      mockCtx.prisma.session.deleteMany.mockResolvedValue({ count: 10 })
+
+      await sessionService.deleteOtherSessions('user-with-many', 'current')
+
+      expect(mockCtx.prisma.session.deleteMany).toHaveBeenCalled()
+    })
+  })
+
+  describe('cleanupExpired', () => {
+    it('should delete all expired sessions', async () => {
+      mockCtx.prisma.session.deleteMany.mockResolvedValue({ count: 5 })
+
+      await sessionService.cleanupExpired()
+
+      expect(mockCtx.prisma.session.deleteMany).toHaveBeenCalledWith({
+        where: {
+          expiresAt: { lt: expect.any(Date) },
+        },
+      })
+    })
+
+    it('should not throw error if no expired sessions', async () => {
+      mockCtx.prisma.session.deleteMany.mockResolvedValue({ count: 0 })
+
+      await expect(sessionService.cleanupExpired()).resolves.not.toThrow()
+    })
+
+    it('should use current time for expiration check', async () => {
+      mockCtx.prisma.session.deleteMany.mockResolvedValue({ count: 2 })
+
+      const beforeCleanup = new Date()
+      await sessionService.cleanupExpired()
+      const afterCleanup = new Date()
+
+      const callArg = mockCtx.prisma.session.deleteMany.mock.calls[0]![0]!
+      const expiresAtFilter = callArg.where!.expiresAt as { lt: Date }
+      const expiresAtLt = expiresAtFilter.lt
+
+      // Verify that the expiration check uses a date between before and after
+      expect(expiresAtLt.getTime()).toBeGreaterThanOrEqual(beforeCleanup.getTime() - 100) // Allow 100ms tolerance
+      expect(expiresAtLt.getTime()).toBeLessThanOrEqual(afterCleanup.getTime() + 100)
+    })
+
+    it('should handle cleanup errors', async () => {
+      mockCtx.prisma.session.deleteMany.mockRejectedValue(new Error('Cleanup failed'))
+
+      await expect(sessionService.cleanupExpired()).rejects.toThrow('Cleanup failed')
+    })
+  })
+
+  describe('integration - session lifecycle', () => {
+    it('should support complete session flow', async () => {
+      // Create session
+      tokenService.generateRefreshToken.mockReturnValue('raw-token-1')
+      tokenService.hashRefreshToken.mockReturnValue('hash-1')
+      tokenService.getRefreshTokenExpiration.mockReturnValue(new Date())
+
+      mockCtx.prisma.session.create.mockResolvedValue(mockSession)
+
+      const result1 = await sessionService.createSession({
+        userId: 'user-123',
+      })
+
+      expect(result1).toEqual({ session: mockSession, refreshToken: 'raw-token-1' })
+
+      // Find session
+      const sessionWithUser = {
+        ...mockSession,
+        user: mockUser,
+      } satisfies Session & { user: User }
+
+      mockCtx.prisma.session.findUnique.mockResolvedValue(sessionWithUser)
+
+      const found = await sessionService.findByRefreshToken('hash-1')
+      expect(found).toBeDefined()
+      expect(found?.user.id).toBe('user-123')
+
+      // Rotate session
+      tokenService.generateRefreshToken.mockReturnValue('raw-token-2')
+      tokenService.hashRefreshToken.mockReturnValue('hash-2')
+
+      mockCtx.prisma.session.findUnique.mockResolvedValue({
+        ...mockSession,
+        refreshToken: 'hash-1',
+      })
+      mockCtx.prisma.session.updateMany.mockResolvedValue({ count: 1 })
+      mockCtx.prisma.session.create.mockResolvedValue({
+        ...mockSession,
+        refreshToken: 'hash-2',
+      })
+
+      const rotated = await sessionService.rotateRefreshToken('hash-1', {
+        userId: 'user-123',
+      })
+
+      expect(rotated.refreshToken).toBe('raw-token-2')
+      expect(rotated.sessionId).toBe(mockSession.id)
+
+      // Delete session
+      mockCtx.prisma.session.deleteMany.mockResolvedValue({ count: 1 })
+
+      await sessionService.deleteByRefreshToken('hash-2')
+
+      expect(mockCtx.prisma.session.deleteMany).toHaveBeenCalledWith({
+        where: { userId: mockSession.userId, familyId: mockSession.familyId },
+      })
+    })
+  })
+})

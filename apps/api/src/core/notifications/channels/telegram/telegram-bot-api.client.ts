@@ -1,0 +1,217 @@
+import { Injectable } from '@nestjs/common'
+import { z } from 'zod'
+
+import { EnvService } from '../../../../env/env.service.js'
+
+import {
+  DEFAULT_TELEGRAM_API_BASE_URL,
+  TELEGRAM_REQUEST_TIMEOUT_MS,
+  TelegramDeliveryError,
+} from './telegram.constants.js'
+import { readBoundedBody } from './telegram-response-body.js'
+
+/** One outbound text message. Plain text only — no `parse_mode` (no escaping/injection surface). */
+export interface TelegramSendMessageInput {
+  chatId: string
+  text: string
+  /** The delivery attempt's abort signal (dispatcher timeout / shutdown), combined with the client's own timeout. */
+  signal?: AbortSignal
+}
+
+/**
+ * Bot API send outcome, mapped by the deliverer (D.5) to a durable `DeliveryResult`.
+ * `retryAfterMs` is the provider flood-wait floor for a transient `rate_limited`.
+ */
+export type TelegramSendResult =
+  | { status: 'delivered'; providerMessageId?: string }
+  | {
+      status: 'transient'
+      errorCode: string
+      retryAfterMs?: number
+      effectCertainty?: 'none' | 'unknown'
+    }
+  | { status: 'permanent'; errorCode: string; effectCertainty?: 'none' | 'unknown' }
+
+/**
+ * Bounded projection of a Bot API response: `result` is narrowed to only the shapes used here
+ * (a message with `message_id`, or a boolean for `setWebhook`) — every other Message field is
+ * stripped. Unknown top-level fields are stripped too (`.partial()` default strip).
+ */
+const botApiResponseSchema = z
+  .object({
+    ok: z.boolean().optional(),
+    result: z.union([z.boolean(), z.object({ message_id: z.number().int() }).partial()]).optional(),
+    error_code: z.number().optional(),
+    description: z.string().max(500).optional(),
+    parameters: z
+      .object({ retry_after: z.number().optional(), migrate_to_chat_id: z.number().optional() })
+      .partial()
+      .optional(),
+  })
+  .partial()
+
+type BotApiResponse = z.infer<typeof botApiResponseSchema>
+type BotApiCall = { httpStatus: number; body: BotApiResponse } | 'transport_error'
+
+/**
+ * Direct Telegram Bot API client (worker infra, Arc D / D.3). `fetch` + an abort timeout, a
+ * **validated base-URL override** (`TELEGRAM_API_BASE_URL` — points at a self-hosted relay
+ * where the public API is blocked, see docs/notifications/README.md; also fake-server-testable),
+ * and the `TELEGRAM_BOT_TOKEN`. The token sits in the request path, so the token-bearing URL **never**
+ * appears in a thrown error or log — failures map to bounded codes only. No framework, no
+ * `parse_mode`. Classification uses the **HTTP status** (Telegram sets it == `error_code`), so a
+ * non-2xx body claiming `ok:true` is never counted as delivered.
+ */
+@Injectable()
+export class TelegramBotApiClient {
+  constructor(private readonly env: EnvService) {}
+
+  async sendMessage(input: TelegramSendMessageInput): Promise<TelegramSendResult> {
+    const outcome = await this.call(
+      'sendMessage',
+      { chat_id: input.chatId, text: input.text },
+      input.signal
+    )
+    if (outcome === 'transport_error') {
+      return { status: 'transient', errorCode: TelegramDeliveryError.PROVIDER_TRANSIENT }
+    }
+    return classifySend(outcome.httpStatus, outcome.body)
+  }
+
+  async sendPreparedMessage(body: string, signal: AbortSignal): Promise<TelegramSendResult> {
+    const outcome = await this.call('sendMessage', body, signal)
+    if (outcome === 'transport_error') {
+      return { status: 'transient', errorCode: TelegramDeliveryError.PROVIDER_TRANSIENT }
+    }
+    return classifySend(outcome.httpStatus, outcome.body)
+  }
+
+  /**
+   * Deploy-time `setWebhook` (used by the setup CLI). Returns whether Telegram accepted it (HTTP
+   * 2xx + `ok:true`); never surfaces the token-bearing URL. `allowed_updates:['message']` narrows
+   * the feed.
+   */
+  async setWebhook(url: string, secret: string, dropPending = false): Promise<boolean> {
+    const outcome = await this.call('setWebhook', {
+      url,
+      secret_token: secret,
+      allowed_updates: ['message'],
+      drop_pending_updates: dropPending,
+    })
+    return outcome !== 'transport_error' && isHttpOk(outcome.httpStatus) && outcome.body.ok === true
+  }
+
+  /**
+   * One bounded request. Returns the HTTP status + parsed projection, or `'transport_error'` for
+   * network/timeout/oversize. A received-but-unparseable body keeps the status (so e.g. a degraded
+   * 429 still classifies as rate-limited) with an empty projection.
+   */
+  private async call(
+    method: string,
+    payload: object | string,
+    externalSignal?: AbortSignal
+  ): Promise<BotApiCall> {
+    const token = this.env.get('TELEGRAM_BOT_TOKEN')
+    const baseUrl = (
+      this.env.get('TELEGRAM_API_BASE_URL') ?? DEFAULT_TELEGRAM_API_BASE_URL
+    ).replace(/\/+$/, '')
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), TELEGRAM_REQUEST_TIMEOUT_MS)
+    try {
+      const response = await fetch(`${baseUrl}/bot${token}/${method}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: typeof payload === 'string' ? payload : JSON.stringify(payload),
+        signal: externalSignal
+          ? AbortSignal.any([controller.signal, externalSignal])
+          : controller.signal,
+      })
+      const body = await readBoundedBody(response)
+      if ('error' in body) return 'transport_error'
+      return { httpStatus: response.status, body: parseBody(body.text) }
+    } catch {
+      // Never leak the token-bearing URL or the raw error.
+      return 'transport_error'
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+}
+
+/** Parse + bounded-project the body; an unparseable/unexpected body yields an empty projection. */
+function parseBody(text: string): BotApiResponse {
+  try {
+    const parsed = botApiResponseSchema.safeParse(JSON.parse(text))
+    return parsed.success ? parsed.data : {}
+  } catch {
+    return {}
+  }
+}
+
+function isHttpOk(status: number): boolean {
+  return status >= 200 && status < 300
+}
+
+/**
+ * Map an HTTP status + parsed body to a send outcome. 2xx + `ok:true` → delivered. Destination
+ * errors are permanent and fence the connection (403 blocked; 400 chat-not-found; 400 +
+ * `migrate_to_chat_id`, value never logged). 429 / 408 / 5xx / network are transient. Any other
+ * deterministic 4xx (bad token/method/request) → `telegram_provider_permanent` (permanent, but it
+ * does NOT fence the destination — D.5).
+ */
+function classifySend(httpStatus: number, body: BotApiResponse): TelegramSendResult {
+  if (isHttpOk(httpStatus) && body.ok === true && extractMessageId(body.result)) {
+    return { status: 'delivered', providerMessageId: extractMessageId(body.result) }
+  }
+  if (httpStatus === 429) {
+    return {
+      status: 'transient',
+      errorCode: TelegramDeliveryError.RATE_LIMITED,
+      effectCertainty: body.ok === false && body.error_code === 429 ? 'none' : 'unknown',
+      retryAfterMs: toRetryAfterMs(body.parameters?.retry_after),
+    }
+  }
+  const effectCertainty = body.ok === false && body.error_code === httpStatus ? 'none' : 'unknown'
+  if (httpStatus === 403)
+    return { status: 'permanent', errorCode: TelegramDeliveryError.BLOCKED, effectCertainty }
+  if (httpStatus === 400 && body.parameters?.migrate_to_chat_id !== undefined) {
+    return { status: 'permanent', errorCode: TelegramDeliveryError.MIGRATED, effectCertainty }
+  }
+  if (httpStatus === 400 && /chat not found/i.test(body.description ?? '')) {
+    return { status: 'permanent', errorCode: TelegramDeliveryError.CHAT_NOT_FOUND, effectCertainty }
+  }
+  if (httpStatus === 408 || httpStatus >= 500) {
+    return { status: 'transient', errorCode: TelegramDeliveryError.PROVIDER_TRANSIENT }
+  }
+  if (httpStatus >= 400) {
+    return {
+      status: 'permanent',
+      errorCode: TelegramDeliveryError.PROVIDER_PERMANENT,
+      effectCertainty,
+    }
+  }
+  // A 2xx with ok:false (or other anomaly) — retry rather than permanently fail.
+  return { status: 'transient', errorCode: TelegramDeliveryError.PROVIDER_TRANSIENT }
+}
+
+/** Defensively read `result.message_id` (sendMessage) — absent for a boolean/other result. */
+function extractMessageId(result: BotApiResponse['result']): string | undefined {
+  if (
+    typeof result === 'object' &&
+    result !== null &&
+    typeof result.message_id === 'number' &&
+    Number.isSafeInteger(result.message_id) &&
+    result.message_id > 0
+  ) {
+    return result.message_id.toString()
+  }
+  return undefined
+}
+
+/** Validate a finite positive **safe** integer seconds floor → ms; ignore anything else. */
+function toRetryAfterMs(retryAfter: number | undefined): number | undefined {
+  if (retryAfter === undefined || !Number.isSafeInteger(retryAfter) || retryAfter <= 0) {
+    return undefined
+  }
+  return retryAfter * 1000
+}

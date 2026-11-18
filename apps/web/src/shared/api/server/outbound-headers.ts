@@ -1,0 +1,32 @@
+import { headers as nextHeaders } from 'next/headers'
+
+import { type BackendAuthMode, resolveAuthHeader, type TokenResolver } from './auth-header'
+
+import 'server-only'
+
+export type OutboundHeadersResult =
+  { headers: Headers; source: Headers } | { authUnavailable: true }
+
+/**
+ * Never the inbound request's own headers verbatim - only the specific,
+ * deliberate set this transport is allowed to add (correlation id, trusted
+ * client IP when configured, and an auth header per `authMode`).
+ */
+export async function buildOutboundHeaders(
+  correlationId: string,
+  authMode: BackendAuthMode,
+  tokenResolver?: TokenResolver
+): Promise<OutboundHeadersResult> {
+  const inbound = await nextHeaders()
+  const authResult = await resolveAuthHeader(authMode, tokenResolver)
+  if ('unavailable' in authResult) return { authUnavailable: true }
+
+  const outbound = new Headers({
+    'Content-Type': 'application/json',
+    'X-Correlation-Id': correlationId,
+  })
+  if (authResult.header) outbound.set('Authorization', authResult.header)
+  for (const [name, value] of Object.entries(authResult.browserHeaders ?? {}))
+    outbound.set(name, value)
+  return { headers: outbound, source: inbound }
+}

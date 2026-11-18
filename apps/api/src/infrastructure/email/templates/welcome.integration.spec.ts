@@ -1,0 +1,84 @@
+/**
+ * Integration test for Welcome Email Template
+ *
+ * Tests real React Email rendering without mocks.
+ * Uses Vitest (React Email's official testing framework) with happy-dom.
+ *
+ * @see https://react.email/docs/introduction#testing
+ */
+
+import { render } from '@react-email/render'
+import { describe, expect, it } from 'vitest'
+
+import WelcomeEmail from './welcome'
+
+// Supplied by the configured happy-dom test environment.
+declare const DOMParser: typeof import('happy-dom').DOMParser
+
+describe('WelcomeEmail Template (Integration)', () => {
+  it('should render in the base locale (English) by default', async () => {
+    const html = await render(
+      WelcomeEmail({
+        name: 'Alexander Morozov',
+        email: 'alex@example.com',
+      })
+    )
+
+    // Check that HTML is generated
+    expect(html).toMatch(/<table/i)
+    expect(html).toMatch(/style="/i)
+
+    // Check English content
+    expect(html).toContain('Alexander Morozov')
+    expect(html).toContain('alex@example.com')
+    expect(html).toContain('Welcome')
+    expect(html).toContain('AMCore')
+
+    // Check HTML structure
+    expect(html).toContain('<!DOCTYPE html')
+    expect(html).toContain('<html')
+    expect(html).toContain('</html>')
+    expect(html).toContain('<body')
+  })
+
+  it('should render in Russian when locale=ru', async () => {
+    const html = await render(
+      WelcomeEmail({
+        name: 'Александр Морозов',
+        email: 'alex@example.com',
+        locale: 'ru',
+      })
+    )
+
+    // Check Russian content
+    expect(html).toContain('Александр Морозов')
+    expect(html).toContain('Добро пожаловать')
+    expect(html).not.toContain('Thank you for signing up')
+  })
+
+  it('should handle special characters in name', async () => {
+    const html = await render(
+      WelcomeEmail({
+        name: 'Иван <script>alert(1)</script> & "Тест" Петров',
+        email: 'ivan@example.com',
+      })
+    )
+
+    const document = new DOMParser().parseFromString(html, 'text/html')
+    expect(document.body.textContent).toContain('Иван <script>alert(1)</script> & "Тест" Петров')
+    expect(document.querySelector('script')).toBeNull()
+  })
+
+  it('should include email info box', async () => {
+    const html = await render(
+      WelcomeEmail({
+        name: 'Test User',
+        email: 'test@example.com',
+      })
+    )
+
+    // Email should be in info box
+    expect(html).toContain('Email')
+    expect(html).toContain('test@example.com')
+  })
+})

@@ -1,0 +1,246 @@
+import { Injectable } from '@nestjs/common'
+
+import {
+  Action,
+  type OrganizationContextResponse,
+  type OrganizationListResponse,
+  type OrgResponse,
+  type RequestPrincipal,
+} from '@amcore/shared'
+
+import {
+  ConflictException,
+  ForbiddenException,
+  NotFoundException,
+} from '../../common/exceptions/index.js'
+import type { Organization, Prisma } from '../../generated/prisma/client.js'
+import { PrismaService } from '../../prisma/index.js'
+import type { AppAbility } from '../auth/casl/ability.factory.js'
+import type { TeamAccessDecision } from '../auth/casl/ability.factory.js'
+import { ORG_READ_FIELDS } from '../auth/casl/org-role-defaults.js'
+import { OrgAclVersionService } from '../auth/org-acl-version.service.js'
+import type { VerifiedOrganizationContext } from '../auth/organization-context/verified-organization-context.js'
+
+import { CapabilityRegistry } from './capability-registry.service.js'
+import type { CreateOrganizationDto, UpdateOrganizationDto } from './dto/index.js'
+import {
+  assertOrganizationAction,
+  assertOrganizationResponse,
+  lockOrganization,
+} from './organization-authorization.js'
+import { OrganizationCreationService } from './organization-creation.service.js'
+
+type PrismaTx = Prisma.TransactionClient
+
+@Injectable()
+export class OrganizationsService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly aclVersionService: OrgAclVersionService,
+    private readonly capabilities: CapabilityRegistry,
+    private readonly creation: OrganizationCreationService
+  ) {}
+
+  create(userId: string, dto: CreateOrganizationDto, operationId?: string): Promise<OrgResponse> {
+    return this.creation.create(userId, dto, operationId)
+  }
+
+  async findAllForUser(
+    userId: string,
+    page: number,
+    limit: number
+  ): Promise<OrganizationListResponse> {
+    // ADR-036: paginated envelope. ORDER BY createdAt DESC, id ASC on
+    // the join (sort the organizations by their own createdAt, with
+    // id as the tie-break for deterministic page boundaries).
+    const skip = (page - 1) * limit
+    const [memberships, total] = await Promise.all([
+      this.prisma.orgMember.findMany({
+        where: { userId },
+        skip,
+        take: limit,
+        orderBy: [{ organization: { createdAt: 'desc' } }, { organization: { id: 'asc' } }],
+        include: { organization: true },
+      }),
+      this.prisma.orgMember.count({ where: { userId } }),
+    ])
+    return {
+      data: memberships.map((m) => this.toOrgResponse(m.organization)),
+      total,
+      page,
+      limit,
+    }
+  }
+
+  private toOrgResponse(org: Organization): OrgResponse {
+    return {
+      id: org.id,
+      name: org.name,
+      slug: org.slug,
+      aclVersion: org.aclVersion,
+      createdAt: org.createdAt.toISOString(),
+      updatedAt: org.updatedAt.toISOString(),
+    }
+  }
+
+  async selectedContext(
+    context: VerifiedOrganizationContext,
+    access: TeamAccessDecision,
+    ability: AppAbility
+  ): Promise<OrganizationContextResponse> {
+    if (
+      !context.membershipVerified ||
+      access.actorId !== context.actorId ||
+      access.organizationId !== context.organizationId ||
+      access.aclVersion !== context.aclVersion
+    ) {
+      throw new Error('Organization context authority mismatch')
+    }
+    const organization = await this.prisma.organization.findUnique({
+      where: { id: context.organizationId },
+    })
+    if (!organization) throw new NotFoundException('Organization', context.organizationId)
+    return {
+      organization: { id: organization.id, name: organization.name, slug: organization.slug },
+      canManageTeamAccess: access.ownerTrusted && access.credentialTrusted,
+      actorAffordances: this.capabilities.actor(ability, access),
+      recordAffordances: this.capabilities.record(ability, access, organization),
+    }
+  }
+
+  async findOne(
+    id: string,
+    principal: RequestPrincipal,
+    ability: AppAbility
+  ): Promise<OrgResponse> {
+    // OA-03: api_key principals are constrained on two axes; JWT
+    // principals fall through both checks and rely on the membership
+    // check below.
+    if (principal.type === 'api_key') {
+      // Bound-org boundary. 403 (not 404) — credential-boundary
+      // violation, not org-existence concealment; the e2e scenario
+      // explicitly builds owner membership in both orgs to prove the
+      // boundary fires, not a missing membership.
+      if (principal.organizationId !== id) {
+        throw new ForbiddenException(
+          'API key is bound to a different organization and cannot read this one'
+        )
+      }
+    }
+
+    const [org, member] = await Promise.all([
+      this.prisma.organization.findUnique({ where: { id } }),
+      this.prisma.orgMember.findUnique({
+        where: { userId_organizationId: { userId: principal.sub, organizationId: id } },
+      }),
+    ])
+    // OB-04: from a non-member JWT principal, missing org and
+    // existing-but-not-member must produce the same response so an
+    // attacker cannot enumerate org IDs by status code. The API-key
+    // branch above intentionally keeps 403 — that path is a
+    // credential-boundary violation (OA-03), not concealment, and the
+    // caller has already authenticated as a key bound to a different
+    // org.
+    if (!org || !member) throw new NotFoundException('Organization', id)
+    if (principal.type === 'api_key') assertOrganizationResponse(ability, org)
+    return this.toOrgResponse(org)
+  }
+
+  async update(
+    id: string,
+    principal: RequestPrincipal,
+    dto: UpdateOrganizationDto,
+    ability: AppAbility
+  ): Promise<OrgResponse> {
+    this.assertOrgContext(principal, id)
+    const org = await this.prisma.$transaction(async (tx) => {
+      const before = await lockOrganization(tx, id, principal)
+      const fields = Object.keys(dto).filter(
+        (field) => dto[field as keyof UpdateOrganizationDto] !== undefined
+      )
+      assertOrganizationAction(ability, Action.Update, before, fields)
+      if (fields.length === 0) {
+        assertOrganizationResponse(ability, before)
+        return before
+      }
+      if (dto.slug) {
+        const conflict = await tx.organization.findFirst({
+          where: { slug: dto.slug, id: { not: id } },
+        })
+        if (conflict) throw new ConflictException(`Slug '${dto.slug}' is already taken`)
+      }
+      const after = await tx.organization.update({ where: { id }, data: dto })
+      assertOrganizationAction(ability, Action.Update, after, fields)
+      assertOrganizationResponse(ability, after)
+      return after
+    })
+    return this.toOrgResponse(org)
+  }
+
+  async remove(id: string, principal: RequestPrincipal, ability: AppAbility): Promise<void> {
+    this.assertOrgContext(principal, id)
+    await this.prisma.$transaction(async (tx) => {
+      const org = await lockOrganization(tx, id, principal)
+      assertOrganizationAction(ability, Action.Delete, org, ORG_READ_FIELDS)
+      await tx.organization.delete({ where: { id } })
+    })
+  }
+
+  /** Returns org data needed to generate a new JWT with this org's context */
+  async getForSwitch(orgId: string, userId: string): Promise<{ aclVersion: number }> {
+    const member = await this.prisma.orgMember.findUnique({
+      where: { userId_organizationId: { userId, organizationId: orgId } },
+      include: { organization: { select: { aclVersion: true } } },
+    })
+    if (!member) throw new ForbiddenException('You are not a member of this organization')
+    return { aclVersion: member.organization.aclVersion }
+  }
+
+  /**
+   * Increment aclVersion to bust permissions cache for this org —
+   * non-transactional variant. Retained per ADR-035 for one-off
+   * callers that don't have an enclosing `$transaction` (e.g.
+   * future admin operations). ACL mutation sites in
+   * `MemberService` / `RoleService` must use {@link bumpAclVersionTx}
+   * so the bump rolls back with the mutation.
+   *
+   * Current ACL authority is read from the primary database. The retained
+   * post-update invalidation seam is a compatibility no-op.
+   */
+  async bumpAclVersion(orgId: string): Promise<void> {
+    await this.prisma.organization.update({
+      where: { id: orgId },
+      data: { aclVersion: { increment: 1 } },
+    })
+    await this.invalidateAclVersion(orgId)
+  }
+
+  async invalidateAclVersion(orgId: string): Promise<void> {
+    await this.aclVersionService.invalidate(orgId)
+  }
+
+  /**
+   * Transactional variant of {@link bumpAclVersion} for ADR-035 / OA-12.
+   *
+   * Must be called inside the same `$transaction` as the ACL mutation
+   * whose effect this bump is meant to invalidate. If the surrounding
+   * transaction rolls back, the increment rolls back with it — the
+   * cache version and the DB ACL state can no longer drift on
+   * transient DB failures.
+   *
+   * No post-commit publication is required for freshness. Existing callers
+   * may retain the compatibility no-op invalidate call after commit.
+   */
+  async bumpAclVersionTx(orgId: string, tx: PrismaTx): Promise<void> {
+    await tx.organization.update({
+      where: { id: orgId },
+      data: { aclVersion: { increment: 1 } },
+    })
+  }
+
+  private assertOrgContext(principal: RequestPrincipal, orgId: string): void {
+    if (principal.organizationId !== orgId) {
+      throw new ForbiddenException('Organization context does not match the operation target')
+    }
+  }
+}

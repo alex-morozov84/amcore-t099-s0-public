@@ -1,0 +1,239 @@
+import { adminAuditQuerySchema } from '@amcore/shared'
+import { afterEach, describe, expect, it } from 'vitest'
+
+import { ADMIN_CONSOLE_CONFIG } from './admin-console-topology'
+import {
+  getConsoleAccountSecurityHref,
+  getConsoleAuditHref,
+  getConsoleBackgroundWorkHref,
+  getConsoleDetailAuditHref,
+  getConsoleOrganizationsHref,
+  getConsoleOverviewHref,
+  getConsolePublicPathname,
+  getConsoleQueueBoardBasePath,
+  getConsoleQueueBoardHref,
+  getConsoleScheduledJobsHref,
+  getConsoleUserDetailHref,
+  getConsoleUserSecurityHrefs,
+  getConsoleUsersHref,
+  parseConsoleReturnHref,
+} from './console-public-href'
+
+const mutableConfig = ADMIN_CONSOLE_CONFIG as unknown as {
+  mode: 'disabled' | 'path' | 'host'
+  alias: string
+}
+const originalMode = ADMIN_CONSOLE_CONFIG.mode
+const originalAlias = ADMIN_CONSOLE_CONFIG.alias
+
+afterEach(() => {
+  mutableConfig.mode = originalMode
+  mutableConfig.alias = originalAlias
+})
+
+describe('detail return addresses', () => {
+  it('opens identity activity for the full 31-day Audit interval', () => {
+    mutableConfig.mode = 'path'
+    mutableConfig.alias = 'operations'
+    const now = Date.parse('2026-09-25T12:00:00.000Z')
+    const href = getConsoleDetailAuditHref({ actorId: 'user1' }, now)
+    const url = new URL(href, 'http://console.invalid')
+    expect(url.pathname).toBe('/operations/audit')
+    expect(url.searchParams.get('actorId')).toBe('user1')
+    expect(url.searchParams.get('from')).toBe('2026-08-25T12:00:00.000Z')
+    expect(url.searchParams.get('to')).toBe('2026-09-25T12:00:00.000Z')
+    expect(parseConsoleReturnHref(`${url.pathname}${url.search}`)).toBe(
+      `${url.pathname}${url.search}`
+    )
+  })
+  it('preserves exact inventory and audit query state in path mode', () => {
+    mutableConfig.mode = 'path'
+    mutableConfig.alias = 'operations'
+    const audit = '/operations/audit?cursor=next&actorId=user1'
+    expect(parseConsoleReturnHref(audit)).toBe(audit)
+    expect(parseConsoleReturnHref('/operations/users?page=10&search=alex')).toBe(
+      '/operations/users?page=10&search=alex'
+    )
+    expect(getConsoleUserDetailHref('user1', audit)).toBe(
+      `/operations/users/user1?${new URLSearchParams({ returnTo: audit })}`
+    )
+  })
+
+  it('rejects external, encoded, malformed and wrong-route sources', () => {
+    mutableConfig.mode = 'path'
+    mutableConfig.alias = 'operations'
+    for (const value of [
+      '//evil.test/operations/users',
+      'https://evil.test/operations/users',
+      '/%2f%2fevil.test/operations/users',
+      '/operations/users/user1',
+      '/operations/users?page=1&page=2',
+      '/operations/users?unknown=1',
+      '/operations/users#fragment',
+      '/operations/users\\evil.test',
+      '/operations/users?' + 'x'.repeat(2048),
+    ]) {
+      expect(parseConsoleReturnHref(value)).toBeNull()
+    }
+  })
+
+  it('uses only host-root paths in host mode', () => {
+    mutableConfig.mode = 'host'
+    expect(parseConsoleReturnHref('/audit?cursor=next')).toBe('/audit?cursor=next')
+    expect(parseConsoleReturnHref('/operations/audit')).toBeNull()
+  })
+})
+
+describe('getConsoleOverviewHref', () => {
+  it('uses the configured alias in path mode', () => {
+    mutableConfig.mode = 'path'
+    mutableConfig.alias = 'operations'
+
+    expect(getConsoleOverviewHref()).toBe('/operations')
+  })
+
+  it('uses the host root in host mode', () => {
+    mutableConfig.mode = 'host'
+
+    expect(getConsoleOverviewHref()).toBe('/')
+  })
+})
+
+describe('getConsoleOrganizationsHref', () => {
+  it('nests under the configured alias in path mode', () => {
+    mutableConfig.mode = 'path'
+    mutableConfig.alias = 'operations'
+
+    expect(getConsoleOrganizationsHref()).toBe('/operations/organizations')
+  })
+
+  it('nests under the host root in host mode', () => {
+    mutableConfig.mode = 'host'
+
+    expect(getConsoleOrganizationsHref()).toBe('/organizations')
+  })
+})
+
+describe('getConsoleUsersHref', () => {
+  it('nests under the configured alias in path mode', () => {
+    mutableConfig.mode = 'path'
+    mutableConfig.alias = 'operations'
+
+    expect(getConsoleUsersHref()).toBe('/operations/users')
+  })
+
+  it('nests under the host root in host mode', () => {
+    mutableConfig.mode = 'host'
+
+    expect(getConsoleUsersHref()).toBe('/users')
+  })
+})
+
+describe('getConsoleAuditHref', () => {
+  it('uses the configured alias in path mode and the root in host mode', () => {
+    mutableConfig.mode = 'path'
+    mutableConfig.alias = 'operations'
+    expect(getConsoleAuditHref()).toBe('/operations/audit')
+    mutableConfig.mode = 'host'
+    expect(getConsoleAuditHref()).toBe('/audit')
+  })
+})
+
+describe('getConsoleBackgroundWorkHref', () => {
+  it('follows the topology rule in every mode', () => {
+    mutableConfig.mode = 'path'
+    mutableConfig.alias = 'operations'
+    expect(getConsoleBackgroundWorkHref()).toBe('/operations/background-work')
+    mutableConfig.mode = 'host'
+    expect(getConsoleBackgroundWorkHref()).toBe('/background-work')
+  })
+})
+
+describe('getConsoleScheduledJobsHref', () => {
+  it('follows the topology rule in every mode, next to Background work', () => {
+    mutableConfig.mode = 'path'
+    mutableConfig.alias = 'operations'
+    expect(getConsoleScheduledJobsHref()).toBe('/operations/scheduled-jobs')
+    mutableConfig.mode = 'host'
+    expect(getConsoleScheduledJobsHref()).toBe('/scheduled-jobs')
+  })
+})
+
+describe('queue board address', () => {
+  it('is the Console BFF route under the product host in path mode, whatever the alias', () => {
+    mutableConfig.mode = 'path'
+    for (const alias of ['admin', 'operations']) {
+      mutableConfig.alias = alias
+      expect(getConsoleQueueBoardBasePath()).toBe('/api/console/bull-board')
+      expect(getConsoleQueueBoardHref()).toBe('/api/console/bull-board')
+    }
+  })
+
+  it('has no console segment in host mode: the edge maps /api/* to /api/console/*', () => {
+    mutableConfig.mode = 'host'
+    expect(getConsoleQueueBoardBasePath()).toBe('/api/bull-board')
+    expect(getConsoleQueueBoardHref()).toBe('/api/bull-board')
+  })
+})
+
+describe('recorded security views', () => {
+  it.each(['path', 'host'] as const)(
+    'binds exact actions and identity to the same 31-day interval in %s mode',
+    (mode) => {
+      mutableConfig.mode = mode
+      mutableConfig.alias = 'operations'
+      const now = Date.parse('2026-10-23T12:00:00.000Z')
+      const hrefs = getConsoleUserSecurityHrefs('user1', now)
+      const parse = (href: string) => {
+        const url = new URL(href, 'http://console.invalid')
+        expect(url.pathname).toBe(mode === 'host' ? '/audit' : '/operations/audit')
+        expect(parseConsoleReturnHref(href)).toBe(href)
+        expect(url.searchParams.has('cursor')).toBe(false)
+        return adminAuditQuerySchema.parse(Object.fromEntries(url.searchParams))
+      }
+      const confirmations = parse(hrefs.confirmations)
+      const access = parse(hrefs.access)
+      expect(confirmations).toMatchObject({
+        actorType: 'USER',
+        actorId: 'user1',
+        actions: ['auth.step_up_failed', 'auth.step_up_succeeded'],
+      })
+      expect(confirmations.targetId).toBeUndefined()
+      expect(access).toMatchObject({
+        targetType: 'USER',
+        targetId: 'user1',
+        actions: [
+          'admin.user.system_role_changed',
+          'admin.user.session_revoked',
+          'admin.user.sessions_revoked',
+        ],
+      })
+      expect(access.actorId).toBeUndefined()
+      expect(access.from).toBe(confirmations.from)
+      expect(access.to).toBe(confirmations.to)
+      expect(Date.parse(access.to!) - Date.parse(access.from!)).toBe(31 * 86400000)
+    }
+  )
+})
+
+it('keeps account security inside the selected Console topology', () => {
+  mutableConfig.mode = 'path'
+  mutableConfig.alias = 'operations'
+  expect(getConsoleAccountSecurityHref()).toBe('/operations/profile')
+  mutableConfig.mode = 'host'
+  expect(getConsoleAccountSecurityHref()).toBe('/profile')
+})
+
+it('normalizes only the selected physical host prefix for display', () => {
+  mutableConfig.mode = 'host'
+  mutableConfig.alias = 'control'
+  for (const [source, expected] of [
+    ['/control', '/'],
+    ['/control/account/security', '/account/security'],
+    ['/account/security', '/account/security'],
+    ['/controller', '/controller'],
+  ])
+    expect(getConsolePublicPathname(source)).toBe(expected)
+  mutableConfig.mode = 'path'
+  expect(getConsolePublicPathname('/control/account/security')).toBe('/control/account/security')
+})

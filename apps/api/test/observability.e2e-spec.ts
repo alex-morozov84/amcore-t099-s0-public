@@ -1,0 +1,126 @@
+import type { INestApplication } from '@nestjs/common'
+import request from 'supertest'
+
+import {
+  cleanDatabase,
+  cleanOrgData,
+  type E2ETestContext,
+  seedSystemRoles,
+  setupE2ETest,
+  teardownE2ETest,
+} from './helpers'
+
+describe('Observability metrics (e2e)', () => {
+  let context: E2ETestContext
+  let app: INestApplication
+
+  beforeAll(async () => {
+    context = await setupE2ETest()
+    app = context.app
+    await seedSystemRoles(context.prisma)
+  }, 120000)
+
+  afterAll(async () => {
+    if (context) await teardownE2ETest(context)
+  }, 120000)
+
+  beforeEach(async () => {
+    await cleanOrgData(context.prisma)
+    await cleanDatabase(context.prisma, context.cache, context.throttlerStorage)
+  })
+
+  it('exports metrics and records HTTP RED for 401, 404, and 429 without raw IDs', async () => {
+    const registered = await request(app.getHttpServer())
+      .post('/auth/register')
+      .send({ email: 'metrics@example.com', password: 'StrongP@ss123' })
+      .expect(201)
+    const accessToken = registered.body.accessToken as string
+
+    // The personal check reads the primary database and records no cache metric. An
+    // organization-scoped token reads the permissions cache: the first read falls back to
+    // the database and fills it, the next is a hit. Registration also queues the bounded
+    // welcome template.
+    await request(app.getHttpServer())
+      .get('/auth/me')
+      .set('Authorization', `Bearer ${accessToken}`)
+      .expect(200)
+    const organization = await request(app.getHttpServer())
+      .post('/organizations')
+      .set('Authorization', `Bearer ${accessToken}`)
+      .send({ name: 'Metrics org' })
+      .expect(201)
+    const scoped = await request(app.getHttpServer())
+      .post(`/organizations/${organization.body.id}/switch`)
+      .set('Authorization', `Bearer ${accessToken}`)
+      .expect(200)
+    for (let read = 0; read < 2; read++)
+      await request(app.getHttpServer())
+        .get(`/organizations/${organization.body.id}`)
+        .set('Authorization', `Bearer ${scoped.body.accessToken}`)
+        .expect(200)
+
+    await request(app.getHttpServer()).get('/auth/me').expect(401)
+
+    await request(app.getHttpServer()).get('/organizations/raw-org-id').expect(401)
+
+    await request(app.getHttpServer()).get('/not-found/raw-resource-id').expect(404)
+
+    // DEFAULT policy's burst (ADR-073) admits 50 requests instantly from
+    // idle — well past this loop's old fixed-window-era count of 15, which
+    // never tripped the new GCRA backstop at all. 55 exceeds burst=50.
+    let sawTooManyRequests = false
+    for (let i = 0; i < 55; i++) {
+      const response = await request(app.getHttpServer()).get('/auth/oauth/providers')
+      if (response.status === 429) {
+        sawTooManyRequests = true
+        break
+      }
+    }
+    expect(sawTooManyRequests).toBe(true)
+
+    const metrics = await request(app.getHttpServer()).get('/metrics').expect(200)
+    expect(metrics.headers['content-type']).toContain('text/plain')
+    expect(metrics.text).toContain('# HELP amcore_http_requests_total')
+    expect(metrics.text).toContain('# HELP amcore_db_pool_connections')
+    expect(metrics.text).toContain('amcore_db_pool_connections{state="total"')
+    expect(metrics.text).toContain('amcore_db_pool_connections{state="idle"')
+    expect(metrics.text).toContain('amcore_db_pool_connections{state="waiting"')
+    expect(metrics.text).toContain('amcore_queue_jobs{queue="default",state="waiting"')
+    expect(metrics.text).toContain('amcore_queue_jobs{queue="email",state="waiting"')
+    expect(metrics.text).toContain('# HELP amcore_cache_operations_total')
+    expect(metrics.text).toContain('cache="permissions",result="db_fallback"')
+    expect(metrics.text).toContain('cache="permissions",result="hit"')
+    expect(metrics.text).not.toContain('cache="user"')
+    expect(metrics.text).toContain('# HELP amcore_storage_operations_total')
+    expect(metrics.text).toContain('# HELP amcore_media_operations_total')
+    expect(metrics.text).toContain('# HELP amcore_email_operations_total')
+    expect(metrics.text).toContain(
+      'template="welcome",operation="dispatch",mode="queued",result="success"'
+    )
+    expect(metrics.text).toContain('status_code="401"')
+    expect(metrics.text).toContain('status_code="404"')
+    expect(metrics.text).toContain('status_code="429"')
+    expect(metrics.text).toContain('route="unknown"')
+    expect(metrics.text).not.toContain('raw-org-id')
+    expect(metrics.text).not.toContain('raw-resource-id')
+
+    // Positive proof that parameterized + guard-rejected routes get a meaningful
+    // normalized template (not everything collapsing to `unknown`): the request
+    // to `/organizations/raw-org-id` must be recorded as `:id` with status 401,
+    // and the throttled route must be recorded with status 429.
+    const counterLines = metrics.text
+      .split('\n')
+      .filter((line) => line.startsWith('amcore_http_requests_total'))
+    expect(
+      counterLines.find(
+        (line) => line.includes('route="/organizations/:id"') && line.includes('status_code="401"')
+      )
+    ).toBeDefined()
+    expect(
+      counterLines.find(
+        (line) =>
+          line.includes('route="/auth/oauth/providers"') && line.includes('status_code="429"')
+      )
+    ).toBeDefined()
+  })
+})

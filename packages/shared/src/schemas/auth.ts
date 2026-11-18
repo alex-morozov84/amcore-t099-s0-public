@@ -1,0 +1,318 @@
+import { z } from 'zod'
+
+import {
+  type CatalogueLocale,
+  classifyStoredLocale,
+  DEFAULT_LOCALE,
+  SERVED_LOCALES,
+} from '../constants'
+
+import { productAdminReturnSchema } from './frontend-context'
+import { invitationOAuthCorrelationSchema } from './invitation-common'
+import { paginatedResponseSchema } from './pagination'
+
+export const emailInputSchema = z.string().trim().pipe(z.email())
+
+/**
+ * Supported locale — derived from the single `SERVED_LOCALES` source so
+ * registration, profile update, the user response, and email rendering all
+ * validate against the same set. No hardcoded messages: a schema-level message
+ * outranks the frontend's per-parse error map and would force English into a
+ * localized UI.
+ */
+export const supportedLocaleSchema = z.enum(SERVED_LOCALES)
+
+/**
+ * Parse a stored locale string (e.g. the Prisma `User.locale` column) into the
+ * locales this build serves. This is the boundary where a persisted value becomes
+ * the typed public contract. A value that is not a catalogue locale at all throws, so
+ * invalid stored data surfaces instead of being silently blessed. A catalogue locale
+ * that this build does not serve (expected after a settings change) maps to
+ * {@link DEFAULT_LOCALE}: the user's stored preference stays in the database and
+ * comes back if the locale is enabled again. Input schemas (`supportedLocaleSchema`)
+ * stay strict: a new choice must be a served locale.
+ */
+export function parseSupportedLocale(value: string): CatalogueLocale {
+  const state = classifyStoredLocale(value)
+  if (state === 'enabled') return supportedLocaleSchema.parse(value)
+  if (state === 'disabled') return DEFAULT_LOCALE
+  throw new Error('Stored locale is not a known catalogue locale')
+}
+
+/**
+ * Non-throwing counterpart of {@link parseSupportedLocale}: coerce an unknown,
+ * absent, or not-served locale to {@link DEFAULT_LOCALE}.
+ *
+ * Use this on best-effort paths where a locale anomaly must not abort the work
+ * — notification/email dispatch, or a recipient who has no account and
+ * therefore no stored preference. Prefer `parseSupportedLocale` anywhere a bad
+ * stored value should surface as an error instead of being silently defaulted.
+ */
+export function coerceSupportedLocale(value: string | null | undefined): CatalogueLocale {
+  const parsed = supportedLocaleSchema.safeParse(value)
+  return parsed.success ? parsed.data : DEFAULT_LOCALE
+}
+
+/**
+ * IANA time-zone identifier (e.g. `Europe/Moscow`, `UTC`). Validated structurally
+ * via `Intl.DateTimeFormat`, which throws `RangeError` for an unknown zone — this
+ * keeps the check language-agnostic and avoids shipping a static zone list that
+ * drifts from the runtime's tz database. Available in both Node and the browser.
+ *
+ * Numeric UTC offsets (`+01:00`, `-0500`, `+23`) are rejected even though `Intl`
+ * accepts them: the contract is a named IANA zone for a durable preference, not a
+ * fixed offset that ignores DST. Offset identifiers always begin with `+`/`-`,
+ * while every named zone/alias begins with a letter (`Etc/GMT+5` included).
+ */
+export const timezoneSchema = z.string().refine((tz) => {
+  if (/^[+-]/.test(tz)) return false
+  try {
+    Intl.DateTimeFormat(undefined, { timeZone: tz })
+    return true
+  } catch {
+    return false
+  }
+})
+
+// ===========================================
+// Request Schemas
+// ===========================================
+
+/** Registration request */
+export const registerSchema = z.object({
+  email: emailInputSchema,
+  password: z.string().min(8).regex(/[A-Z]/).regex(/[0-9]/),
+  // Optional means the field may be omitted — an empty string is not the
+  // same thing and would otherwise fail this same field's own `min(2)`,
+  // which is exactly the state a form's default `name: ''` starts in.
+  // Built from a literal/union rather than `z.preprocess()`: preprocess's
+  // input type collapses to `unknown`, which breaks `useLocalizedForm`'s
+  // `$ZodType<unknown, TFieldValues>` constraint (react-hook-form needs a
+  // concrete `string | undefined` input type for this field, not `unknown`).
+  name: z
+    .literal('')
+    .transform(() => undefined)
+    .or(z.string().min(2))
+    .optional(),
+  // Optional explicit locale; when omitted the API falls back to
+  // `Accept-Language` negotiation, then the DB default (see AuthService.register).
+  locale: supportedLocaleSchema.optional(),
+})
+
+export type RegisterInput = z.infer<typeof registerSchema>
+
+/** Login request */
+export const loginSchema = z.object({
+  email: emailInputSchema,
+  password: z.string().min(1),
+})
+
+export type LoginInput = z.infer<typeof loginSchema>
+
+/** Profile update request */
+export const updateProfileSchema = z.object({
+  name: z.string().min(2).optional(),
+  locale: supportedLocaleSchema.optional(),
+  timezone: timezoneSchema.optional(),
+})
+
+export type UpdateProfileInput = z.infer<typeof updateProfileSchema>
+
+/** Change password request */
+export const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1),
+  newPassword: z.string().min(8).regex(/[A-Z]/).regex(/[0-9]/),
+})
+
+export type ChangePasswordInput = z.infer<typeof changePasswordSchema>
+
+/** Forgot password request */
+export const forgotPasswordSchema = z.object({
+  email: emailInputSchema,
+})
+
+export type ForgotPasswordInput = z.infer<typeof forgotPasswordSchema>
+
+/** Reset password request */
+export const resetPasswordSchema = z.object({
+  token: z.string().length(64), // 64-char crypto token
+  password: z.string().min(8).regex(/[A-Z]/).regex(/[0-9]/),
+})
+
+export type ResetPasswordInput = z.infer<typeof resetPasswordSchema>
+
+/** Verify email request */
+export const verifyEmailSchema = z.object({
+  token: z.string().length(64), // 64-char crypto token
+})
+
+export type VerifyEmailInput = z.infer<typeof verifyEmailSchema>
+
+/** Resend verification email request */
+export const resendVerificationSchema = z.object({
+  email: emailInputSchema,
+})
+
+export type ResendVerificationInput = z.infer<typeof resendVerificationSchema>
+
+/** OAuth login ticket exchange request */
+export const oauthExchangeRequestSchema = z.object({
+  ticket: z.string().min(1),
+})
+
+export type OAuthExchangeRequest = z.infer<typeof oauthExchangeRequestSchema>
+
+/**
+ * Step-up re-authentication request (OB-06b / ADR-037).
+ *
+ * Just the current password — verified against the authenticated user to
+ * refresh the current session's recent-auth window. `min(1)` only: this
+ * verifies an existing credential, it does not set one, so the registration
+ * complexity rules do not apply.
+ */
+export const stepUpSchema = z.object({
+  password: z.string().min(1),
+})
+
+export type StepUpInput = z.infer<typeof stepUpSchema>
+
+// ===========================================
+// Response Schemas
+// ===========================================
+
+/** User response (safe, without password) */
+export const userResponseSchema = z.object({
+  id: z.string(),
+  email: z.email(),
+  emailVerified: z.boolean(),
+  name: z.string().nullable(),
+  avatarUrl: z
+    .string()
+    .nullable()
+    .describe(
+      'Public URL of the avatar, computed from the stored avatar key. It changes when the public storage base changes, so do not persist it.'
+    ),
+  phone: z.string().nullable(),
+  // Reuses the single supported-locale source so the public response contract
+  // matches what registration/profile accept (the mapper boundary parses the
+  // stored Prisma string into this set — see AuthService.mapUserToResponse).
+  locale: supportedLocaleSchema,
+  timezone: z.string(),
+  createdAt: z.iso.datetime(),
+  lastLoginAt: z.iso.datetime().nullable(),
+})
+
+export type UserResponse = z.infer<typeof userResponseSchema>
+
+/** Auth response (login/register) */
+export const authResponseSchema = z.object({
+  user: userResponseSchema,
+  accessToken: z.string(),
+})
+
+export type AuthResponse = z.infer<typeof authResponseSchema>
+
+/**
+ * Approximate IP-derived location. Nullable in every context: no
+ * GeoIP database configured/loaded, a private/reserved/unresolvable
+ * address, or no match in the database. `city` is resolved server-side in
+ * the requester's negotiated locale (city names only exist inside the
+ * GeoIP database's own multilingual data); `countryCode` is a narrow ISO
+ * 3166-1 alpha-2 code the client localizes itself.
+ */
+export const sessionLocationSchema = z.object({
+  city: z.string().nullable(),
+  countryCode: z.string().length(2).nullable(),
+})
+
+export type SessionLocation = z.infer<typeof sessionLocationSchema>
+
+/** Session info */
+export const sessionSchema = z.object({
+  id: z.string(),
+  userAgent: z.string().nullable(),
+  ipAddress: z.string().nullable(),
+  location: sessionLocationSchema.nullable(),
+  createdAt: z.iso.datetime(),
+  current: z.boolean(),
+})
+
+export type Session = z.infer<typeof sessionSchema>
+
+/**
+ * Sessions list response — paginated envelope (ADR-036 / OB-05).
+ *
+ * Previously `{ sessions: Session[] }`. Now `{ data, total, page, limit }`
+ * to match the canonical envelope shared by every other list endpoint.
+ * `apps/web/src/shared/api/auth-api.ts` and downstream UI consumers
+ * switch to `body.data[i]` in the same stage.
+ */
+export const sessionsListResponseSchema = paginatedResponseSchema(sessionSchema)
+
+export type SessionsListResponse = z.infer<typeof sessionsListResponseSchema>
+
+/** Token refresh response */
+export const refreshResponseSchema = z.object({
+  accessToken: z.string(),
+})
+
+export type RefreshResponse = z.infer<typeof refreshResponseSchema>
+
+/** Password verification can leave a second proof pending; this response contains no credentials. */
+export const stepUpPendingSchema = z.strictObject({
+  kind: z.literal('proof_required'),
+  requiredProofs: z
+    .array(z.enum(['password', 'second_factor']))
+    .min(1)
+    .max(2)
+    .refine((proofs) => new Set(proofs).size === proofs.length),
+})
+export const stepUpResponseSchema = z.union([refreshResponseSchema.strict(), stepUpPendingSchema])
+export type StepUpResponse = z.infer<typeof stepUpResponseSchema>
+
+/** OAuth login ticket exchange response */
+export const oauthExchangeResponseSchema = z.strictObject({
+  returnTo: productAdminReturnSchema.optional(),
+  accessToken: z.string(),
+  invitation: invitationOAuthCorrelationSchema.optional(),
+})
+
+export type OAuthExchangeResponse = z.infer<typeof oauthExchangeResponseSchema>
+
+/** Success message response */
+export const messageResponseSchema = z.object({
+  message: z.string(),
+})
+
+export type MessageResponse = z.infer<typeof messageResponseSchema>
+
+/**
+ * Profile response (`GET /auth/me`, `PATCH /auth/me`).
+ *
+ * `user` is nullable: the lookup behind `/auth/me` resolves the principal by
+ * id and can legitimately return null (e.g. the user was deleted while a token
+ * is still live). Distinct from `authResponseSchema`, whose `user` is always
+ * present because it is built from the just-created/authenticated record.
+ */
+export const profileResponseSchema = z.object({
+  user: userResponseSchema.nullable(),
+})
+
+export type ProfileResponse = z.infer<typeof profileResponseSchema>
+
+/** Avatar upload response — the public URL of the stored avatar. */
+export const avatarResponseSchema = z.object({
+  avatarUrl: z.string(),
+})
+
+export type AvatarResponse = z.infer<typeof avatarResponseSchema>
+
+/** OAuth providers list response (`GET /auth/oauth/providers`). */
+export const oauthProvidersResponseSchema = z.object({
+  providers: z.array(z.string()),
+})
+
+export type OAuthProvidersResponse = z.infer<typeof oauthProvidersResponseSchema>
+
+export const signupPolicyResponseSchema = z.strictObject({ publicSignupEnabled: z.boolean() })
+export type SignupPolicyResponse = z.infer<typeof signupPolicyResponseSchema>

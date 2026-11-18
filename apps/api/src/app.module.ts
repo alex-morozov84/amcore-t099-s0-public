@@ -1,0 +1,14 @@
+import { Module } from '@nestjs/common'
+
+import { appProviders, coreImports, webImports, workerImports } from './app-imports.js'
+
+/**
+ * Root module for `PROCESS_ROLE=all` (dev / single-node): HTTP API + BullMQ
+ * worker + cron in one process — today's behaviour. `web` and `worker` use
+ * `WebModule` / `WorkerModule` (ADR-041). Tests import this directly (= `all`).
+ */
+@Module({
+  imports: [...coreImports('all'), ...webImports, ...workerImports()],
+  providers: appProviders,
+})
+export class AppModule {}

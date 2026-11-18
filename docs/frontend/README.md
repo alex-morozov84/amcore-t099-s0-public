@@ -1,0 +1,84 @@
+# Frontend
+
+`apps/web` is AMCore's Next.js frontend/admin starter. It has the same
+production-starter shape expected from the backend: documented contracts,
+enforceable conventions, and a test surface a cold agent can extend without
+guessing.
+
+## What's included
+
+| Topic                                                                    | What it covers                                                                                                                                                                                                                                                                                                                         |
+| ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Architecture & conventions](./architecture-and-conventions.md)          | FSD layer boundaries, route thinness, Server/Client Component defaults, state model, and how the frontend consumes the backend                                                                                                                                                                                                         |
+| [Search](./search/README.md)                                             | Choose local or URL-backed search; shared API, typed adapter, navigation races, no-JavaScript fallback, and verification                                                                                                                                                                                                               |
+| [Brand, theme, and design tokens](./brand-theme-and-tokens.md)           | Token architecture, light/dark/system modes, the no-flash mechanism, brand assets, and the downstream rebrand checklist                                                                                                                                                                                                                |
+| [i18n and error localization](./i18n-and-errors.md)                      | Choose served languages and the default, rebuild and roll out settings, add strings/locales/error codes, plurals and form validation                                                                                                                                                                                                   |
+| [Boundaries & guardrails](./fsd-boundaries-and-guardrails.md)            | Which layer, import, server/client and styling rules are enforced, by which tool, what is deliberately not covered, and how to add a guard                                                                                                                                                                                             |
+| [Shared UI and shadcn](./shared-ui-and-shadcn.md)                        | Reusing `shared/ui`, safely adding shadcn primitives, and adapting generated output to AMCore's lint/i18n/token contract                                                                                                                                                                                                               |
+| [API consumption](./api-consumption.md)                                  | The hooks that consume media/notifications/AI through the BFF, the `EventSource`-based realtime pattern shared by notifications and AI, the frontend `429`/`Retry-After` retry policy, the opt-in client-IP relay that lets `apps/api`'s rate limiter tell BFF visitors apart, and the direct Server-Component-to-`apps/api` transport |
+| [Server-rendered graceful degradation](./server-rendered-resilience.md)  | Primary vs. secondary sections, the `DataOutcome`/`degradeSecondary()`/`resolvePrimary()` primitives, `SectionErrorBoundary` for genuinely unexpected exceptions, and why nothing is thrown for a known failure                                                                                                                        |
+| [Browser security headers and CSP](./browser-security-and-csp.md)        | The static header baseline, nonce-based CSP, enforcement mode, HSTS, adding a third-party origin, downstream route-scoping, and the CSP violation-reporting endpoint                                                                                                                                                                   |
+| [Search-engine indexing](./seo.md)                                       | Closed by default: the two run-time variables, making a page public, the sitemap list, verification commands, traps and recovery from an index leak                                                                                                                                                                                    |
+| [Testing](./testing.md)                                                  | The frontend test taxonomy, production A/B deployment recovery, Playwright mocked/server-mocked/real-stack lanes, accessibility scanning, and the tool-neutral dev loop                                                                                                                                                                |
+| [Temporary Next route-cache patch](./next-route-cache-patch.md)          | Exact-version dependency patch, Docker installation inputs and removal after an official fix                                                                                                                                                                                                                                           |
+| [Storybook](./storybook.md)                                              | The component workshop: what's wired (a11y/theme/MSW/i18n decorators), story conventions, the CLI-safety/`optimizeDeps.include` rules, and running a fork without Storybook                                                                                                                                                            |
+| [Route bundle budgets](./bundle-budget.md)                               | The CI check limiting each page's first-load JavaScript: what it measures, how to investigate a failure, how to change a limit                                                                                                                                                                                                         |
+| [Top route progress bar](./route-progress.md)                            | The global navigation-progress indicator: what starts/finishes it, the `RouteProgressLink`/`useRouteProgressRouter()` adapters, reduced motion, and the `ROUTE_PROGRESS_ENABLED` dev/agent flag                                                                                                                                        |
+| [Operations Console](../operations-console/README.md)                    | The isolated `SUPER_ADMIN` control plane: Overview, Users and Organizations details, Users role and session management, approximate IP location, Audit browsing, FSD ownership, topology, session boundary, deployment, verification, and extension rules                                                                              |
+| [Product administration foundation](../product-admin/README.md)          | Organization selector and overview, member role assignment and confirmed removal, [member-key management](../product-admin/member-api-keys.md), account menu with profile and avatar, one-placement integration and custom headless UI; product-domain screens remain downstream-owned                                                 |
+| [Organization foundation UI](./organization-context.md)                  | Selected organization overview, ordered identity/authority lifecycle and custom mounts                                                                                                                                                                                                                                                 |
+| [Capability catalogue and access hints](../auth/capability-catalogue.md) | Authorable actions, current-employee status and actual-record decisions for future role editors and domain UI                                                                                                                                                                                                                          |
+
+This index is the public entry point for the current frontend starter surface;
+see `architecture-and-conventions.md`'s "See also" section for related guides.
+
+## Start here
+
+- Auditing loaded pages and opening Lighthouse reports → [Automatic audits](./testing.md#lighthouse-audits)
+
+- Connecting administration to a product → [Adoption recipes and custom styling](../product-admin/adoption.md)
+
+- Designing or reviewing a user journey → [Short UI/UX checklist](./ux-checklist.md)
+
+[Organization creation and initial setup](../product-admin/organization-establishment.md) — ready and headless journeys, recovery and fixed shops.
+
+- Choosing button/tab semantics, list pagination, empty states or detail reveal →
+  [Interaction patterns](./architecture-and-conventions.md#interaction-patterns-buttons-tabs-and-lists)
+
+- Choosing server display, interactive Query or required domain rules →
+  [Interactive data ownership](./api-consumption.md#data-ownership-for-interactive-pages)
+- Selecting organization authority or adding another tenant namespace →
+  [Explicit organization context](../auth/organization-context.md)
+- Extending or adding a route/page → [Architecture & conventions](./architecture-and-conventions.md#the-recipe--adding-a-route)
+- Adding local or URL-backed search →
+  [Frontend search](./search/README.md)
+- Adding copy, a locale, or an error message → [i18n and error localization](./i18n-and-errors.md)
+- Reusing or adding a shared UI primitive → [Shared UI and shadcn](./shared-ui-and-shadcn.md)
+- Writing or reviewing a `shared/ui`/feature-flow story → [Storybook](./storybook.md)
+- Wondering whether an import or a colour is allowed → [Boundaries & guardrails](./fsd-boundaries-and-guardrails.md)
+- Deciding between `'use client'`, `client-only` and `server-only` →
+  [Boundaries & guardrails § Server/client boundaries](./fsd-boundaries-and-guardrails.md#serverclient-boundaries)
+- Backend endpoint shapes (paths, request/response bodies, status codes) →
+  the Swagger/OpenAPI document at `/docs` in development, not this guide —
+  see [Architecture & conventions § Relationship to backend/OpenAPI docs](./architecture-and-conventions.md#relationship-to-backendopenapi-docs)
+- Rebranding a downstream fork (logo, PWA icons, tokens, theme mode) →
+  [Brand, theme, and design tokens § Downstream rebrand checklist](./brand-theme-and-tokens.md#downstream-rebrand-checklist)
+- Initializing a downstream fork (`pnpm init:brand`: identity, assets, theme) →
+  [Brand, theme, and design tokens § Fork initialization](./brand-theme-and-tokens.md#fork-initialization)
+- Adding a third-party script/style origin, or running CSP in report-only →
+  [Browser security headers and CSP](./browser-security-and-csp.md)
+- Adding a page that search engines should index, or keeping the product closed →
+  [Search-engine indexing](./seo.md)
+- Adding a navigating `<Link>` or a programmatic `router.push()`/`replace()` →
+  [Top route progress bar § The two building blocks](./route-progress.md#the-two-building-blocks-use-these-not-raw-next-apis)
+- Using, configuring, or extending the Operations Console →
+  [Operations Console](../operations-console/README.md)
+
+[My API keys](../product-admin/own-api-keys.md) — create a personal integration key, save its secret once, and inspect or revoke your keys across organizations.
+
+[Place product administration and isolate host sessions](../product-admin/placement-and-sessions.md) — configurable path alias, canonical addresses, login/logout boundaries and deployment.
+
+For new server requests, start with the [enforced request boundary](api-consumption.md#server-request-boundary).
+
+For account-security UI, use the [user journey](../auth/mfa-browser.md).
+Developers can reuse the [browser adapter contract](../auth/mfa-foundation.md#browser-adapter-contract).

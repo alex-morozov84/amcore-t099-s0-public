@@ -1,0 +1,52 @@
+import { Injectable } from '@nestjs/common'
+
+import { type RequestPrincipal, type SystemRole as Role, SystemRole } from '@amcore/shared'
+
+import { UnauthorizedException } from '../../common/exceptions/index.js'
+
+import type { MfaAdmissionEvidence } from './mfa/mfa-admission-evidence.js'
+import { PrivilegedRoleService } from './privileged-role.service.js'
+
+/** Request-local evidence; original credential facts never become effective grants. */
+export interface PrivilegedAdmission {
+  readonly authenticated: Readonly<RequestPrincipal>
+  readonly principal: RequestPrincipal
+  readonly currentRole?: Role
+}
+
+@Injectable()
+export class PrivilegedAdmissionService {
+  constructor(private readonly roles: PrivilegedRoleService) {}
+
+  async resolve(
+    principal: RequestPrincipal,
+    requiredRoles: Role[] = [],
+    evidence?: MfaAdmissionEvidence
+  ): Promise<PrivilegedAdmission> {
+    const authenticated = Object.freeze({
+      ...principal,
+      ...(principal.scopes && {
+        scopes: Object.freeze([...principal.scopes]) as unknown as string[],
+      }),
+    })
+    // API keys always operate as USER; primary owner-role evidence cannot become a platform grant.
+    const needsCurrentRole =
+      principal.systemRole === SystemRole.SuperAdmin || requiredRoles.includes(principal.systemRole)
+    const currentRole =
+      principal.type === 'api_key'
+        ? SystemRole.User
+        : needsCurrentRole
+          ? evidence?.principal === principal
+            ? evidence.currentRole
+            : await this.roles.getCurrentSystemRole(principal.sub)
+          : undefined
+    if (currentRole === null) throw new UnauthorizedException('User not found')
+    const systemRole =
+      principal.type === 'api_key'
+        ? SystemRole.User
+        : principal.systemRole === SystemRole.SuperAdmin && currentRole !== SystemRole.SuperAdmin
+          ? SystemRole.User
+          : principal.systemRole
+    return Object.freeze({ authenticated, principal: { ...principal, systemRole }, currentRole })
+  }
+}

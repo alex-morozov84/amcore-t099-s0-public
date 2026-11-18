@@ -1,0 +1,68 @@
+name: Dependency freshness
+
+# Surfaces the update signals Dependabot does NOT raise (ignored semver-majors,
+# Docker base-image digest drift, curl-pinned CLI releases) and Dependabot's own
+# health (a root update job cut off by the fixed 55 minute limit opens no PR) into
+# a single tracking issue, edited in place each run. Complements dependabot.yml;
+# does not open PRs.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    name: Report
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read # lists the Dependabot update runs for the health section
+      security-events: read # code scanning; inaccessible APIs remain explicit
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate freshness report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPENDABOT_READ_TOKEN: ${{ secrets.DEPENDABOT_READ_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: node scripts/dependency-freshness.mjs > "$RUNNER_TEMP/report.md"
+
+      - name: Upsert tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPORT: ${{ runner.temp }}/report.md
+        run: |
+          set -euo pipefail
+          label='dependency-freshness'
+          title='Dependency freshness report'
+          gh label create "$label" --color BFD4F2 \
+            --description 'Automated dependency freshness report' 2>/dev/null || true
+          number="$(gh issue list --state open --label "$label" --json number --jq '.[0].number // empty')"
+          if [ -n "$number" ]; then
+            gh issue edit "$number" --body-file "$REPORT"
+            echo "updated issue #$number"
+          else
+            gh issue create --title "$title" --label "$label" --body-file "$REPORT"
+          fi

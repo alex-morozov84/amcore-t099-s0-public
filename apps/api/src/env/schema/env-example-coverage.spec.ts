@@ -1,0 +1,182 @@
+import { existsSync, readFileSync } from 'node:fs'
+import path from 'node:path'
+
+import { parse } from 'dotenv'
+import type { z } from 'zod'
+
+import { envBaseSchema, validate } from '../../env'
+
+// Machine-enforced fork-fidelity: the root `.env.example` must document every env
+// var the schema accepts, and must not document keys the schema doesn't know. This
+// is the guard that stops `.env.example` drifting from `env/schema/*` — the exact
+// place forks silently misconfigure. Both active (`KEY=`) and commented (`# KEY=`)
+// examples count as documented (optional/advanced knobs are shown commented).
+
+function findEnvExample(): string {
+  let dir = __dirname
+  for (let i = 0; i < 8; i += 1) {
+    const candidate = path.join(dir, '.env.example')
+    if (existsSync(candidate)) return candidate
+    dir = path.dirname(dir)
+  }
+  throw new Error(`.env.example not found walking up from ${__dirname}`)
+}
+
+const shape = envBaseSchema.shape as Record<string, z.ZodType>
+const SCHEMA_KEYS = Object.keys(shape)
+
+// Synthetic aggregate, populated by the composed preprocess from dynamic
+// `WEBHOOK_<PROVIDER>_SECRET` keys — never set directly, so intentionally undocumented.
+const SCHEMA_DENYLIST = new Set(['WEBHOOK_SECRETS'])
+
+// Documented in `.env.example` but NOT part of the app's validated runtime env:
+// compose/migration plumbing consumed by docker-compose, not by `validate()`.
+const COMPOSE_ONLY_ALLOW = new Set([
+  'COMPOSE_PROFILES',
+  'COMPOSE_DATABASE_URL',
+  'COMPOSE_REDIS_URL',
+  'MIGRATION_DATABASE_URL',
+  // Optional bundled Caddy `edge` profile — consumed by the `caddy` compose
+  // service's own environment, not the app's env schema.
+  'CADDY_DOMAIN',
+  'CADDY_EMAIL',
+  'CADDY_WEB_DOMAIN',
+  'ADMIN_CONSOLE_HOSTNAME',
+  'ADMIN_CONSOLE_ORIGIN',
+  // apps/web-only: addresses of the external tools the Console Overview links to; read by the web
+  // server at request time, validated at its start-up.
+  'ADMIN_CONSOLE_METRICS_URL',
+  'ADMIN_CONSOLE_LOGS_URL',
+  'ADMIN_CONSOLE_ALERTS_URL',
+  // apps/web-only: the Grafana that "Find in logs" links open; same rules as the addresses above.
+  'ADMIN_CONSOLE_LOGS_GRAFANA_URL',
+  // apps/web-only: the dashboard used for metrics around an observation.
+  'ADMIN_CONSOLE_METRICS_GRAFANA_URL',
+  // Optional bundled `backup`/`restore` profiles — consumed by the `backup`
+  // compose service's own environment, not the app's env schema.
+  'BACKUP_INTERVAL_SECONDS',
+  'BACKUP_DATABASE_URL',
+  'BACKUP_RETENTION_DAYS',
+  // apps/web-only (ADR-068): the browser<->Next CSRF trusted-origin
+  // allowlist, read directly via `process.env` in apps/web (no EnvService
+  // there yet) — not part of apps/api's own runtime env at all.
+  'WEB_TRUSTED_ORIGINS',
+  // Web invitation proof-cookie startup policy; validated by apps/web, not the API.
+  'WEB_INVITATION_LOCAL_HTTP_ORIGIN',
+  // apps/web-only: the origin public files (avatars) load from, added to the browser CSP img-src.
+  'WEB_PUBLIC_FILES_ORIGIN',
+  // apps/web-only: search-engine indexing switch and the public site origin (docs/frontend/seo.md),
+  // read directly via `process.env` in apps/web at request time.
+  'WEB_SEO_INDEXING',
+  'WEB_SITE_ORIGIN',
+  // apps/web-only (ADR-072): which inbound header apps/web trusts as the
+  // real visitor IP before relaying it to apps/api — same reasoning as
+  // WEB_TRUSTED_ORIGINS above.
+  'WEB_TRUSTED_CLIENT_IP_HEADER',
+  // docker-compose.yml only (ADR-072): which host interface api's published
+  // port binds to — consumed by compose's own `ports:` mapping, not the
+  // app's env schema at all.
+  'API_PUBLISH_HOST',
+  // docker-compose.yml only: the host interface for apps/web's published
+  // development port, consumed by Compose rather than either app schema.
+  'WEB_PUBLISH_HOST',
+  // docker-compose.yml only: host interfaces for the bundled Postgres and Redis ports.
+  'POSTGRES_PUBLISH_HOST',
+  'REDIS_PUBLISH_HOST',
+  // Web build identity, passed through Compose build args; not API runtime env.
+  'NEXT_DEPLOYMENT_ID',
+  // Compose build args for the image build stage only (api/worker/seed/web Dockerfiles).
+  'BUILD_NODE_OPTIONS',
+  'BUILD_SOURCE_COMMIT',
+  // Production single-host overlays: docker/compose/bff-relay.yml (fixed subnet and web
+  // address) and docker/compose/postgres-tls.yml (certificate directories).
+  'COMPOSE_NETWORK_SUBNET',
+  'COMPOSE_WEB_IPV4',
+  'POSTGRES_TLS_SERVER_DIR',
+  'POSTGRES_TLS_CA_DIR',
+  // apps/web-only (Track 3, ai/models-talk.md FINAL PLAN §3): the browser
+  // Content-Security-Policy mode (report-only/enforce), read directly via
+  // `process.env` in apps/web (no EnvService there) — same reasoning as
+  // WEB_TRUSTED_ORIGINS above.
+  'WEB_CSP_MODE',
+  // docker/compose/prod.yml only (production deploy profile track): which
+  // promoted image digest each service pulls, and the bounded/rotating log
+  // driver options — consumed by the production overlay's own
+  // interpolation, not the app's env schema at all.
+  'COMPOSE_API_IMAGE',
+  'COMPOSE_API_MIGRATOR_IMAGE',
+  'COMPOSE_WEB_IMAGE',
+  'COMPOSE_LOG_DRIVER',
+  'COMPOSE_LOG_MAX_SIZE',
+  'COMPOSE_LOG_MAX_FILE',
+  // Optional bundled `monitoring` profile — consumed by the `grafana`
+  // compose service's own environment, not the app's env schema at all.
+  'GF_SECURITY_ADMIN_PASSWORD',
+  // docker/compose/logs.yml only (log-search reference overlay): the overlay's own Grafana
+  // password and port and Loki's retention period — compose interpolation, not the app's schema.
+  'LOGS_GRAFANA_ADMIN_PASSWORD',
+  'LOGS_GRAFANA_PORT',
+  'LOGS_RETENTION_PERIOD',
+])
+const WEBHOOK_SECRET_PATTERN = /^WEBHOOK_[A-Z0-9_]+_SECRET$/
+
+const exampleText = readFileSync(findEnvExample(), 'utf8')
+const documented = new Set(
+  [...exampleText.matchAll(/^\s*#?\s*([A-Z][A-Z0-9_]+)=/gm)].map((match) => match[1]!)
+)
+
+describe('.env.example ↔ env schema coverage', () => {
+  const GUIDE = 'docs/backend/architecture-and-conventions.md#adding-an-environment-variable'
+
+  it('documents every schema key (active or commented), except the synthetic denylist', () => {
+    const missing = SCHEMA_KEYS.filter(
+      (key) => !documented.has(key) && !SCHEMA_DENYLIST.has(key)
+    ).sort()
+    expect(
+      missing.length === 0
+        ? 'ok'
+        : `.env.example is missing ${missing.length} schema key(s): ${missing.join(', ')}. ` +
+            `Add each in its section — active \`KEY=\` for required keys, commented \`# KEY=\` ` +
+            `for optional/advanced ones. See ${GUIDE}.`
+    ).toBe('ok')
+  })
+
+  it('documents no key that is neither a schema key nor an allowed compose/webhook key', () => {
+    const unknown = [...documented]
+      .filter(
+        (key) =>
+          !(key in shape) &&
+          !SCHEMA_DENYLIST.has(key) &&
+          !COMPOSE_ONLY_ALLOW.has(key) &&
+          !WEBHOOK_SECRET_PATTERN.test(key)
+      )
+      .sort()
+    expect(
+      unknown.length === 0
+        ? 'ok'
+        : `.env.example documents ${unknown.length} key(s) the schema does not accept: ` +
+            `${unknown.join(', ')}. Remove them, fix a typo, or (if compose-only) add to ` +
+            `COMPOSE_ONLY_ALLOW in this spec. See ${GUIDE}.`
+    ).toBe('ok')
+  })
+
+  // A fork runs `cp .env.example .env` and expects the app to boot. Its *active*
+  // assignments must therefore validate as-is — e.g. a partially-filled OAuth
+  // provider (active callback URL, empty credentials) would fail `validate()`, so
+  // such optional groups must be shipped commented, not active-empty.
+  it('is copyable: its active assignments pass validate() unchanged', () => {
+    const parsed = parse(readFileSync(findEnvExample()))
+    let error = ''
+    try {
+      validate(parsed)
+    } catch (caught) {
+      error = caught instanceof Error ? caught.message : String(caught)
+    }
+    expect(
+      error === ''
+        ? 'ok'
+        : `\`cp .env.example .env\` would not boot: ${error} — ship optional groups ` +
+            `(e.g. OAuth providers) commented, not active-with-empty-values. See ${GUIDE}.`
+    ).toBe('ok')
+  })
+})

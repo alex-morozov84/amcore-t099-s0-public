@@ -1,0 +1,295 @@
+# Contributing to AMCore
+
+[Managed local stands and browser tests](docs/operations/local-stands.md). Agents use managed commands for local DB writes and previews.
+
+Thanks for your interest in contributing. This document explains how to set up the project and submit changes.
+
+## Getting Started
+
+1. **Clone and install** — See [README → Quick Start](README.md#quick-start) for prerequisites, clone, `pnpm install`, Docker, and migrations.
+2. **Environment** — Copy `.env.example` to `.env` at the repository root.
+   That single file configures both `apps/api` and `apps/web` for local
+   development; there is no separate `apps/web/.env.example`.
+3. **Run locally** — `pnpm dev` starts API and web in development mode.
+
+See [the lint policy guide](packages/eslint-config/README.md) for engine ownership,
+inline exceptions and paired presets. Run `pnpm lint:fix` for supported autofixes.
+
+## Development Commands
+
+| Command                                                           | Description                                                                                                                                                                                                                                          |
+| ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pnpm dev`                                                        | Start all apps in dev mode                                                                                                                                                                                                                           |
+| `pnpm build`                                                      | Build all apps                                                                                                                                                                                                                                       |
+| `pnpm lint`                                                       | Run Oxlint + ESLint and web Stylelint                                                                                                                                                                                                                |
+| `pnpm typecheck`                                                  | Run TypeScript check                                                                                                                                                                                                                                 |
+| `pnpm test`                                                       | Run all unit tests                                                                                                                                                                                                                                   |
+| `pnpm format:check`                                               | Check Prettier formatting                                                                                                                                                                                                                            |
+| `pnpm format`                                                     | Format code with Prettier                                                                                                                                                                                                                            |
+| `pnpm init:brand`                                                 | Initialize a downstream fork's identity, brand, assets, and theme choices                                                                                                                                                                            |
+| `docker compose --profile local-infra --profile monitoring up -d` | Optional dev-only Prometheus + Grafana + Alertmanager harness scraping this stack's real metrics — needs `METRICS_AUTH_TOKEN`/`GF_SECURITY_ADMIN_PASSWORD` set in `.env`; see [`docs/operations/observability.md`](docs/operations/observability.md) |
+| `pnpm test:observability-contract`                                | Static observability-contract checks (metric references, runbook links/anchors/panel citations, private-path ratchet, image-pin consistency) — no Docker needed                                                                                      |
+| `pnpm test:observability-contract:live`                           | Live observability-contract checks — boots the monitoring harness above and Grafana's old-volume migration smoke, then tears both down; needs Docker                                                                                                 |
+| `pnpm test:scripts`                                               | Script contract tests (init:brand with its engine core, product-admin placement, lint, Lighthouse, migrator and deployment tooling); the CI job "Script contracts" runs this command                                                                 |
+
+`pnpm test:extension-contracts` runs notification/channel/tool/provider registration
+and migration conformance in an isolated copy with PostgreSQL/Redis Testcontainers.
+Docker is required; ordinary `.env` and owner preview data are excluded. It is
+invoked by the notification/AI extension job feeding Test; see [channel conformance](docs/notifications/channels.md#run-the-conformance-lane).
+
+`pnpm test:background-work-contracts` runs the common registration, image and
+transactional durable recipes, administrative controls, queued-email safety,
+queue inventory/observation and read-only Board regression suites against isolated
+Testcontainers. Docker is required. These standard suites run once through full API E2E
+coverage in CI; this focused command remains available locally. See the
+[background-work contract](docs/backend/background-work.md#verify-a-registration).
+
+Migration image dependencies use a minimal workspace manifest and the root lock.
+Follow [migration image maintenance](docs/operations/migrator-image.md#installation-and-maintenance)
+and run `node scripts/migrator-contract.mjs` before image checks. Keep the Prisma
+CLI/client/adapter family coherent; the image uses its own filtered preparation.
+
+Single app: `pnpm --filter api dev`, `pnpm --filter web test`, etc.
+
+### Size review advisory
+
+The local pre-commit hook prints file and function sizes for staged new or
+changed code after `lint-staged` finishes. File counts cover JS/TS, CSS,
+Prisma, SQL, shell scripts, Dockerfiles, and hooks; function counts cover
+JS/TS, including tests and test helpers. Direct `describe`, `test`, `it`, and
+Playwright `test.describe` suite/case callbacks are omitted, but ordinary
+callbacks such as `test.step` and nested helpers are listed. Files at 150
+lines or functions at 30 lines receive a `review size` marker. The marker is
+advice, not a lint, CI, or commit failure.
+Untouched historical code is not listed. The report reads the staged snapshot,
+so unstaged edits and commits that bypass the hook are not covered.
+
+Before handing a change to Agent 2, inspect the report and state for **each**
+marked file or function whether you split it or kept it together, with a brief
+reason. Judge cohesion and readability; a justified long unit may remain whole.
+The hook prints `size report unavailable` if it cannot inspect the index or
+parse a changed file, without blocking the commit; inspect the diff directly
+in that case. The reporter can also be rerun with
+`node scripts/code-size-report.mjs` while the change is staged.
+
+`pnpm init:brand` initializes a downstream fork's identity, brand assets and theme.
+See [`docs/frontend/brand-theme-and-tokens.md` → Fork initialization](docs/frontend/brand-theme-and-tokens.md#fork-initialization).
+
+### API-specific test commands
+
+| Command                                                              | Description                                                       |
+| -------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| `pnpm --filter api test`                                             | All unit tests                                                    |
+| `pnpm --filter api test -- path/to/file.spec.ts`                     | Single test file                                                  |
+| `pnpm --filter api test:e2e`                                         | All E2E tests (requires Docker — Testcontainers)                  |
+| `pnpm --filter api test:e2e --runTestsByPath test/oauth.e2e-spec.ts` | Single E2E suite                                                  |
+| `pnpm test:capability-extension`                                     | Starter-only extension proof; products warn without running tests |
+| `pnpm --filter api test:email`                                       | Email template integration tests (Vitest)                         |
+
+See [capability check applicability](docs/operations/ci-security.md) for the warning
+and the PostgreSQL access tests that products must own.
+
+API unit and E2E tests use `@swc/jest` with shared decorator/source-map settings.
+Run `pnpm --filter api typecheck` separately. API and shared source checks
+select the pinned TypeScript 7 CLI through `scripts/typecheck-native.mjs`.
+Frontend checks, compiler API tools and shared declaration generation retain
+their supported compiler versions. Bare `tsc` is ambiguous in API/shared; use
+the package commands. API build runs its application-only native `typecheck:build`
+before Nest/SWC. Web production builds use `tsconfig.build.json` for application
+source and generated route types. Full `typecheck` commands still cover tests and
+remain mandatory; build success does not replace them.
+Development diagnostics remain asynchronous. Use explicit `.js` relative imports
+in API runtime modules. See [API build guidance](docs/backend/api-build.md).
+An intentional native compiler patch upgrade must update both native aliases,
+the launcher's expected version and its fixtures together. Native checks do not
+permit syntax unsupported by retained compiler API tools or declaration emission.
+Email retains Vitest. `test:watch` and `test:cov` apply to API unit tests.
+
+API E2E tests provision their own Postgres/Redis and test JWT secret; no local
+`.env` preparation is required. See [API Testcontainers](docs/operations/local-stands.md#api-testcontainers).
+
+Prepare each fresh checkout with `pnpm install --frozen-lockfile`, then
+`node scripts/api-e2e-ci.mjs --prepare`. The launcher refuses stale prerequisites.
+It runs each suite in a fresh observed Node process, with ESM support and a 1 GiB
+V8 heap limit. It rejects retries, skipped assertions, forced exits and incomplete
+cleanup. Use the managed command for focused checks as well as the full inventory.
+
+Follow the [API E2E budget policy](docs/operations/ci-security.md#api-e2e-budget-policy)
+for layout measurements. Ordinary PRs use complete CI without repeating initial
+three-sample admission. Do not repeat a passed full local run for review without
+changed covered behavior or a new testable hypothesis.
+
+### Shared-package test commands
+
+| Command                                             | Description                               |
+| --------------------------------------------------- | ----------------------------------------- |
+| `pnpm --filter shared test`                         | All `packages/shared` unit tests (Vitest) |
+| `pnpm --filter shared test -- path/to/file.test.ts` | Single test file                          |
+
+Pure schema/lib contract tests for `packages/shared` live beside their source
+(`packages/shared/src/**/*.test.ts`), not in `apps/api` or `apps/web` — see
+[`docs/backend/architecture-and-conventions.md` → Contract (shared Zod)](docs/backend/architecture-and-conventions.md#2-contract-shared-zod).
+
+### Web-specific test commands
+
+| Command                                       | Description                                                                                                                                                        |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `pnpm --filter web test`                      | All unit/component/integration tests (mocked infra)                                                                                                                |
+| `pnpm --filter web test:coverage`             | Unit tests with an informational V8 coverage report; see [`docs/frontend/testing.md`](docs/frontend/testing.md#commands)                                           |
+| `pnpm --filter web test:integration`          | Testcontainers-backed tests — real Redis (requires Docker), excluded from `pnpm test`                                                                              |
+| `pnpm --filter web storybook`                 | Storybook component workshop dev server (`http://localhost:6006`)                                                                                                  |
+| `pnpm --filter web build-storybook`           | Static Storybook build — cheap compile/broken-story smoke                                                                                                          |
+| `pnpm --filter web test:storybook`            | Storybook interaction + accessibility gate (browser-mode Vitest/Playwright Chromium)                                                                               |
+| `node scripts/run-deployment-version-e2e.mjs` | Isolated production A/B recovery with a custom Server Action timer; see [deployment verification](docs/frontend/testing.md#production-deployment-version-recovery) |
+| `node scripts/e2e-ci.mjs --all`               | Complete Web E2E CI lanes with matching CI settings and isolated stands; see [frontend testing](docs/frontend/testing.md#complete-ci-e2e-locally)                  |
+| `pnpm audit:web:plan`                         | Inspect Lighthouse scenarios and CI ownership                                                                                                                      |
+| `pnpm audit:web path-standard`                | Audit a new isolated production stand; [setup, HTML reports and limits](docs/frontend/testing.md#lighthouse-audits)                                                |
+| `pnpm --filter web test:e2e`                  | Playwright mocked + server-mocked E2E lanes (auto-starts `next dev`)                                                                                               |
+| `pnpm --filter web test:e2e:real-stack`       | Playwright real-stack E2E lane — managed isolated startup and cleanup; see [local stands](docs/operations/local-stands.md)                                         |
+
+On a clean checkout, build the shared package before running Storybook's browser
+test runner directly: `pnpm --filter @amcore/shared build`. The CI `storybook`
+job does this explicitly; turbo does it automatically for `pnpm test`,
+`pnpm lint`, and `pnpm typecheck`. Managed Playwright commands prepare their own
+isolated runtime; see [local stands](docs/operations/local-stands.md).
+
+Shared builder changes must preserve the [distribution contract](docs/backend/shared-package-build.md).
+`pnpm test:scripts` checks package build/dev commands, strict dist-only consumers,
+removed modules, source maps and build failures in disposable copies.
+
+## Commit Messages
+
+We use [Conventional Commits](https://www.conventionalcommits.org/) and commitlint.
+
+- **Format:** `type(scope): subject`. **Scope is optional** — add it when the change maps to one clear area, and omit it for cross-cutting changes (e.g. `docs:`, `chore:`).
+- **Subject:** lowercase, no period at the end, max 72 characters.
+- **Types:** `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`.
+- **Scopes (when present):** `api`, `web`, `shared`, `auth`, `storage`, `media`, `notifications`, `ai`, `ci`, `docs`, `deps`.
+
+Examples:
+
+```
+feat(auth): add google oauth login
+fix(web): correct button disabled state
+docs: update quick start env step
+chore: unify github repository url
+```
+
+## Branching & merging
+
+- Follow the workflow mode declared in `PROJECT_CONTEXT.md`.
+- **`strict` mode (AMCore upstream default):** `main` is the single protected
+  trunk (PR-only; a direct push is rejected). Branch off `main` (`<type>/<name>`)
+  and open a PR into `main`. This is **GitHub Flow** — there is no long-lived
+  `develop` branch.
+- **`strict` mode merges:** required CI checks must pass before merge. **Merge
+  with Squash** (linear history; one commit per PR). The **PR title becomes the
+  squash commit message**, so it is linted as a Conventional Commit by CI.
+- **`strict` mode releases:** cut an annotated `vX.Y.Z` tag / GitHub Release from
+  `main`; staging and production are promoted through deploy **environments**,
+  not branches. AMCore security fixes target the latest published minor only,
+  with no older-minor backports. A product owner may maintain its own `release/x.y`
+  branch; that is not a promise of upstream support.
+- **Downstream products:** choose `strict`, `flexible`, or `custom` in
+  `PROJECT_CONTEXT.md`. `flexible` / `custom` forks may relax branch protection
+  or merge rules, but their own contributor docs become authoritative. Source-update
+  PRs preserve true merge commits in every mode; never squash/rebase them. Eligible
+  strict products run setup with `--fork-updates` on every reconciliation. See the
+  [fork update guide](docs/operations/updating-a-fork.md).
+- First-time `strict` repo-protection setup (these settings do not travel with a
+  fork): `bash scripts/setup-repo-security.sh` — needs `gh` + `jq` and repo
+  admin; see
+  [`docs/operations/ci-security.md` → What a fork inherits](docs/operations/ci-security.md#what-a-fork-inherits-and-what-it-doesnt). The security
+  scripts require a Unix-like shell (macOS/Linux/WSL).
+
+## Adding tests
+
+Follow [test necessity, replacement and CI ownership](docs/operations/adding-tests.md).
+Inspect existing cases first. A passing test is not automatically needed; remove
+a repeated case only with a named replacement, relevant fault proof and explicit
+lost coverage. Do not infer execution from a filename.
+Use the [backend conventions](docs/backend/architecture-and-conventions.md),
+[frontend taxonomy](docs/frontend/testing.md) and [CI gate map](docs/operations/ci-security.md#current-gates).
+
+## Before Submitting a PR
+
+1. Run `pnpm lint` and `pnpm typecheck` — must pass.
+2. Run `pnpm test` — all tests must pass.
+3. Run `pnpm format:check` — or `pnpm format` to fix.
+4. Check docs impact. Follow the [documentation writing guide](docs/documentation-guide.md).
+   Update affected `README.md`, `AGENTS.md`, and `docs/`
+   pages when behavior, API contracts, extension points, security invariants,
+   operations, commands, or contributor workflow changed. If no docs update is
+   needed, say so in the PR.
+5. Add notable AMCore changes to `CHANGELOG.md` under `[Unreleased]`. Downstream
+   products leave that upstream file untouched and name their own product notes file.
+   For incompatible integration/operational changes, state affected consumers, old/new
+   behavior, required action/order, checks and rollback limits. Review extension-fixture
+   adaptations for contract impact. Never rewrite already shared/applied migrations.
+   Skip internal refactors, tests, and typo-only documentation changes.
+6. **Next.js-specific changes** (see the trigger list in root `AGENTS.md` →
+   _Next.js reference_ bullet): list the installed Next.js docs pages checked
+   in the PR description or handoff, or say explicitly why none applied. This
+   is a review expectation, not a CI check — reviewers should expect to see
+   this list for a Next.js-specific PR, not find it enforced automatically.
+   For Turborepo configuration, tasks or CLI changes, likewise list the relevant
+   bundled docs pages checked from the installed `turbo` package (see root
+   `AGENTS.md` → _Turborepo reference_).
+7. **CSP-affecting changes** (a new third-party script/style origin, a
+   `shared/ui` addition using `ScrollArea`/`Tabs.Indicator`/`Slider.Thumb`/
+   `Select` with `alignItemWithTrigger`, or anything touching
+   `apps/web/src/proxy.ts`/`shared/lib/csp/`): verify with
+   `WEB_CSP_MODE=enforce` against a real browser, console free of
+   `securitypolicyviolation` — not just the mocked Playwright lane, whose
+   `next dev` target can't prove "zero violations" (Turbopack's own HMR
+   tooling noise). See
+   [`docs/frontend/browser-security-and-csp.md`](docs/frontend/browser-security-and-csp.md).
+8. **Web bundle growth:** after `pnpm build`, run `pnpm check:route-budgets`. If a
+   page is over its limit, reduce the cost or raise the limit in the same PR and
+   explain why; see [route bundle budgets](docs/frontend/bundle-budget.md).
+9. Fill in the [PR template](.github/PULL_REQUEST_TEMPLATE.md) and ensure the checklist is satisfied.
+
+For product-admin placement changes, validate the physical routes and generated
+edge mapping as described in [placement and sessions](docs/product-admin/placement-and-sessions.md).
+
+CI runs the same checks on push; fixing any failures before opening a PR saves time.
+
+## Changelog & releases
+
+Ordinary PRs do not bump the version or create tags. Maintainers release the
+repository as one product; only the root `package.json` version is the release
+version. Private workspace package versions stay unchanged.
+
+Manual release procedure (until release automation is adopted):
+
+1. Create a short-lived release-preparation branch from current `main`.
+2. Choose the next SemVer version. Stay on `0.x` while the public starter
+   contract is still evolving.
+3. Set the root `package.json` version and move `[Unreleased]` entries in
+   `CHANGELOG.md` into `[X.Y.Z] - YYYY-MM-DD`. Restore an empty `[Unreleased]`
+   section and update the comparison links at the bottom.
+4. Open a `chore: release vX.Y.Z` PR into `main`; merge it with Squash after CI.
+5. Tag that exact `main` commit with annotated tag `vX.Y.Z`, push it, then create
+   the matching GitHub Release.
+
+Release tags are immutable: never move, overwrite, or delete an existing `v*`
+tag. See the internal maintainer checklist in `ai/PROCESS.md` when `ai/` exists.
+
+## Troubleshooting
+
+- **`pnpm --filter web build` hangs at "Creating an optimized production build…"** —
+  a slow build alone does not prove a stale process or lock. Inspect live progress
+  and identify the owning process. Stop only your own build normally. Remove a
+  stale lock only after verifying that its owning process has stopped. Never
+  remove another task's output or an active server's lock. Managed runs use
+  [stand recovery](docs/operations/local-stands.md), not manual lock deletion.
+  See [observable checks](docs/frontend/testing.md#observable-long-running-checks).
+
+### Backend HTTP changes
+
+The API uses Fastify. Follow [HTTP runtime](docs/backend/http-runtime.md) when
+adding plugins, cookies, uploads, raw responses or middleware. Run affected HTTP
+contract fixtures and API typecheck; full API E2E and generated consumer checks
+remain required CI.
+
+Web server requests must use the [enforced transport boundary](docs/frontend/api-consumption.md#server-request-boundary). Preserve original request headers and exact adapter exceptions.

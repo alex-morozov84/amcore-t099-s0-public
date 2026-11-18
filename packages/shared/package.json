@@ -1,0 +1,41 @@
+{
+  "name": "@amcore/shared",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Shared schemas, types, and constants for AMCore",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch --no-clean",
+    "lint": "node ../../scripts/lint.mjs --scope shared",
+    "typecheck": "node ../../scripts/typecheck-native.mjs --noEmit -p tsconfig.json",
+    "test": "vitest run --passWithNoTests",
+    "lint:fix": "node ../../scripts/lint.mjs --scope shared --fix"
+  },
+  "dependencies": {
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@amcore/eslint-config": "workspace:*",
+    "@amcore/typescript-config": "workspace:*",
+    "typescript": "^5.9.3",
+    "vitest": "^5.1.0",
+    "tsdown": "0.23.7",
+    "@typescript/native": "npm:typescript@7.0.2"
+  }
+}

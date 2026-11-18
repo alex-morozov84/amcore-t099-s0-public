@@ -1,0 +1,86 @@
+# Explicit host-mode edge config. Select it only with docker/compose/console-host.yml.
+{
+	email {$CADDY_EMAIL}
+}
+
+:443 {
+	respond 404
+}
+
+{$CADDY_DOMAIN} {
+	reverse_proxy api:5002 {
+		# The API trusts this header only from TRUSTED_WEB_PEERS (the web BFF relay). A client
+		# must never deliver it through the edge, whatever that setting is.
+		header_up -X-AMCore-Client-Ip
+	}
+}
+
+{$CADDY_WEB_DOMAIN} {
+	reverse_proxy web:3000 {
+		header_up Host {hostport}
+	}
+}
+
+# AMCORE_ADMIN_CONSOLE_PROXY_START — the managed stand copies the block between these two
+# markers (scripts/stand/product-admin-source.mjs); keep both lines.
+{$ADMIN_CONSOLE_HOSTNAME} {
+	@physicalConsolePath path /admin /admin/*
+	handle @physicalConsolePath {
+		respond 404
+	}
+
+	@consoleTrailingSlash path_regexp consoleTrailingSlash ^(/(?:en|ru)(?:/.*[^/])?)/$
+	handle @consoleTrailingSlash {
+		redir {re.consoleTrailingSlash.1}?{query} 308
+	}
+
+	@cspReport path /api/csp-report
+	handle @cspReport {
+		reverse_proxy web:3000 {
+			header_up Host {hostport}
+		}
+	}
+
+	@deploymentVersion path /api/deployment-version
+	handle @deploymentVersion {
+		reverse_proxy web:3000 {
+			header_up Host {hostport}
+		}
+	}
+
+	# The queue board's root has a trailing slash (its page base). Next.js would redirect it to the
+	# slashless address and that redirect names the physical /api/console/ path, so the root is
+	# mapped to the slashless physical route here, query preserved.
+	@consoleBoardRoot path /api/bull-board/
+	handle @consoleBoardRoot {
+		rewrite * /api/console/bull-board
+		reverse_proxy web:3000 {
+			header_up Host {hostport}
+		}
+	}
+
+	@consoleApi path /api/*
+	handle @consoleApi {
+		# Only the FIRST /api/: the queue board's own data paths (/api/bull-board/api/queues) contain a
+		# second one, and Caddy replaces every occurrence unless it is given a limit.
+		uri replace /api/ /api/console/ 1
+		reverse_proxy web:3000 {
+			header_up Host {hostport}
+		}
+	}
+
+	@consolePage path_regexp consolePage ^/(en|ru)(/.*)?$
+	handle @consolePage {
+		rewrite * /{re.consolePage.1}/admin{re.consolePage.2}
+		reverse_proxy web:3000 {
+			header_up Host {hostport}
+		}
+	}
+
+	handle {
+		reverse_proxy web:3000 {
+			header_up Host {hostport}
+		}
+	}
+}
+# AMCORE_ADMIN_CONSOLE_PROXY_END

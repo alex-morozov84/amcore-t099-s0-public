@@ -1,0 +1,1195 @@
+import type { INestApplication } from '@nestjs/common'
+import request from 'supertest'
+
+import { adminOverviewResponseSchema, SystemRole } from '@amcore/shared'
+
+import type { PrismaService } from '../src/prisma'
+
+import {
+  cleanDatabase,
+  cleanOrgData,
+  type E2ETestContext,
+  seedSystemRoles,
+  setupE2ETest,
+  signAccessToken,
+  teardownE2ETest,
+} from './helpers'
+import { loginDomainOperator } from './operator-auth.fixture.js'
+import { reauthenticateDomainOperator } from './operator-step-up.fixture.js'
+
+describe('Admin (e2e)', () => {
+  let app: INestApplication
+  let prisma: PrismaService
+  let context: E2ETestContext
+
+  beforeAll(async () => {
+    context = await setupE2ETest()
+    app = context.app
+    prisma = context.prisma
+    await seedSystemRoles(prisma)
+  }, 120000)
+
+  afterAll(async () => {
+    await teardownE2ETest(context)
+  }, 120000)
+
+  beforeEach(async () => {
+    await cleanOrgData(prisma)
+    await cleanDatabase(prisma, context.cache, context.throttlerStorage)
+  })
+
+  async function registerAndGetToken(email: string, password = 'StrongP@ss123') {
+    const res = await request(app.getHttpServer())
+      .post('/auth/register')
+      .send({ email, password })
+      .expect(201)
+    return { token: res.body.accessToken as string, userId: res.body.user.id as string }
+  }
+
+  async function promoteToSuperAdmin(userId: string) {
+    await prisma.user.update({
+      where: { id: userId },
+      data: { systemRole: 'SUPER_ADMIN' },
+    })
+    // Login again to get a fresh token with updated role from DB
+    const res = await loginDomainOperator(context, {
+      email: 'superadmin@example.com',
+      password: 'StrongP@ss123',
+    })
+    return res.body.accessToken as string
+  }
+
+  describe('access control', () => {
+    it('returns 401 without token', async () => {
+      await request(app.getHttpServer()).get('/admin/users').expect(401)
+    })
+
+    it('returns 403 for regular USER', async () => {
+      const { token } = await registerAndGetToken('user@example.com')
+
+      await request(app.getHttpServer())
+        .get('/admin/users')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(403)
+    })
+  })
+
+  describe('GET /admin/access', () => {
+    it('returns 401 without a bearer token', async () => {
+      await request(app.getHttpServer()).get('/admin/access').expect(401)
+    })
+
+    it('returns 403 for a regular USER', async () => {
+      const { token } = await registerAndGetToken('access-user@example.com')
+
+      await request(app.getHttpServer())
+        .get('/admin/access')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(403)
+    })
+
+    it('returns 403 for an organization ADMIN', async () => {
+      const { token } = await registerAndGetToken('access-org-admin@example.com')
+
+      await request(app.getHttpServer())
+        .post('/organizations')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ name: 'Access Probe Organization' })
+        .expect(201)
+
+      await request(app.getHttpServer())
+        .get('/admin/access')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(403)
+    })
+
+    it('returns an empty 204 for a SUPER_ADMIN', async () => {
+      const { userId } = await registerAndGetToken('superadmin@example.com')
+      const superToken = await promoteToSuperAdmin(userId)
+
+      const response = await request(app.getHttpServer())
+        .get('/admin/access')
+        .set('Authorization', `Bearer ${superToken}`)
+        .expect(204)
+
+      expect(response.text).toBe('')
+      expect(response.headers['content-length']).toBeUndefined()
+    })
+  })
+
+  describe('GET /admin/users', () => {
+    it('returns paginated user list for SUPER_ADMIN', async () => {
+      const { userId } = await registerAndGetToken('superadmin@example.com')
+      await registerAndGetToken('other@example.com')
+      const superToken = await promoteToSuperAdmin(userId)
+
+      const res = await request(app.getHttpServer())
+        .get('/admin/users')
+        .set('Authorization', `Bearer ${superToken}`)
+        .expect(200)
+
+      expect(res.body.total).toBeGreaterThanOrEqual(2)
+      expect(Array.isArray(res.body.data)).toBe(true)
+    })
+  })
+
+  /**
+   * Admin discovery (search/sort, ADR-082). Real Postgres round trip: proves
+   * the `pg_trgm`-backed literal-contains search and the allowlisted sort
+   * contract actually work against the database, not just against a Prisma
+   * mock (`admin.service.spec.ts` already covers the query-construction
+   * unit contract).
+   */
+  describe('Admin discovery: search + sort', () => {
+    async function registerNamedUser(email: string, name: string) {
+      const res = await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email, password: 'StrongP@ss123', name })
+        .expect(201)
+      return res.body.user.id as string
+    }
+
+    describe('GET /admin/users?search=', () => {
+      it('matches by name OR email, case-insensitively', async () => {
+        const { userId } = await registerAndGetToken('superadmin@example.com')
+        const superToken = await promoteToSuperAdmin(userId)
+        await registerNamedUser('wonderland@example.com', 'Alice Wonderland')
+        await registerNamedUser('bob@example.com', 'Bob Builder')
+
+        const byName = await request(app.getHttpServer())
+          .get('/admin/users?search=WONDER')
+          .set('Authorization', `Bearer ${superToken}`)
+          .expect(200)
+        expect(byName.body.data).toHaveLength(1)
+        expect(byName.body.data[0].email).toBe('wonderland@example.com')
+
+        const byEmail = await request(app.getHttpServer())
+          .get('/admin/users?search=wonderland@ex')
+          .set('Authorization', `Bearer ${superToken}`)
+          .expect(200)
+        expect(byEmail.body.data).toHaveLength(1)
+      })
+
+      it('treats a whitespace-only search as no filter', async () => {
+        const { userId } = await registerAndGetToken('superadmin@example.com')
+        const superToken = await promoteToSuperAdmin(userId)
+        await registerNamedUser('whitespace-check@example.com', 'Ann')
+
+        const filtered = await request(app.getHttpServer())
+          .get('/admin/users?search=%20%20%20')
+          .set('Authorization', `Bearer ${superToken}`)
+          .expect(200)
+        const unfiltered = await request(app.getHttpServer())
+          .get('/admin/users')
+          .set('Authorization', `Bearer ${superToken}`)
+          .expect(200)
+
+        expect(filtered.body.total).toBe(unfiltered.body.total)
+      })
+
+      it('matches a literal % / _ / \\ in a search term rather than treating it as a wildcard', async () => {
+        const { userId } = await registerAndGetToken('superadmin@example.com')
+        const superToken = await promoteToSuperAdmin(userId)
+        await registerNamedUser('literal@example.com', '50%_off\\deal')
+        await registerNamedUser('unrelated@example.com', 'Someone Else')
+
+        const res = await request(app.getHttpServer())
+          .get(`/admin/users?search=${encodeURIComponent('50%_off\\deal')}`)
+          .set('Authorization', `Bearer ${superToken}`)
+          .expect(200)
+
+        expect(res.body.data).toHaveLength(1)
+        expect(res.body.data[0].email).toBe('literal@example.com')
+      })
+
+      it('matches a Cyrillic name case-insensitively', async () => {
+        const { userId } = await registerAndGetToken('superadmin@example.com')
+        const superToken = await promoteToSuperAdmin(userId)
+        await registerNamedUser('anna@example.com', 'Анна Иванова')
+
+        const res = await request(app.getHttpServer())
+          .get(`/admin/users?search=${encodeURIComponent('иванов')}`)
+          .set('Authorization', `Bearer ${superToken}`)
+          .expect(200)
+
+        expect(res.body.data).toHaveLength(1)
+      })
+
+      it('returns a 200 with an empty page for a search matching nothing', async () => {
+        const { userId } = await registerAndGetToken('superadmin@example.com')
+        const superToken = await promoteToSuperAdmin(userId)
+
+        const res = await request(app.getHttpServer())
+          .get('/admin/users?search=no-such-user-anywhere')
+          .set('Authorization', `Bearer ${superToken}`)
+          .expect(200)
+
+        expect(res.body.total).toBe(0)
+        expect(res.body.data).toEqual([])
+      })
+    })
+
+    describe('GET /admin/users?sortBy=&sortOrder=', () => {
+      it('sorts by name ascending by default', async () => {
+        const { userId } = await registerAndGetToken('superadmin@example.com')
+        const superToken = await promoteToSuperAdmin(userId)
+        await registerNamedUser('zed@example.com', 'Zed')
+        await registerNamedUser('amy@example.com', 'Amy')
+
+        const res = await request(app.getHttpServer())
+          .get('/admin/users?sortBy=name')
+          .set('Authorization', `Bearer ${superToken}`)
+          .expect(200)
+
+        const names = res.body.data.map((u: { name: string | null }) => u.name).filter(Boolean)
+        const sorted = [...names].sort((a, b) => a.localeCompare(b))
+        expect(names).toEqual(sorted)
+      })
+
+      it('reverses with sortOrder=desc', async () => {
+        const { userId } = await registerAndGetToken('superadmin@example.com')
+        const superToken = await promoteToSuperAdmin(userId)
+        await registerNamedUser('zed@example.com', 'Zed')
+        await registerNamedUser('amy@example.com', 'Amy')
+
+        const res = await request(app.getHttpServer())
+          .get('/admin/users?sortBy=name&sortOrder=desc')
+          .set('Authorization', `Bearer ${superToken}`)
+          .expect(200)
+
+        const names = res.body.data.map((u: { name: string | null }) => u.name).filter(Boolean)
+        const sorted = [...names].sort((a, b) => b.localeCompare(a))
+        expect(names).toEqual(sorted)
+      })
+    })
+
+    describe('invalid discovery query values', () => {
+      it.each([
+        ['?sortBy=systemRole', 'unallowlisted sortBy'],
+        ['?sortBy=emailVerified', 'unallowlisted sortBy'],
+        ['?sortOrder=ascending', 'invalid sortOrder'],
+        [`?search=${encodeURIComponent('a'.repeat(256))}`, 'oversized search'],
+        ['?search=a&search=b', 'repeated search query key (array, not a string)'],
+        ['?sortBy=name&sortBy=email', 'repeated sortBy query key'],
+      ])('GET /admin/users%s → 400 (%s)', async (qs) => {
+        const { userId } = await registerAndGetToken('superadmin@example.com')
+        const superToken = await promoteToSuperAdmin(userId)
+
+        await request(app.getHttpServer())
+          .get(`/admin/users${qs}`)
+          .set('Authorization', `Bearer ${superToken}`)
+          .expect(400)
+      })
+    })
+
+    describe('GET /admin/organizations?search=&sortBy=', () => {
+      it('matches by name OR slug, case-insensitively', async () => {
+        const { userId } = await registerAndGetToken('superadmin@example.com')
+        const superToken = await promoteToSuperAdmin(userId)
+        await request(app.getHttpServer())
+          .post('/organizations')
+          .set('Authorization', `Bearer ${superToken}`)
+          .send({ name: 'Acme Rockets' })
+          .expect(201)
+        await request(app.getHttpServer())
+          .post('/organizations')
+          .set('Authorization', `Bearer ${superToken}`)
+          .send({ name: 'Umbrella Corp' })
+          .expect(201)
+
+        const res = await request(app.getHttpServer())
+          .get('/admin/organizations?search=ACME')
+          .set('Authorization', `Bearer ${superToken}`)
+          .expect(200)
+
+        expect(res.body.data).toHaveLength(1)
+        expect(res.body.data[0].name).toBe('Acme Rockets')
+      })
+
+      it('rejects a sortBy that is only valid for Users', async () => {
+        const { userId } = await registerAndGetToken('superadmin@example.com')
+        const superToken = await promoteToSuperAdmin(userId)
+
+        await request(app.getHttpServer())
+          .get('/admin/organizations?sortBy=email')
+          .set('Authorization', `Bearer ${superToken}`)
+          .expect(400)
+      })
+
+      it('rejects a repeated search query key (array, not a string)', async () => {
+        const { userId } = await registerAndGetToken('superadmin@example.com')
+        const superToken = await promoteToSuperAdmin(userId)
+
+        await request(app.getHttpServer())
+          .get('/admin/organizations?search=a&search=b')
+          .set('Authorization', `Bearer ${superToken}`)
+          .expect(400)
+      })
+    })
+  })
+
+  /**
+   * OA-07: admin responses must not expose `passwordHash` (argon2 hash)
+   * or `emailCanonical` (internal normalization). `ZodSerializerDto`
+   * strips anything outside `adminUserResponseSchema` at the transport
+   * layer; the Prisma `select` allowlist prevents the DB from reading
+   * those columns in the first place. Both must hold.
+   */
+  describe('OA-07: admin user responses exclude passwordHash', () => {
+    it('GET /admin/users → 200 with no passwordHash and no emailCanonical', async () => {
+      const { userId } = await registerAndGetToken('superadmin@example.com')
+      const superToken = await promoteToSuperAdmin(userId)
+
+      const res = await request(app.getHttpServer())
+        .get('/admin/users')
+        .set('Authorization', `Bearer ${superToken}`)
+        .expect(200)
+
+      expect(res.body.data.length).toBeGreaterThan(0)
+      for (const user of res.body.data) {
+        expect(user).not.toHaveProperty('passwordHash')
+        expect(user).not.toHaveProperty('emailCanonical')
+        expect(typeof user.createdAt).toBe('string')
+        expect(typeof user.updatedAt).toBe('string')
+        expect(user.systemRole).toBeDefined()
+      }
+    })
+
+    it('PATCH /admin/users/:id → 200 with no passwordHash and no emailCanonical', async () => {
+      const { userId: targetId } = await registerAndGetToken('target@example.com')
+      const { userId: adminId } = await registerAndGetToken('superadmin@example.com')
+      const superToken = await promoteToSuperAdmin(adminId)
+
+      const res = await request(app.getHttpServer())
+        .patch(`/admin/users/${targetId}`)
+        .set('Authorization', `Bearer ${superToken}`)
+        .send({ systemRole: SystemRole.SuperAdmin })
+        .expect(200)
+
+      expect(res.body).not.toHaveProperty('passwordHash')
+      expect(res.body).not.toHaveProperty('emailCanonical')
+      expect(res.body.systemRole).toBe(SystemRole.SuperAdmin)
+      expect(typeof res.body.createdAt).toBe('string')
+      expect(typeof res.body.updatedAt).toBe('string')
+    })
+  })
+
+  /**
+   * OA-08: admin list endpoints validate `page`/`limit` via Zod and
+   * return the paginated envelope `{ data, total, page, limit }`.
+   * Invalid input maps to a clean field-level 400, not a Prisma
+   * 500 (the old behavior). Organization list also enforces the
+   * Prisma `select` allowlist — `aclVersion` (ADR-035 internal RBAC
+   * counter) never appears on the wire.
+   */
+  describe('OA-08: pagination validation', () => {
+    it('GET /admin/users without query returns defaults page=1 limit=20', async () => {
+      const { userId } = await registerAndGetToken('superadmin@example.com')
+      const superToken = await promoteToSuperAdmin(userId)
+
+      const res = await request(app.getHttpServer())
+        .get('/admin/users')
+        .set('Authorization', `Bearer ${superToken}`)
+        .expect(200)
+
+      expect(res.body.page).toBe(1)
+      expect(res.body.limit).toBe(20)
+      expect(typeof res.body.total).toBe('number')
+    })
+
+    it('GET /admin/users with valid pagination respects page+limit', async () => {
+      const { userId } = await registerAndGetToken('superadmin@example.com')
+      await registerAndGetToken('other-1@example.com')
+      await registerAndGetToken('other-2@example.com')
+      const superToken = await promoteToSuperAdmin(userId)
+
+      const res = await request(app.getHttpServer())
+        .get('/admin/users?page=2&limit=2')
+        .set('Authorization', `Bearer ${superToken}`)
+        .expect(200)
+
+      expect(res.body.page).toBe(2)
+      expect(res.body.limit).toBe(2)
+      expect(res.body.data.length).toBeLessThanOrEqual(2)
+    })
+
+    it.each([
+      ['?page=abc', 'page=abc'],
+      ['?page=0', 'page=0'],
+      ['?page=-1', 'page=-1'],
+      ['?limit=0', 'limit=0'],
+      ['?limit=-5', 'limit=-5'],
+      ['?limit=101', 'limit=101'],
+      ['?limit=abc', 'limit=abc'],
+    ])('GET /admin/users %s → 400', async (qs) => {
+      const { userId } = await registerAndGetToken('superadmin@example.com')
+      const superToken = await promoteToSuperAdmin(userId)
+
+      await request(app.getHttpServer())
+        .get(`/admin/users${qs}`)
+        .set('Authorization', `Bearer ${superToken}`)
+        .expect(400)
+    })
+
+    it('GET /admin/organizations rejects invalid limit with 400', async () => {
+      const { userId } = await registerAndGetToken('superadmin@example.com')
+      const superToken = await promoteToSuperAdmin(userId)
+
+      await request(app.getHttpServer())
+        .get('/admin/organizations?limit=999')
+        .set('Authorization', `Bearer ${superToken}`)
+        .expect(400)
+    })
+
+    it('GET /admin/organizations returns envelope without aclVersion', async () => {
+      const { userId, token: userToken } = await registerAndGetToken('superadmin@example.com')
+      await request(app.getHttpServer())
+        .post('/organizations')
+        .set('Authorization', `Bearer ${userToken}`)
+        .send({ name: 'Pagination Test Org' })
+        .expect(201)
+      const superToken = await promoteToSuperAdmin(userId)
+
+      const res = await request(app.getHttpServer())
+        .get('/admin/organizations')
+        .set('Authorization', `Bearer ${superToken}`)
+        .expect(200)
+
+      expect(res.body.page).toBe(1)
+      expect(res.body.limit).toBe(20)
+      expect(res.body.data.length).toBeGreaterThan(0)
+      for (const org of res.body.data) {
+        expect(org).not.toHaveProperty('aclVersion')
+        expect(typeof org.createdAt).toBe('string')
+        expect(typeof org.updatedAt).toBe('string')
+      }
+    })
+  })
+
+  describe('PATCH /admin/users/:id', () => {
+    it('promotes user to SUPER_ADMIN', async () => {
+      const { userId: targetId } = await registerAndGetToken('target@example.com')
+      const { userId: adminId } = await registerAndGetToken('superadmin@example.com')
+      const superToken = await promoteToSuperAdmin(adminId)
+
+      const res = await request(app.getHttpServer())
+        .patch(`/admin/users/${targetId}`)
+        .set('Authorization', `Bearer ${superToken}`)
+        .send({ systemRole: SystemRole.SuperAdmin })
+        .expect(200)
+
+      expect(res.body.systemRole).toBe(SystemRole.SuperAdmin)
+    })
+
+    it('returns 404 for non-existent user', async () => {
+      const { userId } = await registerAndGetToken('superadmin@example.com')
+      const superToken = await promoteToSuperAdmin(userId)
+
+      await request(app.getHttpServer())
+        .patch('/admin/users/nonexistent-id')
+        .set('Authorization', `Bearer ${superToken}`)
+        .send({ systemRole: SystemRole.User })
+        .expect(404)
+    })
+  })
+
+  /**
+   * OB-03: privileged admin operations narrow the global default policy
+   * per-handler via `@RateLimit(RATE_LIMIT_POLICIES.EXPENSIVE_ACTION)`
+   * (`rate: 5, per: 60_000, burst: 5`, ADR-073). Storage is reset between
+   * tests via `cleanDatabase`, so the 6th call here is the first one to
+   * exhaust the per-handler override — the test does NOT depend on what
+   * the first 5 cleanups actually did (counts vary because cleanup
+   * mutates DB state), only that the rate-limit gate fires.
+   *
+   * Why per-handler `@RateLimit(...)` and not a global policy change:
+   * narrowing the global `DEFAULT` policy itself would apply the admin
+   * limit to every route in the API (caught in Stage 7 final-e2e when
+   * login-burst tests regressed). The per-handler override stays local.
+   *
+   * If this test ever proves flaky on CI under load, drop it — the GCRA
+   * limiter's own properties are covered by
+   * `gcra-redis-limiter.service.e2e-spec.ts`/`gcra-memory-limiter.spec.ts`,
+   * and the decorator metadata is verified by
+   * `rate-limit-decorator-coverage.spec.ts`. We prefer one focused e2e
+   * over duplicating that coverage here.
+   */
+  describe('OB-03: admin operations throttle on 6th rapid call', () => {
+    it('POST /admin/cleanup → 429 on the 6th call within the EXPENSIVE_ACTION override', async () => {
+      const { userId } = await registerAndGetToken('superadmin@example.com')
+      const superToken = await promoteToSuperAdmin(userId)
+
+      for (let i = 0; i < 5; i++) {
+        await request(app.getHttpServer())
+          .post('/admin/cleanup')
+          .set('Authorization', `Bearer ${superToken}`)
+          .expect(200)
+      }
+
+      await request(app.getHttpServer())
+        .post('/admin/cleanup')
+        .set('Authorization', `Bearer ${superToken}`)
+        .expect(429)
+    })
+
+    /**
+     * ADR-073: RateLimitGuard must run before AuthenticationGuard
+     * (ThrottlingModule is imported ahead of AuthModule in app-imports.ts).
+     * Proven structurally, not asserted: every one of 6 *unauthenticated*
+     * requests to this EXPENSIVE_ACTION-limited route would 401 if
+     * AuthenticationGuard ran first — none would ever reach the rate
+     * limiter, so none could ever 429. Getting a 429 on the 6th call proves
+     * the opposite order: the first 5 were admitted by the rate limiter and
+     * only then rejected as unauthenticated (401); the 6th never reached
+     * AuthenticationGuard at all.
+     */
+    it('rate-limits before authenticating — 401 on calls 1-5, 429 on call 6, all unauthenticated', async () => {
+      for (let i = 0; i < 5; i++) {
+        await request(app.getHttpServer()).post('/admin/cleanup').expect(401)
+      }
+
+      await request(app.getHttpServer()).post('/admin/cleanup').expect(429)
+    })
+  })
+
+  /**
+   * OA-09: protect SUPER_ADMIN role transitions.
+   *
+   * Self-demotion (foot-gun protection) is the only path that the
+   * API can reach the last-SA guard through — `SystemRolesGuard`
+   * requires the actor to be SUPER_ADMIN, so a non-self demotion
+   * always has the actor as another SUPER_ADMIN. The unit test in
+   * `admin.service.spec.ts` locks down the in-transaction last-SA
+   * guard for the defense-in-depth case; here we cover what users
+   * actually see on the wire.
+   */
+  describe('OA-09: protect SUPER_ADMIN role transitions', () => {
+    it('denies self-demotion with 400 + BUSINESS_RULE_VIOLATION', async () => {
+      const { userId } = await registerAndGetToken('superadmin@example.com')
+      const superToken = await promoteToSuperAdmin(userId)
+
+      const res = await request(app.getHttpServer())
+        .patch(`/admin/users/${userId}`)
+        .set('Authorization', `Bearer ${superToken}`)
+        .send({ systemRole: SystemRole.User })
+        .expect(400)
+
+      expect(res.body.errorCode).toBe('BUSINESS_RULE_VIOLATION')
+    })
+
+    it('demotes target SUPER_ADMIN when another SUPER_ADMIN exists', async () => {
+      const { userId: targetId } = await registerAndGetToken('peer-sa@example.com')
+      await prisma.user.update({
+        where: { id: targetId },
+        data: { systemRole: 'SUPER_ADMIN' },
+      })
+      const { userId: actorId } = await registerAndGetToken('superadmin@example.com')
+      const superToken = await promoteToSuperAdmin(actorId)
+
+      const res = await request(app.getHttpServer())
+        .patch(`/admin/users/${targetId}`)
+        .set('Authorization', `Bearer ${superToken}`)
+        .send({ systemRole: SystemRole.User })
+        .expect(200)
+
+      expect(res.body.systemRole).toBe(SystemRole.User)
+    })
+
+    it('no-op same-role request returns 200 with current role unchanged', async () => {
+      const { userId: targetId } = await registerAndGetToken('target-noop@example.com')
+      const { userId: actorId } = await registerAndGetToken('superadmin@example.com')
+      const superToken = await promoteToSuperAdmin(actorId)
+
+      const res = await request(app.getHttpServer())
+        .patch(`/admin/users/${targetId}`)
+        .set('Authorization', `Bearer ${superToken}`)
+        .send({ systemRole: SystemRole.User })
+        .expect(200)
+
+      expect(res.body.systemRole).toBe(SystemRole.User)
+    })
+  })
+
+  describe('POST /admin/cleanup', () => {
+    it('returns cleanup counts for SUPER_ADMIN', async () => {
+      const { userId } = await registerAndGetToken('superadmin@example.com')
+      const superToken = await promoteToSuperAdmin(userId)
+
+      const res = await request(app.getHttpServer())
+        .post('/admin/cleanup')
+        .set('Authorization', `Bearer ${superToken}`)
+        .expect(200)
+
+      expect(res.body).toMatchObject({
+        expiredSessions: expect.any(Number),
+        expiredPasswordResetTokens: expect.any(Number),
+        expiredEmailVerificationTokens: expect.any(Number),
+        staleTerminalApiKeys: expect.any(Number),
+        expiredPendingInvites: expect.any(Number),
+        staleTerminalInvites: expect.any(Number),
+        expiredSupportMailAttempts: 0,
+        failures: [], // EQS-04: per-type failures surfaced; empty on success
+      })
+    })
+
+    it('returns 403 for regular USER', async () => {
+      const { token } = await registerAndGetToken('user@example.com')
+
+      await request(app.getHttpServer())
+        .post('/admin/cleanup')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(403)
+    })
+  })
+
+  describe('GET /admin/organizations', () => {
+    it('returns all organizations for SUPER_ADMIN', async () => {
+      const { userId } = await registerAndGetToken('superadmin@example.com')
+      const superToken = await promoteToSuperAdmin(userId)
+
+      // Use the admitted family after promotion; the earlier token lost authority.
+      await request(app.getHttpServer())
+        .post('/organizations')
+        .set('Authorization', `Bearer ${superToken}`)
+        .send({ name: 'Test Org' })
+        .expect(201)
+
+      const res = await request(app.getHttpServer())
+        .get('/admin/organizations')
+        .set('Authorization', `Bearer ${superToken}`)
+        .expect(200)
+
+      expect(res.body.total).toBeGreaterThanOrEqual(1)
+      expect(Array.isArray(res.body.data)).toBe(true)
+    })
+  })
+
+  describe('GET /admin/overview', () => {
+    it('returns 401 without a bearer token', async () => {
+      await request(app.getHttpServer()).get('/admin/overview').expect(401)
+    })
+
+    it('returns 403 for a regular USER', async () => {
+      const { token } = await registerAndGetToken('user-overview@example.com')
+
+      await request(app.getHttpServer())
+        .get('/admin/overview')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(403)
+    })
+
+    it('returns 200 with readiness, sanitized dependencies, version and process role for SUPER_ADMIN', async () => {
+      const { userId } = await registerAndGetToken('superadmin@example.com')
+      const superToken = await promoteToSuperAdmin(userId)
+
+      const res = await request(app.getHttpServer())
+        .get('/admin/overview')
+        .set('Authorization', `Bearer ${superToken}`)
+        .expect(200)
+
+      expect(adminOverviewResponseSchema.parse(res.body)).toEqual(res.body)
+      expect(res.body.resources.pool.status).toBe('available')
+      expect(res.body.resources.memory.status).toBe('available')
+      expect(res.body.process.uptimeSeconds).toBeGreaterThanOrEqual(0)
+      expect(res.headers['cache-control']).toBe('private, no-store')
+      expect(res.body).toMatchObject({
+        readiness: 'ready',
+        dependencies: expect.arrayContaining([
+          expect.objectContaining({ name: 'database', status: 'up' }),
+          expect.objectContaining({ name: 'redis', status: 'up' }),
+        ]),
+        version: expect.any(String),
+        processRole: expect.stringMatching(/^(web|worker|all)$/),
+      })
+      // Every dependency status is one of the allowlisted values — no raw
+      // indicator message/detail field leaks onto the wire.
+      for (const dep of res.body.dependencies) {
+        expect(Object.keys(dep).sort()).toEqual(['name', 'status'])
+        expect(['up', 'down', 'degraded', 'unknown']).toContain(dep.status)
+      }
+    })
+  })
+
+  /**
+   * OA-02: admin routes are bearer-only.
+   *
+   * `SystemRolesGuard` only checks `user.systemRole`; it does not look
+   * at credential type or scopes. The principal an `ApiKeyGuard` builds
+   * inherits `systemRole` from the owning user, so a SUPER_ADMIN-owned
+   * API key with a deliberately narrow scope (`read:User`) would pass
+   * the system-role check and reach the admin handler without any
+   * scope intersection — `/admin/**` has no `@CheckPolicies`, so the
+   * CASL ability built from `userPerms ∩ scopes` is not consulted.
+   *
+   * Class-level `@Auth(AuthType.Bearer)` on `AdminController` closes
+   * this: the auth chain skips the API-key branch entirely, and an
+   * `amcore_live_...` bearer fails the JWT branch as 401.
+   *
+   * Coverage strategy: the SUPER_ADMIN-owned key is the actual
+   * vulnerability — a USER-owned key would also have been stopped by
+   * `SystemRolesGuard`. We assert SUPER_ADMIN denial on every route
+   * (each handler must be inside the class-level decorator's reach),
+   * plus a USER-owned sanity case on one route to prove the
+   * auth-type policy fires first.
+   */
+  describe('OA-02: api keys cannot reach admin routes', () => {
+    /**
+     * Promotes the user to SUPER_ADMIN, creates an org owned by them,
+     * issues an API key bound to that org with a deliberately narrow
+     * scope, and returns the raw key plus the org id. Returns the
+     * fresh SUPER_ADMIN JWT so callers can also confirm positive
+     * SUPER_ADMIN access on the same routes if needed.
+     */
+    async function setupSuperAdminWithKey() {
+      const { userId } = await registerAndGetToken('superadmin@example.com')
+      const superToken = await promoteToSuperAdmin(userId)
+
+      const orgRes = await request(app.getHttpServer())
+        .post('/organizations')
+        .set('Authorization', `Bearer ${superToken}`)
+        .send({ name: 'Admin Org' })
+        .expect(201)
+      const orgId = orgRes.body.id as string
+
+      const keyRes = await request(app.getHttpServer())
+        .post('/api-keys')
+        .set('Authorization', `Bearer ${superToken}`)
+        .send({ name: 'Privileged attacker key', organizationId: orgId, scopes: ['read:User'] })
+        .expect(201)
+      return { apiKey: keyRes.body.key as string, superToken, userId }
+    }
+
+    /**
+     * USER-owned API key is also rejected at the auth-type layer.
+     * `SystemRolesGuard` would have stopped this credential too, but
+     * the denial must surface from the auth chain before any
+     * system-role decision so that `@Auth(AuthType.Bearer)` is the
+     * single authoritative gate.
+     */
+    it('USER-owned API key → GET /admin/users → 401', async () => {
+      const { token } = await registerAndGetToken('user@example.com')
+
+      const orgRes = await request(app.getHttpServer())
+        .post('/organizations')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ name: 'User Org' })
+        .expect(201)
+
+      const keyRes = await request(app.getHttpServer())
+        .post('/api-keys')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ name: 'Regular key', organizationId: orgRes.body.id, scopes: ['read:User'] })
+        .expect(201)
+
+      await request(app.getHttpServer())
+        .get('/admin/users')
+        .set('Authorization', `Bearer ${keyRes.body.key}`)
+        .expect(401)
+    })
+
+    it('SUPER_ADMIN-owned API key authenticates on /auth/me (sanity)', async () => {
+      const { apiKey } = await setupSuperAdminWithKey()
+
+      // Sanity: the key is well-formed and the owner's role does not
+      // get rejected elsewhere — every 401 below is the auth-type
+      // policy at /admin, not a malformed credential.
+      await request(app.getHttpServer())
+        .get('/auth/me')
+        .set('Authorization', `Bearer ${apiKey}`)
+        .expect(200)
+    })
+
+    it('SUPER_ADMIN-owned API key → GET /admin/users → 401', async () => {
+      const { apiKey } = await setupSuperAdminWithKey()
+
+      await request(app.getHttpServer())
+        .get('/admin/users')
+        .set('Authorization', `Bearer ${apiKey}`)
+        .expect(401)
+    })
+
+    it('SUPER_ADMIN-owned API key → GET /admin/access → 401', async () => {
+      const { apiKey } = await setupSuperAdminWithKey()
+
+      await request(app.getHttpServer())
+        .get('/admin/access')
+        .set('Authorization', `Bearer ${apiKey}`)
+        .expect(401)
+    })
+
+    it('SUPER_ADMIN-owned API key → PATCH /admin/users/:id → 401', async () => {
+      const { apiKey, userId } = await setupSuperAdminWithKey()
+
+      await request(app.getHttpServer())
+        .patch(`/admin/users/${userId}`)
+        .set('Authorization', `Bearer ${apiKey}`)
+        .send({ systemRole: SystemRole.User })
+        .expect(401)
+    })
+
+    it('SUPER_ADMIN-owned API key → POST /admin/cleanup → 401', async () => {
+      const { apiKey } = await setupSuperAdminWithKey()
+
+      await request(app.getHttpServer())
+        .post('/admin/cleanup')
+        .set('Authorization', `Bearer ${apiKey}`)
+        .expect(401)
+    })
+
+    it('SUPER_ADMIN-owned API key → GET /admin/organizations → 401', async () => {
+      const { apiKey } = await setupSuperAdminWithKey()
+
+      await request(app.getHttpServer())
+        .get('/admin/organizations')
+        .set('Authorization', `Bearer ${apiKey}`)
+        .expect(401)
+    })
+
+    it('SUPER_ADMIN-owned API key → GET /admin/overview → 401', async () => {
+      const { apiKey } = await setupSuperAdminWithKey()
+
+      await request(app.getHttpServer())
+        .get('/admin/overview')
+        .set('Authorization', `Bearer ${apiKey}`)
+        .expect(401)
+    })
+  })
+
+  /**
+   * OB-06a (ADR-037): privileged-role freshness. `SystemRolesGuard` grants
+   * SUPER_ADMIN only when the JWT claim AND the current DB role are both
+   * SUPER_ADMIN (direct DB read). A system-role change also revokes the
+   * target's sessions, so a promotion cannot silently elevate an existing
+   * refresh session and a demoted admin is signed out.
+   */
+  describe('OB-06a: privileged-role freshness', () => {
+    async function makeSuperAdmin(email: string) {
+      const { userId } = await registerAndGetToken(email)
+      await prisma.user.update({ where: { id: userId }, data: { systemRole: 'SUPER_ADMIN' } })
+      const res = await loginDomainOperator(context, { email, password: 'StrongP@ss123' })
+      return {
+        userId,
+        token: res.body.accessToken as string,
+        cookie: res.headers['set-cookie'] as unknown as string[],
+      }
+    }
+
+    it('positive control: a genuine SUPER_ADMIN (claim ∩ DB) is allowed', async () => {
+      const a = await makeSuperAdmin('admin-a@example.com')
+
+      await request(app.getHttpServer())
+        .get('/admin/users')
+        .set('Authorization', `Bearer ${a.token}`)
+        .expect(200)
+    })
+
+    it('T1: a demoted SUPER_ADMIN is denied on the next request with the pre-demotion token', async () => {
+      const a = await makeSuperAdmin('admin-a@example.com')
+      const b = await makeSuperAdmin('admin-b@example.com')
+
+      // B works while genuinely SUPER_ADMIN.
+      await request(app.getHttpServer())
+        .get('/admin/users')
+        .set('Authorization', `Bearer ${b.token}`)
+        .expect(200)
+
+      // A demotes B (another SUPER_ADMIN exists → allowed).
+      await request(app.getHttpServer())
+        .patch(`/admin/users/${b.userId}`)
+        .set('Authorization', `Bearer ${a.token}`)
+        .send({ systemRole: SystemRole.User })
+        .expect(200)
+
+      // B's still-valid pre-demotion token is now denied: claim SA ∩ DB USER.
+      await request(app.getHttpServer())
+        .get('/admin/users')
+        .set('Authorization', `Bearer ${b.token}`)
+        .expect(409)
+        .expect(({ body }) => expect(body.errorCode).toBe('SESSION_CHANGED'))
+    })
+
+    it('denies a demoted SUPER_ADMIN on the next access-probe request', async () => {
+      const a = await makeSuperAdmin('access-admin-a@example.com')
+      const b = await makeSuperAdmin('access-admin-b@example.com')
+
+      await request(app.getHttpServer())
+        .get('/admin/access')
+        .set('Authorization', `Bearer ${b.token}`)
+        .expect(204)
+
+      await request(app.getHttpServer())
+        .patch(`/admin/users/${b.userId}`)
+        .set('Authorization', `Bearer ${a.token}`)
+        .send({ systemRole: SystemRole.User })
+        .expect(200)
+
+      await request(app.getHttpServer())
+        .get('/admin/access')
+        .set('Authorization', `Bearer ${b.token}`)
+        .expect(409)
+        .expect(({ body }) => expect(body.errorCode).toBe('SESSION_CHANGED'))
+    })
+
+    it('denies a demoted SUPER_ADMIN on the next overview request', async () => {
+      const a = await makeSuperAdmin('overview-admin-a@example.com')
+      const b = await makeSuperAdmin('overview-admin-b@example.com')
+
+      await request(app.getHttpServer())
+        .get('/admin/overview')
+        .set('Authorization', `Bearer ${b.token}`)
+        .expect(200)
+
+      await request(app.getHttpServer())
+        .patch(`/admin/users/${b.userId}`)
+        .set('Authorization', `Bearer ${a.token}`)
+        .send({ systemRole: SystemRole.User })
+        .expect(200)
+
+      await request(app.getHttpServer())
+        .get('/admin/overview')
+        .set('Authorization', `Bearer ${b.token}`)
+        .expect(409)
+        .expect(({ body }) => expect(body.errorCode).toBe('SESSION_CHANGED'))
+    })
+
+    it('T1: a demoted SUPER_ADMIN cannot refresh (sessions revoked)', async () => {
+      const a = await makeSuperAdmin('admin-a@example.com')
+      const b = await makeSuperAdmin('admin-b@example.com')
+
+      await request(app.getHttpServer())
+        .patch(`/admin/users/${b.userId}`)
+        .set('Authorization', `Bearer ${a.token}`)
+        .send({ systemRole: SystemRole.User })
+        .expect(200)
+
+      await request(app.getHttpServer()).post('/auth/refresh').set('Cookie', b.cookie).expect(401)
+    })
+
+    it('T4: a promotion does not elevate the old USER-claim token, and revokes its refresh session', async () => {
+      const a = await makeSuperAdmin('admin-a@example.com')
+
+      const reg = await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email: 'promoted@example.com', password: 'StrongP@ss123' })
+        .expect(201)
+      const promotedId = reg.body.user.id as string
+      const oldUserToken = reg.body.accessToken as string
+      const oldCookie = reg.headers['set-cookie'] as unknown as string[]
+
+      // Sanity: USER cannot reach admin.
+      await request(app.getHttpServer())
+        .get('/admin/users')
+        .set('Authorization', `Bearer ${oldUserToken}`)
+        .expect(403)
+
+      // A promotes the user to SUPER_ADMIN.
+      await request(app.getHttpServer())
+        .patch(`/admin/users/${promotedId}`)
+        .set('Authorization', `Bearer ${a.token}`)
+        .send({ systemRole: SystemRole.SuperAdmin })
+        .expect(200)
+
+      // Promotion revokes the old family; its USER claim cannot gain operator rights.
+      await request(app.getHttpServer())
+        .get('/admin/users')
+        .set('Authorization', `Bearer ${oldUserToken}`)
+        .expect(409)
+        .expect(({ body }) => expect(body.errorCode).toBe('SESSION_CHANGED'))
+
+      // The old refresh session was revoked on promotion → cannot silently mint an SA token.
+      await request(app.getHttpServer()).post('/auth/refresh').set('Cookie', oldCookie).expect(401)
+
+      // Only a fresh re-login yields a working SUPER_ADMIN token.
+      const relogin = await loginDomainOperator(context, {
+        email: 'promoted@example.com',
+        password: 'StrongP@ss123',
+      })
+      await request(app.getHttpServer())
+        .get('/admin/users')
+        .set('Authorization', `Bearer ${relogin.body.accessToken}`)
+        .expect(200)
+    })
+  })
+
+  /**
+   * OB-06b (ADR-037): step-up. Destructive admin mutations
+   * (`PATCH /admin/users/:id`, `POST /admin/cleanup`) require the actor's
+   * session to have been (re)authenticated within the step-up window. Listing
+   * routes are unaffected. Sessions are aged deterministically via Prisma.
+   */
+  describe('OB-06b: step-up for destructive admin ops', () => {
+    const PASSWORD = 'StrongP@ss123'
+
+    async function makeSuperAdmin(email: string) {
+      const reg = await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email, password: PASSWORD })
+        .expect(201)
+      await prisma.user.update({
+        where: { id: reg.body.user.id as string },
+        data: { systemRole: 'SUPER_ADMIN' },
+      })
+      const login = await loginDomainOperator(context, { email, password: PASSWORD })
+      return {
+        userId: reg.body.user.id as string,
+        token: login.body.accessToken as string,
+        cookie: login.headers['set-cookie'] as unknown as string[],
+      }
+    }
+
+    // Age the actor's live sessions past the 10-min step-up window.
+    async function ageSessions(userId: string) {
+      await prisma.authSessionFamily.updateMany({
+        where: { userId, revokedAt: null },
+        data: {
+          primaryAt: new Date(Date.now() - 60 * 60 * 1000),
+          mfaAt: new Date(Date.now() - 60 * 60 * 1000),
+        },
+      })
+    }
+
+    it('listing routes are unaffected by stale auth', async () => {
+      const a = await makeSuperAdmin('sa-listing@example.com')
+      await ageSessions(a.userId)
+
+      await request(app.getHttpServer())
+        .get('/admin/users')
+        .set('Authorization', `Bearer ${a.token}`)
+        .expect(200)
+    })
+
+    it('stale session → 403 STEP_UP_REQUIRED on a destructive op', async () => {
+      const a = await makeSuperAdmin('sa-stale@example.com')
+      const { userId: targetId } = await registerAndGetToken('target-stale@example.com')
+      await ageSessions(a.userId)
+
+      const res = await request(app.getHttpServer())
+        .patch(`/admin/users/${targetId}`)
+        .set('Authorization', `Bearer ${a.token}`)
+        .send({ systemRole: SystemRole.SuperAdmin })
+        .expect(403)
+
+      expect(res.body.errorCode).toBe('STEP_UP_REQUIRED')
+    })
+
+    it('step-up refreshes the session and unblocks the destructive op', async () => {
+      const a = await makeSuperAdmin('sa-stepup@example.com')
+      const { userId: targetId } = await registerAndGetToken('target-stepup@example.com')
+      await ageSessions(a.userId)
+
+      await request(app.getHttpServer())
+        .patch(`/admin/users/${targetId}`)
+        .set('Authorization', `Bearer ${a.token}`)
+        .send({ systemRole: SystemRole.SuperAdmin })
+        .expect(403)
+
+      await reauthenticateDomainOperator(context, a.token, PASSWORD)
+
+      // Server-side session freshness: the same token now passes.
+      await request(app.getHttpServer())
+        .patch(`/admin/users/${targetId}`)
+        .set('Authorization', `Bearer ${a.token}`)
+        .send({ systemRole: SystemRole.SuperAdmin })
+        .expect(200)
+    })
+
+    it('refresh alone does NOT satisfy step-up (freshness carried, not renewed)', async () => {
+      const a = await makeSuperAdmin('sa-refresh@example.com')
+      const { userId: targetId } = await registerAndGetToken('target-refresh@example.com')
+      await ageSessions(a.userId)
+
+      const refreshed = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .set('Cookie', a.cookie)
+        .expect(200)
+
+      const res = await request(app.getHttpServer())
+        .patch(`/admin/users/${targetId}`)
+        .set('Authorization', `Bearer ${refreshed.body.accessToken}`)
+        .send({ systemRole: SystemRole.SuperAdmin })
+        .expect(403)
+
+      expect(res.body.errorCode).toBe('STEP_UP_REQUIRED')
+    })
+
+    it('legacy protected token without family authority cannot list or mutate', async () => {
+      const a = await makeSuperAdmin('sa-nosid@example.com')
+      const { userId: targetId } = await registerAndGetToken('target-nosid@example.com')
+
+      const legacyToken = signAccessToken(app, {
+        sub: a.userId,
+        email: 'sa-nosid@example.com',
+        systemRole: 'SUPER_ADMIN',
+      })
+
+      await request(app.getHttpServer())
+        .get('/admin/users')
+        .set('Authorization', `Bearer ${legacyToken}`)
+        .expect(409)
+
+      const res = await request(app.getHttpServer())
+        .patch(`/admin/users/${targetId}`)
+        .set('Authorization', `Bearer ${legacyToken}`)
+        .send({ systemRole: SystemRole.SuperAdmin })
+        .expect(409)
+
+      expect(res.body.errorCode).toBe('SESSION_CHANGED')
+    })
+
+    it('protected token without a live family fails before any password check', async () => {
+      const a = await makeSuperAdmin('sa-oracle@example.com')
+      // sid points at a session that does not exist → fail closed regardless of
+      // the password, so step-up cannot be used to probe credentials.
+      const ghostToken = signAccessToken(app, {
+        sub: a.userId,
+        email: 'sa-oracle@example.com',
+        systemRole: 'SUPER_ADMIN',
+        sid: 'ghost-session-id',
+      })
+
+      const res = await request(app.getHttpServer())
+        .post('/auth/step-up')
+        .set('Authorization', `Bearer ${ghostToken}`)
+        .send({ password: PASSWORD })
+        .expect(409)
+
+      expect(res.body.errorCode).toBe('SESSION_CHANGED')
+    })
+
+    it('password-less (OAuth-only) account with a live session → STEP_UP_METHOD_UNAVAILABLE', async () => {
+      const user = await prisma.user.create({
+        data: {
+          email: 'oauth-only@example.com',
+          emailCanonical: 'oauth-only@example.com',
+          systemRole: 'USER',
+          passwordHash: null,
+        },
+      })
+      // A real live session so the live-session precheck passes and the flow
+      // reaches the password-less branch.
+      const session = await prisma.session.create({
+        data: {
+          userId: user.id,
+          familyId: 'fam-oauth-only',
+          refreshToken: 'oauth-only-refresh-hash',
+          expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+          lastAuthAt: new Date(),
+        },
+      })
+      const token = signAccessToken(app, {
+        sub: user.id,
+        email: user.email,
+        systemRole: 'USER',
+        sid: session.id,
+      })
+
+      const res = await request(app.getHttpServer())
+        .post('/auth/step-up')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ password: 'whatever' })
+        .expect(403)
+
+      expect(res.body.errorCode).toBe('STEP_UP_METHOD_UNAVAILABLE')
+    })
+  })
+})

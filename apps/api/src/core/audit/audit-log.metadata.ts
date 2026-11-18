@@ -1,0 +1,420 @@
+import type { Prisma } from '../../generated/prisma/client.js'
+
+import type { AuditAction } from './audit-log.actions.js'
+
+const memberKeyCount = (value: unknown): number | undefined =>
+  typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 1000
+    ? value
+    : undefined
+
+interface MetadataSpec {
+  [key: string]: MetadataRule
+}
+
+type MetadataRule = MetadataSpec | PrimitiveArrayRule | MetadataValueRule | true
+type Primitive = boolean | number | string | null
+type PrimitiveArrayRule = 'number[]' | 'string[]'
+/** A custom bounded-value rule: returns the accepted primitive, or `undefined` to drop the field. */
+type MetadataValueRule = (value: unknown) => Primitive | Prisma.JsonArray | undefined
+
+/** Accept a string only when it is within `maxLength` and matches `pattern`; else drop the field. */
+function boundedString(maxLength: number, pattern: RegExp): MetadataValueRule {
+  return (value) =>
+    typeof value === 'string' && value.length <= maxLength && pattern.test(value)
+      ? value
+      : undefined
+}
+
+/** A bounded lowercase snake code — toolId, riskClass, outcome, decision, reasonCode (Arc E). */
+const aiCode = boundedString(64, /^[a-z][a-z0-9_]*$/)
+const auditFilterFlag: MetadataValueRule = (value) =>
+  typeof value === 'boolean' ? value : undefined
+const auditResultCount: MetadataValueRule = (value) =>
+  typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 50
+    ? value
+    : undefined
+/** Same shape as `auditResultCount`, bounded to `PAGINATION.MAX_LIMIT` (100) for admin list reads whose page size isn't capped at 50. */
+const boundedResultCount: MetadataValueRule = (value) =>
+  typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 100
+    ? value
+    : undefined
+const memberRoleCount: MetadataValueRule = (value) =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= 2_147_483_647
+    ? value
+    : undefined
+/** A bounded cuid-shaped id — runId, invocationId, approvalId (Arc E). */
+const aiId = boundedString(64, /^[a-z0-9]+$/)
+/** A bounded assistant slug — lowercase alnum + hyphen (Arc F). */
+const aiSlug = boundedString(64, /^[a-z0-9][a-z0-9-]*$/)
+/**
+ * An operator-supplied takeover reason / ticket ref (Arc F, D1 constraint). NOT transcript content — a
+ * bounded justification the owner requires for privileged-access accountability. Accepted only when it
+ * is a non-empty string ≤ 200 chars with no control characters (any language); otherwise dropped.
+ */
+const aiReasonRef: MetadataValueRule = (value) => {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 200) return undefined
+  // No control characters (any language is otherwise allowed - this is a bounded ref, not content).
+  for (let i = 0; i < value.length; i += 1) if (value.charCodeAt(i) < 0x20) return undefined
+  return value
+}
+
+const cleanupCounts: MetadataSpec = {
+  staleTerminalApiKeys: true,
+  expiredEmailVerificationTokens: true,
+  expiredPasswordResetTokens: true,
+  expiredPendingInvites: true,
+  expiredSessions: true,
+  failures: 'string[]',
+  staleTerminalInvites: true,
+  expiredSupportMailAttempts: true,
+}
+
+const commonSpec: MetadataSpec = { emailHash: true, pinoEvent: true }
+
+/**
+ * AI tool-loop + approval audit metadata (Track C — ADR-054, Arc E). Every allowed key is a bounded,
+ * content-free identifier or code — never tool args, tool result, prompt, provider body, or user
+ * text. `toolId`/`riskClass`/`invocationId`/`runId` describe *what* acted; `approvalId`/`decision`/
+ * `reasonCode`/`outcome` describe the gate/result.
+ */
+const aiToolContext: MetadataSpec = {
+  toolId: aiCode,
+  riskClass: aiCode,
+  invocationId: aiId,
+  runId: aiId,
+}
+const aiApprovalContext: MetadataSpec = { ...aiToolContext, approvalId: aiId }
+
+/**
+ * AI assistant-admin audit metadata (Track C — ADR-054, Arc F.1). Bounded and content-free — the
+ * assistant `systemPrompt`/model/tool config is NEVER audited; only which version of which slug
+ * changed and its enabled state.
+ */
+const aiAssistantContext: MetadataSpec = { slug: aiSlug, version: true, enabled: true }
+
+/**
+ * AI conversation takeover/release audit metadata (Track C — ADR-054, Arc F). Content-free: the
+ * generation transition, the resulting control, the actor's role, how many bot runs were superseded,
+ * and the operator's bounded reason/ticket ref (never transcript/prompt content).
+ */
+const aiConversationControlContext: MetadataSpec = {
+  conversationId: aiId,
+  fromGeneration: true,
+  toGeneration: true,
+  control: aiCode,
+  actorRole: aiCode,
+  supersededRuns: true,
+  voidedApprovals: true,
+  reasonRef: aiReasonRef,
+}
+
+/**
+ * Role-definition audit metadata: the actor's credential type, ids and counts only. A role's name,
+ * description and stored conditions, member emails and holder lists are never audited.
+ */
+const roleDefinitionAuditMetadata: MetadataSpec = {
+  actorCredentialType: boundedString(7, /^(jwt|api_key)$/),
+  roleId: boundedString(128, /^[A-Za-z0-9_-]+$/),
+  revisionBefore: memberRoleCount,
+  revisionAfter: memberRoleCount,
+  addedPresetCount: memberRoleCount,
+  removedPresetCount: memberRoleCount,
+  fullControl: boundedString(5, /^(added|removed|none)$/),
+  holderCount: memberRoleCount,
+  liveInvitationCount: memberRoleCount,
+  nameChanged: auditFilterFlag,
+  descriptionChanged: auditFilterFlag,
+  source: boundedString(12, /^(editor|legacy)$/),
+}
+
+const backgroundControlMetadata: MetadataSpec = {
+  workId: aiSlug,
+  commandId: boundedString(36, /^[a-f0-9-]{36}$/),
+  dispatchId: boundedString(36, /^[a-f0-9-]{36}$/),
+  incarnation: boundedString(36, /^[a-f0-9-]{36}$/),
+  queueEpoch: boundedString(36, /^[a-f0-9-]{36}$/),
+  jobId: boundedString(128, /^[A-Za-z0-9_-]+$/),
+  operation: boundedString(7, /^(retry|pause|resume|cancel|cleanup)$/),
+  outcome: boundedString(16, /^(prepared|dispatching|applied|rejected|not_attempted|unknown)$/),
+  resolution: boundedString(32, /^(none|acknowledged_unknown|proven_applied|proven_no_effect)$/),
+  reasonCode: boundedString(64, /^[A-Z][A-Z0-9_]*$/),
+  reason: (value) =>
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= 250 &&
+    Buffer.byteLength(value, 'utf8') <= 1024
+      ? value
+      : undefined,
+  snapshotDigest: boundedString(64, /^[a-f0-9]{64}$/),
+  count: auditResultCount,
+  references: (value) =>
+    Array.isArray(value) &&
+    value.length <= 3 &&
+    value.every(
+      (item) =>
+        typeof item === 'string' &&
+        item.length > 0 &&
+        item.length <= 64 &&
+        /^[A-Za-z0-9_-]+$/.test(item)
+    )
+      ? value
+      : undefined,
+}
+
+const administratorCommandMetadata: MetadataSpec = {
+  operationId: true,
+  administratorInvitationId: true,
+  memberId: true,
+  adminGrantId: true,
+  revision: true,
+  changed: true,
+  reason: (value) =>
+    typeof value === 'string' &&
+    value.trim().length > 0 &&
+    value.length <= 500 &&
+    Buffer.byteLength(value, 'utf8') <= 2000 &&
+    !/[\p{Cc}]/u.test(value)
+      ? value
+      : undefined,
+}
+
+const supportMailMetadata: MetadataSpec = {
+  attemptId: boundedString(36, /^[a-f0-9-]{36}$/),
+  kind: boundedString(20, /^(email_verification|password_recovery)$/),
+  provider: boundedString(6, /^(resend|mock)$/),
+  tokenIssued: auditFilterFlag,
+  outcome: boundedString(
+    20,
+    /^(claimed|dispatching|accepted|simulated|refused|not_started|unknown)$/
+  ),
+  reason: aiCode,
+}
+
+const specs: Record<AuditAction, MetadataSpec> = {
+  'admin.user.support_mail_requested': supportMailMetadata,
+  'admin.user.support_mail_dispatching': supportMailMetadata,
+  'admin.user.support_mail_settled': supportMailMetadata,
+  'admin.user.support_mail_refused': supportMailMetadata,
+  'org.administrator_invitation_created': administratorCommandMetadata,
+  'org.administrator_invitation_reissued': administratorCommandMetadata,
+  'org.administrator_invitation_replaced': administratorCommandMetadata,
+  'org.administrator_invitation_cancelled': administratorCommandMetadata,
+  'org.administrator_invitation_completed': administratorCommandMetadata,
+  'org.administrator_assigned': administratorCommandMetadata,
+
+  'background_work.command_intent': backgroundControlMetadata,
+  'background_work.command_outcome': backgroundControlMetadata,
+  'background_work.command_denied': backgroundControlMetadata,
+  'background_work.command_resolution': backgroundControlMetadata,
+  'background_work.evidence_resolution': backgroundControlMetadata,
+  'admin.audit_logs.viewed': {
+    actor: auditFilterFlag,
+    action: auditFilterFlag,
+    target: auditFilterFlag,
+    organization: auditFilterFlag,
+    time: auditFilterFlag,
+    resultCount: auditResultCount,
+  },
+  'organization.api_keys.revocation_requested': {
+    operation: boundedString(6, /^(single|all)$/),
+    memberId: boundedString(128, /^[A-Za-z0-9_-]+$/),
+    requestedCount: memberKeyCount,
+    affectedCount: memberKeyCount,
+    reason: boundedString(26, /^organization_admin_revoked$/),
+  },
+  'organization.member_removed': {
+    memberId: boundedString(128, /^[A-Za-z0-9_-]+$/),
+    selectedKeyCount: memberKeyCount,
+    revokedKeyCount: memberKeyCount,
+    reason: boundedString(18, /^membership_removed$/),
+  },
+  'admin.api_keys.viewed': {
+    search: auditFilterFlag,
+    user: auditFilterFlag,
+    organization: auditFilterFlag,
+    status: auditFilterFlag,
+    id: auditFilterFlag,
+    resultCount: boundedResultCount,
+  },
+  'admin.api_keys.revocation_requested': {
+    requestedCount: boundedResultCount,
+    affectedCount: boundedResultCount,
+    reason: aiCode,
+  },
+  'admin.runtime_setting.changed': {
+    settingKey: true,
+    beforeIntervalSeconds: true,
+    afterIntervalSeconds: true,
+    beforeRevision: true,
+    afterRevision: true,
+  },
+  'integration.email_test_requested': { provider: aiCode },
+  'integration.email_test_settled': { provider: aiCode, outcome: aiCode, class: aiCode },
+  'admin.cleanup.executed': { counts: cleanupCounts },
+  'admin.user.session_revoked': { sessionId: true, count: true },
+  'admin.user.sessions_revoked': { count: true, reason: true },
+  'admin.user.sessions_viewed': { page: true, limit: true, resultCount: boundedResultCount },
+  'admin.user.system_role_changed': { afterSystemRole: true, beforeSystemRole: true },
+  'ai.approval.approved': { ...aiApprovalContext, decision: aiCode },
+  'ai.approval.expired': { ...aiApprovalContext, reasonCode: aiCode },
+  'ai.approval.rejected': { ...aiApprovalContext, decision: aiCode, reasonCode: aiCode },
+  'ai.approval.requested': { ...aiApprovalContext },
+  'ai.assistant.created': { ...aiAssistantContext },
+  'ai.assistant.disabled': { ...aiAssistantContext },
+  'ai.assistant.enabled': { ...aiAssistantContext },
+  'ai.assistant.updated': { ...aiAssistantContext },
+  'ai.assistant.version_published': { ...aiAssistantContext },
+  'ai.conversation.artifact_accessed': {
+    conversationId: aiId,
+    artifactId: aiId,
+    kind: aiCode,
+    actorRole: aiCode,
+    reasonRef: aiReasonRef,
+  },
+  'ai.conversation.operator_message': {
+    conversationId: aiId,
+    messageId: aiId,
+    authorType: aiCode,
+    actorRole: aiCode,
+    reasonRef: aiReasonRef,
+  },
+  'ai.conversation.released': { ...aiConversationControlContext },
+  'ai.conversation.taken_over': { ...aiConversationControlContext },
+  'ai.conversation.transcript_accessed': {
+    conversationId: aiId,
+    actorRole: aiCode,
+    messageCount: true,
+    reasonRef: aiReasonRef,
+  },
+  'ai.tool.execution_failed': { ...aiToolContext, reasonCode: aiCode },
+  'ai.tool.invoked': { ...aiToolContext, outcome: aiCode },
+  'api_key.created': { expiresAt: true, name: true, scopes: 'string[]' },
+  'api_key.revoked': { reason: true },
+  'auth.step_up_failed': { reason: true },
+  'auth.mfa_backup_codes_replaced': {
+    operationId: boundedString(36, /^[a-f0-9-]+$/),
+    generation: true,
+  },
+  'auth.mfa_backup_codes_saved': {
+    operationId: boundedString(36, /^[a-f0-9-]+$/),
+    generation: true,
+  },
+  'auth.mfa_setup_completed': { operationId: boundedString(36, /^[a-f0-9-]+$/), generation: true },
+  'auth.mfa_factor_enrolled': {
+    operationId: boundedString(36, /^[a-f0-9-]+$/),
+    factorVersion: true,
+  },
+  'auth.mfa_factor_replaced': {
+    operationId: boundedString(36, /^[a-f0-9-]+$/),
+    factorVersion: true,
+  },
+  'auth.mfa_protocol_activated': {
+    actorDatabaseRole: boundedString(63, /^[\p{L}\p{M}\p{N}\p{P}\p{S}\p{Zs}]+$/u),
+    evidenceHash: boundedString(64, /^[a-f0-9]{64}$/),
+    sourceCommit: boundedString(64, /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/),
+  },
+  'auth.mfa_offline_recovery_started': {
+    operationId: boundedString(36, /^[a-f0-9-]+$/),
+    actorDatabaseRole: boundedString(63, /^[\p{L}\p{M}\p{N}\p{P}\p{S}\p{Zs}]+$/u),
+    reason: boundedString(256, /^[\p{L}\p{M}\p{N}\p{P}\p{S}\p{Zs}]+$/u),
+  },
+  'auth.mfa_recovery_ticket_redeemed': { operationId: boundedString(36, /^[a-f0-9-]+$/) },
+  'auth.mfa_proof_verified': {
+    operationId: boundedString(36, /^[a-f0-9-]+$/),
+    method: boundedString(13, /^(password|totp|recovery_code)$/),
+  },
+  'auth.mfa_verification_failed': {
+    operationId: boundedString(36, /^[a-f0-9-]+$/),
+    reason: boundedString(20, /^invalid_code$/),
+  },
+  'auth.mfa_backup_code_used': {
+    operationId: boundedString(36, /^[a-f0-9-]+$/),
+    method: boundedString(13, /^recovery_code$/),
+  },
+  'auth.step_up_succeeded': { sessionId: true },
+  'org.created': {
+    source: boundedString(17, /^(self-service|bootstrap-cli|bootstrap-console)$/),
+    userId: aiId,
+    memberId: aiId,
+    adminRoleId: aiId,
+    adminGrantId: aiId,
+  },
+  'org.setup_account_prepared': {
+    source: boundedString(17, /^(bootstrap-cli|bootstrap-console)$/),
+    userId: aiId,
+  },
+  'org.invite_accepted': {
+    actorCredentialType: true,
+    branch: true,
+    generation: true,
+    roleIds: 'string[]',
+  },
+  'org.invite_created': { actorCredentialType: true, branch: true, roleIds: 'string[]' },
+  'org.invite_revoked': { actorCredentialType: true, generation: true },
+  'org.invite_reissued': { actorCredentialType: true, branch: true, roleIds: 'string[]' },
+  'org.member_roles_changed': {
+    actorCredentialType: boundedString(7, /^(jwt|api_key)$/),
+    memberId: boundedString(128, /^[A-Za-z0-9_-]+$/),
+    addedCount: memberRoleCount,
+    removedCount: memberRoleCount,
+    source: boundedString(7, /^(replace|assign|remove)$/),
+  },
+  // Role-definition events carry counts and ids only: never names, descriptions, conditions or emails.
+  'org.role_created': roleDefinitionAuditMetadata,
+  'org.role_updated': roleDefinitionAuditMetadata,
+  'org.role_deleted': roleDefinitionAuditMetadata,
+  // No metadata — the security event is bounded to actor + target; no chat/user id or token.
+  'telegram.connection_linked': {},
+  'telegram.connection_unlinked': {},
+}
+
+export function sanitizeAuditMetadata(
+  action: AuditAction,
+  input?: Record<string, unknown>
+): Prisma.JsonObject {
+  return sanitizeObject(input, { ...commonSpec, ...specs[action] })
+}
+
+function sanitizeObject(input: unknown, spec: MetadataSpec): Prisma.JsonObject {
+  if (!isRecord(input)) return {}
+  const output: Prisma.JsonObject = {}
+  for (const [key, rule] of Object.entries(spec)) {
+    const value = sanitizeValue(input[key], rule)
+    if (value !== undefined) output[key] = value
+  }
+  return output
+}
+
+function sanitizeValue(value: unknown, rule: MetadataRule): Prisma.JsonValue | undefined {
+  if (rule === true) return sanitizePrimitive(value)
+  if (typeof rule === 'function') return rule(value)
+  if (typeof rule === 'string') return sanitizePrimitiveArray(value, rule)
+  return sanitizeNested(value, rule)
+}
+
+function sanitizePrimitive(value: unknown): Primitive | undefined {
+  return isPrimitive(value) ? value : undefined
+}
+
+function sanitizePrimitiveArray(
+  value: unknown,
+  rule: PrimitiveArrayRule
+): Prisma.JsonArray | undefined {
+  if (!Array.isArray(value)) return undefined
+  const expected = rule === 'number[]' ? 'number' : 'string'
+  const items = value.filter((item) => typeof item === expected)
+  return items.length > 0 ? (items as Prisma.JsonArray) : undefined
+}
+
+function sanitizeNested(value: unknown, spec: MetadataSpec): Prisma.JsonObject | undefined {
+  const nested = sanitizeObject(value, spec)
+  return Object.keys(nested).length > 0 ? nested : undefined
+}
+
+function isPrimitive(value: unknown): value is Primitive {
+  return value === null || ['boolean', 'number', 'string'].includes(typeof value)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}

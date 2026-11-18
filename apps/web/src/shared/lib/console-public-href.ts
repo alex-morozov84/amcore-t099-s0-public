@@ -1,0 +1,196 @@
+import type { AuditAction } from '@amcore/shared'
+
+import { ADMIN_CONSOLE_CONFIG } from './admin-console-topology'
+
+/**
+ * Returns the public overview address, never the internal proxy target.
+ * Host mode serves the console at its own host root; path mode uses its alias.
+ */
+export function getConsoleOverviewHref(): string {
+  if (ADMIN_CONSOLE_CONFIG.mode === 'host') return '/'
+  if (ADMIN_CONSOLE_CONFIG.mode === 'path') return `/${ADMIN_CONSOLE_CONFIG.alias}`
+  return '/'
+}
+
+/** Background work: read-only queue summary, same topology rule as the other panels. */
+export function getConsoleBackgroundWorkHref(): string {
+  return `${getConsoleOverviewHref().replace(/\/$/, '')}/background-work`
+}
+
+/** Scheduled jobs: recorded results of periodic jobs, same topology rule as the other panels. */
+export function getConsoleScheduledJobsHref(): string {
+  return `${getConsoleOverviewHref().replace(/\/$/, '')}/scheduled-jobs`
+}
+
+/**
+ * Where the browser reaches the read-only queue board. It is served by the Console BFF route
+ * `app/api/console/bull-board`; in host mode the edge maps `/api/*` to `/api/console/*`, so the
+ * public path has no `console` segment. Not configurable by an environment variable: the board
+ * renders under this path, so changing it means changing this function, the BFF route and the proxy
+ * rules together. No trailing slash: the page's `<base>` adds it.
+ */
+export function getConsoleQueueBoardBasePath(): string {
+  return ADMIN_CONSOLE_CONFIG.mode === 'host' ? '/api/bull-board' : '/api/console/bull-board'
+}
+
+/**
+ * Entry address of the queue board (the page, not an API). No trailing slash: Next.js redirects
+ * `/…/bull-board/` to `/…/bull-board`, so that is the canonical address (the page's `<base>` is an
+ * absolute path with a slash, so its assets are unaffected).
+ */
+export function getConsoleQueueBoardHref(): string {
+  return getConsoleQueueBoardBasePath()
+}
+
+/** Same topology rule as {@link getConsoleOverviewHref}, for the Organizations panel. */
+export function getConsoleOrganizationsHref(): string {
+  return `${getConsoleOverviewHref().replace(/\/$/, '')}/organizations`
+}
+
+/** Same topology rule as {@link getConsoleOverviewHref}, for the Users panel. */
+export function getConsoleUsersHref(): string {
+  return `${getConsoleOverviewHref().replace(/\/$/, '')}/users`
+}
+
+export function getConsoleApiKeysHref(): string {
+  return `${getConsoleOverviewHref().replace(/\/$/, '')}/api-keys`
+}
+
+/** Audit is a separate bounded cursor/filter route in both Console topologies. */
+export function getConsoleAuditHref(): string {
+  return `${getConsoleOverviewHref().replace(/\/$/, '')}/audit`
+}
+
+/** Open identity activity in the widest single interval accepted by Audit. */
+export function getConsoleDetailAuditHref(
+  filters: {
+    actorId?: string
+    actorType?: 'USER'
+    actions?: readonly AuditAction[]
+    targetId?: string
+    targetType?: 'USER' | 'API_KEY'
+    organizationId?: string
+  },
+  now = Date.now()
+): string {
+  const query = new URLSearchParams()
+  for (const [key, value] of Object.entries(filters)) {
+    if (value) query.set(key, Array.isArray(value) ? value.join(',') : String(value))
+  }
+  query.set('from', new Date(now - 31 * 24 * 60 * 60_000).toISOString())
+  query.set('to', new Date(now).toISOString())
+  return `${getConsoleAuditHref()}?${query}`
+}
+
+/** Two recorded-security views share one interval; neither claims a complete login history. */
+export function getConsoleUserSecurityHrefs(userId: string, now = Date.now()) {
+  return {
+    confirmations: getConsoleDetailAuditHref(
+      {
+        actorType: 'USER',
+        actorId: userId,
+        actions: ['auth.step_up_failed', 'auth.step_up_succeeded'],
+      },
+      now
+    ),
+    access: getConsoleDetailAuditHref(
+      {
+        targetType: 'USER',
+        targetId: userId,
+        actions: [
+          'admin.user.system_role_changed',
+          'admin.user.session_revoked',
+          'admin.user.sessions_revoked',
+        ],
+      },
+      now
+    ),
+  }
+}
+
+function detailHref(base: string, id: string, returnTo?: string): string {
+  const path = `${base}/${encodeURIComponent(id)}`
+  return returnTo ? `${path}?${new URLSearchParams({ returnTo })}` : path
+}
+
+export function getConsoleUserDetailHref(id: string, returnTo?: string): string {
+  return detailHref(getConsoleUsersHref(), id, returnTo)
+}
+
+export function getConsoleOrganizationDetailHref(id: string, returnTo?: string): string {
+  return detailHref(getConsoleOrganizationsHref(), id, returnTo)
+}
+
+const DISCOVERY_KEYS = new Set(['page', 'search', 'sortBy', 'sortOrder'])
+const AUDIT_KEYS = new Set([
+  'actorId',
+  'actorType',
+  'action',
+  'actions',
+  'targetId',
+  'targetType',
+  'organizationId',
+  'includeReadEvents',
+  'from',
+  'to',
+  'limit',
+  'cursor',
+])
+
+/** Only an exact, bounded Console inventory/Audit URL may become a return target. */
+export function parseConsoleReturnHref(value: unknown): string | null {
+  if (
+    typeof value !== 'string' ||
+    value.length > 2048 ||
+    !value.startsWith('/') ||
+    value.startsWith('//') ||
+    value.includes('\\') ||
+    value.includes('#') ||
+    Array.from(value).some((character) => character.charCodeAt(0) < 32)
+  )
+    return null
+  let url: URL
+  try {
+    url = new URL(value, 'http://console.invalid')
+  } catch {
+    return null
+  }
+  if (url.origin !== 'http://console.invalid') return null
+  if (value.split('?')[0] !== url.pathname) return null
+  const keys =
+    url.pathname === getConsoleAuditHref()
+      ? AUDIT_KEYS
+      : url.pathname === getConsoleApiKeysHref()
+        ? new Set([...DISCOVERY_KEYS, 'userId', 'organizationId', 'status', 'id', 'limit'])
+        : url.pathname === getConsoleUsersHref() || url.pathname === getConsoleOrganizationsHref()
+          ? DISCOVERY_KEYS
+          : null
+  if (!keys) return null
+  const seen = new Set<string>()
+  for (const key of url.searchParams.keys()) {
+    if (!keys.has(key) || seen.has(key)) return null
+    seen.add(key)
+  }
+  return `${url.pathname}${url.search}`
+}
+
+/** Integrations: safe state of configured outside services, same topology rule as the other panels. */
+export function getConsoleIntegrationsHref(): string {
+  return `${getConsoleOverviewHref().replace(/\/$/, '')}/integrations`
+}
+
+/** Account settings follow Console topology; account MFA itself survives Console removal. */
+export function getConsoleAccountSecurityHref(): string {
+  return `${getConsoleOverviewHref().replace(/\/$/, '')}/profile`
+}
+export function getConsoleSignInAgainHref(): string {
+  return `${getConsoleOverviewHref().replace(/\/$/, '')}/sign-in-again`
+}
+
+/** Display-only normalization of the host edge's physical rewrite target. Never an auth selector. */
+export function getConsolePublicPathname(pathname: string | null): string | null {
+  if (pathname === null || ADMIN_CONSOLE_CONFIG.mode !== 'host') return pathname
+  const physical = `/${ADMIN_CONSOLE_CONFIG.alias}`
+  if (pathname === physical) return '/'
+  return pathname.startsWith(`${physical}/`) ? pathname.slice(physical.length) : pathname
+}

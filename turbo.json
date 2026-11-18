@@ -1,0 +1,72 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "agentGuidance": false,
+  "globalEnv": ["NEXT_PUBLIC_*"],
+  "tasks": {
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", ".next/**", "!.next/cache/**"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/scripts/typecheck-native.mjs",
+        "$TURBO_ROOT$/scripts/lib/native-typecheck*.mjs",
+        "$TURBO_ROOT$/scripts/check-product-admin-placement.mjs",
+        "$TURBO_ROOT$/scripts/render-product-admin-edge.mjs",
+        "$TURBO_ROOT$/scripts/check-shared-settings-fresh.mjs",
+        "$TURBO_ROOT$/scripts/lib/shared-settings-fresh.mjs",
+        "$TURBO_ROOT$/scripts/render-console-edge.mjs",
+        "$TURBO_ROOT$/scripts/lib/console-edge.mjs",
+        "$TURBO_ROOT$/scripts/lib/product-admin*.mjs",
+        "$TURBO_ROOT$/docker/caddy/Caddyfile.console-host",
+        "$TURBO_ROOT$/docker/nginx/operations-console.conf",
+        "$TURBO_ROOT$/docker/caddy/product-admin.generated.caddy",
+        "$TURBO_ROOT$/docker/nginx/product-admin*.conf",
+        "$TURBO_ROOT$/packages/typescript-config/**",
+        "$TURBO_ROOT$/pnpm-lock.yaml",
+        "$TURBO_ROOT$/scripts/write-mfa-artifact.mjs"
+      ],
+      "env": ["BUILD_SOURCE_COMMIT"]
+    },
+    "lint": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/scripts/lint.mjs",
+        "$TURBO_ROOT$/scripts/lib/lint-*.mjs",
+        "$TURBO_ROOT$/packages/eslint-config/**",
+        "$TURBO_ROOT$/apps/web/node_modules/tailwindcss/theme.css",
+        "$TURBO_ROOT$/packages/typescript-config/**",
+        "$TURBO_ROOT$/pnpm-lock.yaml"
+      ]
+    },
+    "typecheck": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/scripts/typecheck-native.mjs",
+        "$TURBO_ROOT$/scripts/lib/native-typecheck*.mjs",
+        "$TURBO_ROOT$/packages/typescript-config/**",
+        "$TURBO_ROOT$/pnpm-lock.yaml"
+      ]
+    },
+    "test": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/.env.example",
+        "$TURBO_ROOT$/scripts/typecheck-native.mjs"
+      ]
+    },
+    "clean": {
+      "cache": false
+    },
+    "lint:fix": {
+      "dependsOn": ["^build"],
+      "cache": false
+    }
+  }
+}

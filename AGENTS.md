@@ -1,0 +1,462 @@
+# AGENTS.md
+
+[Agent development, owner previews and Playwright](docs/operations/local-stands.md). Agents use managed commands for local DB writes and previews.
+API e2e uses its own isolated Testcontainers as described in that guide.
+
+Guidance for AI coding agents (and humans) working in this repository. Any agent
+should read this first — it is the cross-tool standard ([agents.md](https://agents.md)).
+Claude Code reads it via the `@AGENTS.md` import in `CLAUDE.md`.
+
+## Operating context (read first)
+
+1. Read `PROJECT_CONTEXT.md`. It declares whether this checkout is the AMCore
+   upstream starter or a downstream product, and which workflow mode applies
+   (`strict`, `flexible`, or `custom`). Do not guess from git remotes or names.
+   If the file is missing or still says `upstream-starter` in a product fork, stop
+   and ask the owner to initialize it. The supported fork-initialization path is
+   `pnpm init:brand`, which writes the product identity, workflow and theme fields; see
+   `docs/frontend/brand-theme-and-tokens.md#fork-initialization`. Served locales and the
+   Console mode are build settings in `packages/shared/src/config/*.json`, not fields
+   there (see `PROJECT_CONTEXT.md` → _Build Settings_). A frontend Route Handler is not
+   a NestJS backend controller.
+2. Detect the working-context overlay:
+   - **`ai/` directory present** → maintainer copy of the product named in
+     `PROJECT_CONTEXT.md`. ALSO read, in order: `ai/README.md` (private-repo
+     boundary and document map), `ai/STATUS.md` (current state), `ai/BACKLOG.md`
+     (only unfinished-work queue), `ai/WORKFLOW.md` (working rules), and
+     `ai/DECISIONS.md` (ADR index).
+   - **No `ai/` directory** → public contributor/product-fork mode. This file,
+     `PROJECT_CONTEXT.md`, `CONTRIBUTING.md`, and public `docs/` are complete; do
+     **not** look for private maintainer context.
+
+**Do not infer live enforcement from tracked files** — workflows, `.github/rulesets/*.json` and
+hooks _declare_ the intended policy; GitHub-side enforcement is external repository state applied
+separately (see [`docs/operations/ci-security.md` → What a fork inherits](docs/operations/ci-security.md#what-a-fork-inherits-and-what-it-doesnt)).
+
+## What this is
+
+**AMCore** is a production-oriented application starter for secure, modular
+products. The reusable surface is backend-first: an exemplary NestJS API
+foundation with auth, organizations, API keys, storage/media, notifications,
+AI capabilities, audit, observability, CI/security, and production operations.
+pnpm + Turborepo monorepo.
+
+- `apps/api` — NestJS 12 + Fastify 5 backend (Postgres 18 + Prisma 7, Redis + BullMQ, Zod
+  validation, JWT/OAuth/API-keys, CASL RBAC). The starter core.
+- `apps/web` — Next.js 16 frontend/admin starter, Feature-Sliced Design, with
+  locale-routed UI, localized API/form errors, design tokens, theme support, and
+  lint-enforced architecture/styling guardrails. Product-specific admin screens
+  remain downstream-owned.
+- `packages/shared` — Zod schemas, types, constants used by both api and web.
+
+## Lint engines
+
+`pnpm lint` runs paired Oxlint and ESLint checks, plus web Stylelint.
+Use the shared policy guide in `packages/eslint-config/README.md`.
+ESLint alone runs only residual rules. Use the wrapper for complete checks.
+Keep rule ownership explicit when adding rules or inline exceptions.
+
+## Commands
+
+```bash
+pnpm install            # install all
+pnpm dev                # run all apps (or: pnpm --filter api dev)
+pnpm lint               # lint        pnpm typecheck   # types
+pnpm test               # unit tests  pnpm build       # build all
+pnpm test:background-work-contracts # isolated work registration/control/provider safety (Docker)
+pnpm test:extension-contracts  # isolated notification/AI registration + upgrade conformance (Docker)
+pnpm --filter api organization:setup -- status # inspect trusted initial organization setup
+pnpm init:brand         # downstream fork identity/brand/theme initializer
+node scripts/api-e2e-ci.mjs --prepare # generate Prisma and build shared for API E2E
+pnpm --filter api test:e2e            # e2e (Jest + Testcontainers, needs Docker)
+pnpm --filter api db:migrate          # prisma migrate dev (LOCAL dev only)
+docker compose up                     # full stack (Postgres+Redis+migrate+api+web)
+```
+
+Production migrates with `db:migrate:prod` (`prisma migrate deploy`) as a one-shot
+step, never `db:migrate`. See `docs/operations/deployment.md`.
+The [migration image](docs/operations/migrator-image.md) uses the minimal
+`docker/migrator` workspace package and the root frozen lock. Its separate Docker
+preparation uses a digest-pinned official pnpm image and filtered deploy; never
+inherit API build or run root/API authoring hooks to prepare the migrator.
+Keep its Prisma version coherent with the API CLI/client/adapter. Preserve its
+Tini entrypoint and migration-only startup options; verify endpoint capability
+before rollout. Do not change API/worker role defaults to satisfy image checks.
+
+## How to contribute (workflow)
+
+- Follow the workflow mode declared in `PROJECT_CONTEXT.md`.
+- **`strict` mode (AMCore upstream default):** `main` is the single protected
+  trunk — PR-only. A direct push is rejected. Branch off `main`
+  (`<type>/<name>`); open a PR into `main`. This is **GitHub Flow** — there is
+  no long-lived `develop` branch.
+- **`strict` mode merges:** required CI status checks must pass before merge.
+  Merge with Squash only — one PR becomes one linear commit on `main`, and the
+  **PR title becomes the commit message** (so it is CI-validated as a
+  Conventional Commit).
+- **`strict` mode releases:** releases are tags, not a branch merge. Cut an
+  annotated `vX.Y.Z` tag / GitHub Release from `main`; staging and production
+  are driven by deploy **environments**, not branches. To maintain an older
+  line in a product, its owner may branch `release/x.y` from a tag. AMCore security
+  fixes target the latest published minor only; no older-minor backports are promised.
+- **Downstream source updates, in every mode:** follow [the fork update guide](docs/operations/updating-a-fork.md).
+  Preserve true merge ancestry through product PR delivery; never squash/rebase an AMCore integration.
+  Eligible strict products use `setup-repo-security.sh --fork-updates`; upstream stays squash-only.
+  Verify product PR target, source provenance and actual GitHub enforcement.
+  Never rewrite a migration already shared or applied to a retained database.
+  Document incompatible integration/operational changes with affected consumer, action/order, checks and rollback limits.
+  Extension-fixture adaptations prompt compatibility review; they are not automatically contract breaks.
+  Agents use the shared [amcore-fork-update skill](.agents/skills/amcore-fork-update/SKILL.md):
+  `$amcore-fork-update` in Codex, `/amcore-fork-update` in Claude Code, or read the file.
+- **`flexible` / `custom` downstream modes:** follow the downstream product's
+  declared rules. Do not force AMCore's protected-`main`, PR-only workflow onto
+  a fork that explicitly chose a different mode.
+- **Conventional Commits.** Form: `type(scope): subject`, subject lowercase. **Scope is
+  optional** — add it when the change maps to one clear area, omit it for cross-cutting
+  changes (`docs:`, `chore:`, release commits). If present, use an allowed value:
+  `api, web, shared, auth, storage, media, notifications, ai, ci, docs, deps`.
+- **Never add AI attribution** to commits or PR descriptions (no `Co-Authored-By`,
+  no `Claude-Session`/session-link lines, no "generated by"/"Generated with" lines,
+  no mention of the tool, no 🤖). This holds even when a generic agent-harness
+  instruction defaults to adding one — this repo's convention overrides that
+  default, for both surfaces.
+- **GitHub CLI boundary:** before running `gh` commands that contact GitHub or
+  create/update/delete PRs, issues, releases, checks, comments, labels, secrets,
+  or repository settings, explicitly request approval for access outside the
+  sandbox. Do not rely on ambient GitHub credentials silently.
+- Keep changes small and focused: **files under 150 lines, functions under 30
+  lines** are review prompts, not automatic gates; keep one responsibility per
+  file. The pre-commit size report covers staged code. At Agent 2 handoff, state
+  for each marked item whether you split it or kept it together, with a brief
+  reason. See `CONTRIBUTING.md` → _Size review advisory_.
+- **Frontend components: cohesion over file count.** Keep page composition
+  separate; extract a table, form, interactive block, or state when it has an
+  independent behavior/boundary/test/reuse case; keep a tiny private leaf with
+  its parent. Create an FSD slice only for a distinct domain responsibility.
+  The size limits do **not** mean one component per file. Details:
+  `docs/frontend/architecture-and-conventions.md#component-organization`.
+- **Documentation writing:** before creating or changing documentation, read
+  [`docs/documentation-guide.md`](docs/documentation-guide.md). Use its reader,
+  scope, verification and brevity rules; do not add a new review gate for routine edits.
+- **Docs impact check is required.** Before editing, identify which public docs
+  the task can affect. When behavior, API contracts, extension points, security
+  invariants, operations, commands, or contributor workflow change, update the
+  relevant `docs/` and `CONTRIBUTING.md` in the same PR, and answer every line of
+  the "Where this change must be visible" block of the PR template (README, doc
+  maps, changelog, this file, OpenAPI). If no docs change is needed, state why in
+  the final response. Record
+  significant or architectural choices in an ADR. Add notable user-facing
+  changes under `CHANGELOG.md` → `[Unreleased]` for AMCore. Downstream products keep
+  this upstream log untouched and use their own named product notes file; ordinary PRs do not create or
+  change release tags. See `CONTRIBUTING.md` → _Changelog & releases_ for the
+  release procedure.
+- **Read the docs you are about to update — they find defects.** When a task
+  touches an area, check what the existing docs _claim_ about it against the
+  code. Treat "the system does X" as an assertion to verify, not background.
+  Two claims are worth extra suspicion because they are worse than merely
+  stale: a **documented guard that does not exist** (a reviewer reads the claim
+  and stops looking), and an **example that teaches an antipattern** (sample
+  code gets copied). Both have shipped here. If a doc says something is
+  enforced, confirm the enforcement exists.
+- **OpenAPI is public documentation.** For any `apps/api` controller, auth,
+  request/response DTO, upload, or route-contract change, update Swagger
+  metadata in the same PR: `@ApiTags`, `@ApiOperation`, auth decorators
+  (`@ApiBearerAuth`, `@ApiSecurity('apiKeyBearer')` where ADR-034 allows API
+  keys), success/error responses, params/queries, and multipart
+  `@ApiConsumes`/`@ApiBody` as applicable. Keep
+  `apps/api/test/openapi.e2e-spec.ts` in sync: add new public handlers to the
+  success inventory and extend/adjust OpenAPI guardrails when changing security
+  schemes or upload request bodies. Do not treat Markdown docs as a substitute
+  for `/docs`.
+- **Never cite a private `ai/<name>.md`-shaped path from public code or docs.**
+  A comment pointing at the maintainer's internal planning thread or logging
+  notes inside **any git-tracked file** — `apps/*`, `packages/*`, `scripts/*`,
+  or public `docs/` included — ships to every fork and contributor checkout,
+  which has no `ai/` directory — the citation is dead on arrival for everyone
+  but the maintainer. This applies just as much to a test fixture or generated
+  file that copies real source text verbatim as to hand-written prose: copying a
+  file that already carries a citation reproduces it in a second public file.
+  `pnpm test:observability-contract`'s private-path ratchet (ADR-078)
+  mechanically fails a PR that adds one — it scans every git-tracked file,
+  not just Markdown, and its baseline may only shrink, never grow. Put the
+  rationale inline (self-contained — explain the _why_, don't point at it) or
+  link the ADR/public doc once one exists; never a private planning-thread
+  section. `.husky/pre-push` runs the static (non-`:live`) half of
+  `pnpm test:observability-contract` automatically on every push (see
+  `docs/operations/ci-security.md`), so this is enforced mechanically, not
+  only by remembering the rule — but a fast local check is still worth
+  running proactively (`pnpm test:observability-contract`) whenever a change
+  touches a git-tracked file outside `ai/` itself, rather than discovering a
+  violation only at push time.
+- First-time setup of `strict` repo protections (they do not travel with a
+  fork): `bash scripts/setup-repo-security.sh` — see
+  `docs/operations/ci-security.md` → _Strict security setup after forking_. The
+  security scripts need a Unix-like shell (macOS/Linux/WSL). Downstream update profiles
+  must use `--fork-updates` on every setup/rerun; an unflagged run restores squash-only.
+
+## Code conventions
+
+- **API runtime uses ESM.** Use explicit `.js` relative imports and `/index.js`
+  barrel entries in API runtime modules. Keep the maintained Nest CLI + SWC
+  development path and required native checks. See `docs/backend/api-build.md`
+  for build order, operator commands and manual restart boundaries.
+
+- **Validation: Zod everywhere, never `class-validator`.** Schemas live in
+  `packages/shared` and are **language-agnostic — never add a literal `message`**.
+  A schema-level message outranks the frontend's per-parse error map (Zod
+  precedence: schema-level → per-parse → global → locale) and silently forces
+  English into a localized UI. A `superRefine` that needs a specific meaning
+  passes `params: { errorCode }` instead. Backend DTOs use `createSchemaDto()`.
+- **Shared types go in `packages/shared/src/types/`** whenever used by both api
+  and web or representing an API contract — single source of truth, no duplication.
+- **Environment config: one Zod schema, split by domain** under
+  `apps/api/src/env/schema/*.env.ts` (read via `EnvService`, never `process.env`).
+  Adding a variable means declaring it in a section **and** documenting it in
+  `.env.example` — a CI guard (`env-example-coverage.spec.ts`) fails if the two
+  drift or if a copied `.env.example` would not boot. Follow
+  `docs/backend/architecture-and-conventions.md` → _Adding an environment variable_.
+- **Redis caching** for frequently-read entities (version-keyed cache-aside + stampede
+  lock); pattern in `apps/api/src/core/auth/permissions-cache.service.ts`. Authentication
+  code uses the supervised `AuthRedis` client, not `REDIS_CLIENT`.
+- **Product administration placement:** before changing its alias, route subtree,
+  hosts or session selection, read
+  `docs/product-admin/placement-and-sessions.md`. Source configuration, physical
+  routes, generated edge mapping and API/web placement must stay aligned.
+- **Periodic jobs:** declare a timer job once in the scheduled-jobs catalogue and decorate
+  it with `@ScheduledJob`, never a raw `@Cron` or `@Interval` (a test fails otherwise). The
+  task returns an explicit result; a resolved promise is not success. See
+  `docs/backend/scheduled-jobs.md`.
+- **Integration status:** register a module's outside service once in the integrations
+  composition list with a reader that reports stored state, never a provider call, secret or
+  free text; the backend API needs no change. An operator action is a reviewed probe kind with a
+  safe policy, not configuration. See `docs/backend/integrations.md`.
+- **Frontend (web):** Feature-Sliced Design on Next.js App Router — `app/` is
+  Next routing plumbing only (thin), application composition lives in `_app/`, page composition lives in `_pages/`,
+  `widgets`/`features`/`entities`/`shared` keep canonical FSD meanings.
+  Import a slice through its public API only (`@/features/auth-login`, not
+  `@/features/auth-login/ui/LoginForm`); `shared/ui` and `shared/lib` are
+  collections of modules, so import those directly (`@/shared/ui/button`,
+  `@/shared/lib/utils`) — there is no `@/shared/ui` barrel, and no layer-level
+  barrel anywhere. A slice may not import a sibling slice in another group.
+  `_app/<slice>` enters lower slice public APIs and is not imported from below.
+  The explicitly named `entities/organization-context/index.server.ts`,
+  `entities/invitation-flow/index.server.ts` and `entities/api-key/index.server.ts` are server-only public DAL entries;
+  other deep server imports remain forbidden.
+  TanStack Query owns browser-managed server data; Server Components may retain
+  direct server DAL reads. Forms keep local input; add domain rules only for a
+  concrete requirement. Server hydration is optional. Follow
+  `docs/frontend/api-consumption.md` → Data ownership for interactive pages.
+  For data-flow changes, use the shared
+  [amcore-data-patterns skill](.agents/skills/amcore-data-patterns/SKILL.md).
+  Codex discovers it in `.agents/skills`; Claude Code uses the relative link in
+  `.claude/skills`. Invoke it as `$amcore-data-patterns` in Codex or
+  `/amcore-data-patterns` in Claude Code, or read the file with another agent.
+  Zustand remains the convention for shared local client state; no live store is
+  required today (see `docs/frontend/architecture-and-conventions.md` → State model). Theme
+  defaults to `system` (light/dark), owned by `shared/lib/theme.ts` — no
+  `next-themes` dependency. **These import rules fail lint, they are not
+  conventions.** Full contract:
+  `docs/frontend/architecture-and-conventions.md`,
+  `docs/frontend/brand-theme-and-tokens.md`,
+  `docs/frontend/fsd-boundaries-and-guardrails.md`.
+- **Turborepo reference:** before changing Turborepo configuration, tasks or CLI
+  usage, resolve the installed `turbo` package and read its `docs/README.md`
+  followed by the relevant bundled docs. Name the pages checked in the plan or
+  handoff. Root `turbo.json` sets `agentGuidance: false` so commands do not
+  automatically edit this file; the documentation rule is maintained here.
+- **Next.js reference: read the installed docs, not training data — and say
+  which ones.** For any change touching `apps/web/next.config.ts`,
+  `apps/web/src/app/**`, `apps/web/src/proxy.ts`, routing, caching/`use cache`,
+  App Router APIs, Server/Client Component boundaries, or a Next.js upgrade:
+  first find and read the relevant version-matched bundled docs at
+  `apps/web/node_modules/next/dist/docs/` — a Next.js major/minor can differ
+  substantially from what a model was trained on — then name the specific
+  docs pages you read in your plan or final response. **This is a
+  process/review expectation, not a CI check** — nothing technically blocks a
+  commit that skips it, but a reviewer should expect that list in the PR
+  description or handoff for any Next.js-specific change (see
+  `CONTRIBUTING.md` → _Before Submitting a PR_). `apps/web/next.config.ts`
+  sets `agentRules: false` specifically so this bullet — not Next's own
+  auto-generated block — is the source of that instruction. **Do not create or
+  commit `apps/web/AGENTS.md` or `apps/web/CLAUDE.md`**; this file is the
+  single source of truth for agent instructions across the whole repo.
+- **Frontend runtime verification: prove an `apps/web` change against a
+  running app, not a diff you never ran.** Check compilation/errors first
+  (Next's MCP server at `/_next/mcp`, which can be bridged through
+  `next-devtools-mcp` in an agent/workspace MCP config when one is present —
+  `get_compilation_issues`/`compile_route` for the build, `get_logs` for
+  server-side Route Handler errors specifically, since `get_errors` only
+  covers client/config errors), then drive the page with whatever browser
+  automation is available in your agent environment and assert the intended
+  behavior. `docs/frontend/testing.md` documents this loop tool-neutrally on
+  purpose — no browser-automation vendor is named as required.
+  `pnpm --filter web test:e2e` (mocked + server-mocked lanes, infra-free) and
+  `pnpm --filter web test:e2e:real-stack` (the full `docker-compose.yml` stack
+  — the only lane that proves auth/BFF/cookies/Redis/App Router end to end)
+  are the two Playwright entry points; see that guide for which layer a given
+  change belongs in.
+- **Verification plan, not retries.** Before running checks, map each changed
+  risk to the smallest test that proves it; run cheap checks first and each
+  Docker/full-browser check once per unchanged review iteration, only after its
+  covered diff is settled. Re-run a passed check when its covered behavior
+  changes. This avoids redundant review-time reruns; it never replaces a
+  required final-delivery or CI gate at its designated workflow stage. A
+  sandbox, lock, or transport failure is **no verdict**: diagnose the
+  prerequisite, not the whole suite. Long checks use a live persistent PTY,
+  never background/log redirection; in a sandbox, `pnpm --filter web build`
+  always uses the user-approved elevated path. Details:
+  `docs/frontend/testing.md#observable-long-running-checks`.
+- **Browser accessibility scans:** use `expectNoAxeViolations()` from
+  `apps/web/e2e/shared/axe.ts`; it waits for fonts and finite visual transitions.
+  Assert the intended loaded/open state first; the helper also waits for
+  visible `aria-busy="true"` regions (opt out with `{ allowBusy: true }` only when the busy state
+  is the subject). Direct axe runtime imports outside this helper fail web lint. Do not disable contrast checks or add fixed sleeps.
+  For full CI E2E reproduction use `node scripts/e2e-ci.mjs --all`; it runs the
+  same applicable isolated lanes with CI settings (locally sequential).
+- **Frontend server requests:** use the [required-source backend transport](docs/frontend/api-consumption.md#server-request-boundary). Preserve original request headers, no-follow redirects and exact browser-adapter exceptions. New runtime raw fetch fails paired lint.
+- **Frontend server/client boundary — two separate decisions.** Server
+  Components are the default; add `'use client'` only at the interactive leaf
+  that owns events, effects, browser APIs, a Zustand store or a Query hook —
+  never on a layout, which makes the whole subtree ship as client JS. For
+  **non-component modules**, mark by capability: `import 'client-only'` when it
+  touches `window`/`document`/`localStorage`/`navigator`/browser SDKs,
+  `import 'server-only'` when it touches secrets, the filesystem, database
+  clients or Node built-ins. Never blanket-style — **a universal module stays
+  universal.** Both marker packages are installed in `apps/web`; use them when
+  the capability boundary applies, and do not add marker imports to ordinary
+  universal modules.
+- **Frontend usability:** before designing or materially changing a user journey,
+  read and apply `docs/frontend/ux-checklist.md`. Check it again before owner
+  preview; record the pattern choice, actual checks and gaps in task evidence.
+- **Frontend interaction patterns:** read
+  `docs/frontend/architecture-and-conventions.md#interaction-patterns-buttons-tabs-and-lists`
+  before adding buttons, tabs, filters or list/detail journeys. Reuse shared
+  controls, pagination, empty states and skeletons; distinguish action,
+  selection and on/off mode. Use explicit selected variants, destructive final
+  confirmations and semantic tokens instead of page-local copies or recoloring
+  every `aria-pressed` button. Verify the affected journey in the running UI.
+- **Frontend styling — the palette is a source, tokens are the public API.**
+  Colors come from semantic tokens (`bg-card`, `text-muted-foreground`). All of
+  these fail lint: Tailwind's default palette (`bg-red-500`, including behind
+  variants like `dark:`/`hover:`), raw colors in arbitrary values
+  (`bg-[#8b5cf6]`), and the DOM `style` prop entirely. A CSS variable stays
+  legal (`bg-[var(--brand)]`) — a variable _is_ a token reference. CSS Modules
+  are supported for local component CSS under the same rule, with camelCase
+  class names; `app/globals.css` is exempt because that is where tokens are
+  declared.
+- **Operations Console entrypoints:** read `docs/operations-console/development.md`
+  before adding a page, layout, metadata function or BFF handler. Call the synchronous
+  `requireConsoleEnabled()` first in each page entrypoint. Return `withConsoleHostGuard()`
+  first in BFF handlers, and keep parameter awaits/session/API work inside its callback.
+  Resolve the physical folder from `admin-console.json`'s alias; keep it when disabled.
+- **Frontend indexing — closed by default; decide public or private before adding a
+  page.** A private page needs nothing: the whole app, `/api/*` and the Console are
+  `noindex`. A public page builds its metadata only with `buildPageMetadata()` from
+  `@/shared/lib/seo/page-metadata` and is listed in `src/_app/seo/public-pages.ts`
+  (the list the sitemap is built from). **Never write a `robots` metadata key**
+  anywhere else: metadata merges shallowly, so it can silently reopen indexing, and
+  a static test fails on it. Keep the indexing hook in `proxy.ts`, the routing
+  option `alternateLinks: false` and `htmlLimitedBots` as they are unless you have
+  read `docs/frontend/seo.md`.
+- **Frontend i18n — English base, Russian second, both live by default.** Which
+  locales a build serves is set in `packages/shared/src/config/locales.json`
+  (`SERVED_LOCALES` means the served list; `LOCALE_CATALOGUES` lists the catalogues
+  the repository ships). Routes sit under `[locale]`; with several served locales every
+  URL has an explicit prefix (`/en/...`, `/ru/...`), with one the URLs are bare. Never
+  write a second hand-made locale list. Four rules an agent will otherwise break:
+  1. **Never inline user-facing text.** Add the key to `messages/en.json` (the
+     source of truth) and to **every** other catalogue. Keys are type-checked;
+     a catalogue mismatch fails a test.
+     Select new client namespaces through `ClientMessages` at the owning server
+     composition. Add only namespaces absent from its parent. Raw client providers
+     and `useMessages` belong only in the private boundary. Runtime catalogue imports
+     belong only in `i18n/request.ts`. Paired lint enforces these boundaries.
+     See `docs/frontend/i18n-and-errors.md` for extension steps.
+  2. **Use `RouteProgressLink` for internal navigating links and
+     `useRouteProgressRouter()` for programmatic navigation.** They wrap the
+     locale-aware helpers and keep the top progress bar correct. Import other
+     locale-aware helpers (`usePathname`, `redirect`, etc.) from
+     `@/i18n/navigation`; never use locale-unaware `next/link` or navigation
+     APIs for these jobs. Oxlint enforces the boundaries. See
+     `docs/frontend/route-progress.md`.
+  3. **Translate API failures by `errorCode`**, never the backend's `message`
+     (English, developer-facing). Use `<ApiErrorAlert>` / `useApiError()`. A new
+     shared error code with no translation fails the required translation tests.
+  4. **Build forms with `useLocalizedForm()`**, never a global Zod locale.
+     Any backend link shown to a user (email CTA, notification, OAuth redirect)
+     must be built with `localizedFrontendUrl()` from `@amcore/shared`, never
+     string-concatenated from `FRONTEND_URL` — a test enforces this.
+     Plurals go in the message as ICU (`{n, plural, ...}`) — Russian needs
+     `one`/`few`/`many`/`other`; never write a `pluralize()` helper. Full guide:
+     `docs/frontend/i18n-and-errors.md`.
+- **CI dependencies are pinned:** every workflow `uses:` pins a full commit SHA
+  (resolve annotated tags via `git ls-remote <repo> <tag> '<tag>^{}'` and use the
+  `^{}` commit); CLI tools pin version + sha256. `scripts/verify-action-pins.sh`
+  and `zizmor` enforce this.
+- **Docs example tokens must be obviously fake** (truncate `...`, bracket
+  `<...>`/`{...}`, or reuse the canonical fake key) — real-shaped secrets fail the
+  gitleaks gate.
+
+## Where the docs are
+
+- `docs/README.md` — the documentation map: route to any guide by intent.
+- `README.md` — overview + Quick Start.
+- `PROJECT_CONTEXT.md` — checkout identity: upstream starter or downstream product.
+- `CONTRIBUTING.md` — contributor process (commands, commit format, PR checklist).
+- `docs/backend/architecture-and-conventions.md` — how to add a backend module
+  (boundaries, shared contracts, process roles, required tests).
+- `docs/frontend/` — frontend architecture, i18n/error localization, theme,
+  FSD guardrails, shared UI, API consumption, and the testing pyramid; start
+  with [`docs/frontend/README.md`](docs/frontend/README.md).
+- `docs/operations-console/` — using, configuring, deploying, and safely
+  extending the optional `SUPER_ADMIN` Operations Console; start with
+  [`docs/operations-console/README.md`](docs/operations-console/README.md).
+- `docs/email/` — email extension contract: `NotificationsService` vs
+  `EmailService`, React Email templates, queueing, and secret-link rules.
+- `docs/auth/`, `docs/storage/`, `docs/media/` — feature guides.
+- `docs/operations/` — deployment, TLS/reverse-proxy (nginx or the optional
+  bundled Caddy profile), backup/restore, observability, webhooks,
+  idempotency, audit-log, **ci-security** (CI gates + repo-security setup);
+  see [`docs/operations/README.md`](docs/operations/README.md) for the index.
+
+## Testing
+
+Before adding tests, follow [test necessity and replacement](docs/operations/adding-tests.md).
+Name the guarantee, reuse an existing case where possible, and choose the smallest
+sufficient boundary. Removing or moving a test requires a retained witness, a
+relevant controlled fault and explicit lost coverage; a passing test alone is not
+a reason to keep it. Preserve the first failure and distinguish prerequisites from verdicts.
+
+API E2E policy and measurement triggers are defined in
+[CI security](docs/operations/ci-security.md#api-e2e-budget-policy).
+Use the accepted layout and absolute budgets; do not recreate a historical hardware
+comparison or repeat three admission samples for an ordinary PR.
+Reopen measurements only when runner class, layout, preparation or lifecycle policy
+materially changes, or evidence shows a regression.
+Use existing API fixtures and managed cleanup. Test observable state or a controlled
+clock boundary, not assumptions about simultaneous HTTP arrivals; see
+[backend test guidance](docs/backend/architecture-and-conventions.md#tests).
+
+API: Jest + SWC (unit) + Jest/SWC/Testcontainers (e2e); independent `typecheck`
+checks test types. Email retains its own Vitest config. Shared: Vitest for
+`packages/shared`'s own schema/lib unit tests (`pnpm --filter shared test`,
+included in the default `pnpm test`). Web: Vitest for unit/component
+tests, `msw/node` for selected same-origin `/api/*` integration tests,
+Vitest/Testcontainers for real-Redis BFF session-vault tests
+(`pnpm --filter web test:integration`, needs Docker, excluded from the default
+`pnpm test`), Storybook for isolated `shared/ui`/feature-flow component
+states plus interaction/a11y checks (`pnpm --filter web test:storybook`,
+see [`docs/frontend/storybook.md`](docs/frontend/storybook.md)), Playwright
+for mocked/server-mocked browser flows (`pnpm --filter web test:e2e`),
+Playwright against the full Docker stack for auth/BFF/cookies/Redis/App Router
+flows (`pnpm --filter web test:e2e:real-stack`), and `@axe-core/playwright`
+for automated WCAG A/AA scans. Email templates: Vitest. Focus on critical
+paths; see [`docs/frontend/testing.md`](docs/frontend/testing.md) for the web
+taxonomy.
+
+## Compiler selection
+
+Use package `typecheck` commands: API and shared select the native TypeScript 7
+CLI explicitly. Frontend, compiler API tools and shared declarations retain their
+supported compiler versions. Avoid bare `tsc` in API/shared because both packages
+provide that bin name. Preserve the separate Nest checker and SWC emitter.

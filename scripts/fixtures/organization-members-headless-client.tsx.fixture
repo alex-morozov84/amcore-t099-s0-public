@@ -1,0 +1,202 @@
+'use client'
+
+import { type ReactNode, useRef, useState } from 'react'
+import { useLocale, useTranslations } from 'next-intl'
+import type { ProductAccessBootstrap } from '@amcore/shared'
+
+import {
+  type MemberRemovalTarget,
+  useOrganizationContext,
+  useOrganizationMembers,
+} from '@/entities/organization-context'
+import { ApiErrorAlert } from '@/shared/ui/api-error-alert'
+import { Button } from '@/shared/ui/button'
+import { Empty, EmptyTitle } from '@/shared/ui/empty'
+import { RouteProgressLink } from '@/shared/ui/route-progress-link'
+import { Skeleton } from '@/shared/ui/skeleton'
+
+import { InlineKeys } from './member-keys'
+import { InlineRemoval } from './member-removal'
+import { InlineRoles } from './member-roles'
+
+export interface CustomMembersProps {
+  admission: ProductAccessBootstrap
+  organizationId: string
+  deniedContent?: ReactNode
+  initialOrganizationName?: string
+  query?: { page: number; search: string; roleId?: string }
+  membersHref?: string
+  backHref?: string
+  listHref?: string
+  invitationsHref?: string
+  rolesHref?: string
+}
+
+export function CustomMembers(props: CustomMembersProps) {
+  return <MemberSession key={`${props.admission.binding}:${props.organizationId}`} {...props} />
+}
+
+function MemberSession({ admission, organizationId }: CustomMembersProps) {
+  const locale = useLocale()
+  const t = useTranslations('organizationMembers')
+  const e = useTranslations('productAdminExample')
+  const access = useOrganizationContext(admission.binding, {
+    kind: 'selected',
+    id: organizationId,
+    locale,
+  })
+  const members = useOrganizationMembers(access.controller, { page: 1, search: '' })
+  const [selected, setSelected] = useState<MemberRemovalTarget>()
+  const [target, setTarget] = useState<MemberRemovalTarget>()
+  const [editorLocked, setEditorLocked] = useState(false)
+  const [removalLocked, setRemovalLocked] = useState(false)
+  const [selfRemoved, setSelfRemoved] = useState(false)
+  const editor = useRef<HTMLDivElement>(null)
+  const sameSession = !['missing', 'changed'].includes(access.state.status)
+  const allowed = Boolean(
+    access.state.status === 'ready' &&
+    members.ready &&
+    access.data &&
+    'canManageTeamAccess' in access.data.data &&
+    access.data.data.canManageTeamAccess
+  )
+  const available = allowed && members.available
+  const currentMember =
+    available && members.data?.data.find((m) => m.memberId === selected?.memberId)
+  const visible = Boolean(allowed && currentMember)
+  function choose(value: MemberRemovalTarget) {
+    if (removalLocked || editorLocked || access.busy) return
+    setSelected(value)
+    requestAnimationFrame(() => {
+      editor.current?.focus()
+      editor.current?.scrollIntoView({ block: 'nearest', behavior: 'instant' })
+    })
+  }
+  return (
+    <section className="space-y-6" data-testid="custom-headless-members">
+      <header
+        data-example-region="heading"
+        className="flex flex-wrap items-center justify-between gap-3"
+      >
+        <div>
+          <h1 className="text-2xl font-semibold">{t('title')}</h1>
+          <p className="text-muted-foreground">{e('bounded')}</p>
+        </div>
+        <Button
+          variant="outline"
+          disabled={access.busy || access.state.status === 'pending'}
+          onClick={() => void access.refresh().catch(() => undefined)}
+        >
+          {t('refresh')}
+        </Button>
+      </header>
+      {!selfRemoved && <ApiErrorAlert error={access.state.error ?? members.error} />}
+      {access.state.status === 'missing' && (
+        <RouteProgressLink href="/login">{e('signIn')}</RouteProgressLink>
+      )}
+      {access.state.status === 'changed' && (
+        <Button onClick={() => window.location.reload()}>{e('reload')}</Button>
+      )}
+      {!allowed && sameSession && access.state.status !== 'pending' && !selfRemoved && (
+        <p role="status">{t('denied')}</p>
+      )}
+      {allowed && Boolean(members.error) && (
+        <Button
+          disabled={Boolean(members.retryAt)}
+          onClick={() => void members.refresh().catch(() => undefined)}
+        >
+          {t('retry')}
+        </Button>
+      )}
+      <div className="grid gap-6 md:grid-cols-2" data-example-region="panels">
+        <section
+          data-example-region="members"
+          className="space-y-3 rounded-lg border p-4"
+          aria-busy={allowed && members.pending}
+        >
+          {allowed && members.pending && <Skeleton className="h-24 w-full" />}
+          {available && !members.data?.data.length && (
+            <Empty>
+              <EmptyTitle>{t('empty')}</EmptyTitle>
+            </Empty>
+          )}
+          {available && (
+            <ul className="space-y-3">
+              {members.data?.data.map((member) => {
+                const identity = {
+                  userId: member.user.id,
+                  memberId: member.memberId,
+                  email: member.user.email,
+                  name: member.user.name,
+                }
+                return (
+                  <li key={member.memberId} className="flex flex-wrap gap-2">
+                    <Button
+                      variant={
+                        selected?.memberId === member.memberId ? 'selection-soft' : 'outline'
+                      }
+                      aria-pressed={selected?.memberId === member.memberId}
+                      disabled={removalLocked || editorLocked || access.busy}
+                      onClick={() => choose(identity)}
+                    >
+                      {member.user.name ?? member.user.email}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      disabled={removalLocked || editorLocked || access.busy}
+                      onClick={() => setTarget(identity)}
+                    >
+                      {t('remove')}
+                    </Button>
+                  </li>
+                )
+              })}
+            </ul>
+          )}
+        </section>
+        <div
+          ref={editor}
+          tabIndex={-1}
+          data-example-region="editor"
+          className="space-y-4 rounded-lg border p-4 outline-offset-4"
+        >
+          {!selected && allowed && <p>{e('chooseMember')}</p>}
+          {selected && (
+            <>
+              <InlineRoles
+                key={selected.memberId}
+                controller={access.controller}
+                target={selected}
+                actorId={admission.actor.id}
+                visible={visible}
+                sameSession={sameSession}
+                onLock={setEditorLocked}
+              />
+              <InlineKeys
+                key={`keys:${selected.memberId}`}
+                controller={access.controller}
+                target={selected}
+                visible={visible}
+                sameSession={sameSession}
+              />
+            </>
+          )}
+        </div>
+      </div>
+      {target && (
+        <InlineRemoval
+          key={target.memberId}
+          controller={access.controller}
+          target={target}
+          visible={allowed && members.available}
+          sameSession={sameSession}
+          onCancel={() => setTarget(undefined)}
+          onLock={setRemovalLocked}
+          onSelfRemoved={() => {
+            if (target.userId === admission.actor.id) setSelfRemoved(true)
+          }}
+        />
+      )}
+    </section>
+  )
+}

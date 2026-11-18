@@ -1,0 +1,72 @@
+import { type CanActivate, type ExecutionContext, Injectable } from '@nestjs/common'
+import { Reflector } from '@nestjs/core'
+
+import { type RequestPrincipal, SystemRole } from '@amcore/shared'
+
+import { ForbiddenException } from '../../../common/exceptions/index.js'
+import { PrismaService } from '../../../prisma/index.js'
+import type { TeamAccessDecision } from '../casl/ability.factory.js'
+import { TEAM_ACCESS_KEY } from '../decorators/require-team-access.decorator.js'
+import {
+  assertVerifiedContext,
+  type VerifiedOrganizationContext,
+} from '../organization-context/verified-organization-context.js'
+import type { PrivilegedAdmission } from '../privileged-admission.service.js'
+
+@Injectable()
+export class TeamAccessGuard implements CanActivate {
+  constructor(
+    private readonly reflector: Reflector,
+    private readonly prisma: PrismaService
+  ) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const param = this.reflector.getAllAndOverride<string>(TEAM_ACCESS_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ])
+    if (param === undefined) return true
+    const request = context.switchToHttp().getRequest<{
+      user?: RequestPrincipal
+      teamAccess?: TeamAccessDecision
+      params: Record<string, string>
+      organizationContext?: VerifiedOrganizationContext
+      privilegedAdmission?: PrivilegedAdmission
+    }>()
+    const actor = request.user
+    const decision = request.teamAccess
+    const orgId = request.params[param]
+    if (
+      !actor ||
+      !decision ||
+      !orgId ||
+      actor.organizationId !== orgId ||
+      decision.organizationId !== orgId ||
+      decision.actorId !== actor.sub ||
+      decision.type !== actor.type ||
+      (actor.type === 'api_key' && decision.aclVersion !== actor.aclVersion) ||
+      !decision.ownerTrusted ||
+      !decision.credentialTrusted
+    ) {
+      throw new ForbiddenException('Full team access is required for this organization')
+    }
+    if (actor.type === 'jwt' && actor.systemRole !== SystemRole.SuperAdmin) {
+      const verified = request.organizationContext
+      if (verified && request.privilegedAdmission) {
+        assertVerifiedContext(verified, request.privilegedAdmission)
+        if (
+          verified.membershipVerified &&
+          verified.organizationId === orgId &&
+          verified.actorId === actor.sub
+        )
+          return true
+      }
+      const member = await this.prisma.orgMember.findUnique({
+        where: { userId_organizationId: { userId: actor.sub, organizationId: orgId } },
+        select: { id: true },
+      })
+      if (!member) throw new ForbiddenException('Organization membership is required')
+    }
+    return true
+  }
+}
