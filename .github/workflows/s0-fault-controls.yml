@@ -1,0 +1,26 @@
+name: S0 card fault controls
+
+on:
+  push:
+    branches: [s0-card-ci-fault-controls]
+
+permissions:
+  contents: read
+
+jobs:
+  fault:
+    name: Fixture ${{ matrix.fault }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        fault: [missing, failed, skipped, cancelled]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Exercise the existing evidence and required-job checks
+        env:
+          S0_FAULT: ${{ matrix.fault }}
+        run: node scripts/s0-hosted-fault-controls.mjs "$S0_FAULT"
