@@ -1,4 +1,4 @@
-import { s0Scenarios } from '../product-admin-e2e-plan.mjs'
+import { s0Scenarios } from './s0-scenarios.mjs'
 import { readFile } from 'node:fs/promises'
 import assert from 'node:assert/strict'
 import { pathToFileURL } from 'node:url'

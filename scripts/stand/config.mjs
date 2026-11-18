@@ -1,4 +1,4 @@
-import { s0Scenarios } from '../product-admin-e2e-plan.mjs'
+import { s0Scenarios } from './s0-scenarios.mjs'
 import { managedReadiness } from '../runner-disk/policy.mjs'
 import { mfaE2EEnvironment } from './mfa-e2e.mjs'
 import { operatorMfaEnvironment } from './operator-mfa.mjs'
