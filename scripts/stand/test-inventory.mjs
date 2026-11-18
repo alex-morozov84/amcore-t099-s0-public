@@ -1,3 +1,4 @@
+import { cardSpec } from '../lib/s0-card-selection.mjs'
 import { caseDigest } from './s0-case-evidence.mjs'
 import assert from 'node:assert/strict'
 import { writeFile } from 'node:fs/promises'
@@ -58,11 +59,12 @@ export async function s0Inventory(options, lane, expected) {
   assertCollectedCases(await collect(options, [], lane), expected)
 }
 
-export async function groupArguments(m, group, options, caseSet) {
+export async function groupArguments(m, group, options, caseSet, cardOnly = false) {
   const tests = await collect(options)
   assert.equal(new Set(tests.map((test) => test.id)).size, tests.length, 'Duplicate test IDs')
   assert.deepEqual([...new Set(tests.map((test) => test.file))].sort(), specFiles(m.snapshot))
-  const files = selectedFiles(m.snapshot, group)
+  assert.ok(!cardOnly || (group === 'standard' && caseSet), 'Invalid card selection')
+  const files = cardOnly ? [cardSpec] : selectedFiles(m.snapshot, group)
   assert.ok(files.length, 'Empty E2E group refused')
   const args = files.map((file) => RegExp.escape(file) + '$')
   const expected = tests.filter((test) => files.includes(test.file))

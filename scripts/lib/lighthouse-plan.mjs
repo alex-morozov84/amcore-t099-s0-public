@@ -1,4 +1,5 @@
-import { browserCaseDigests } from '../stand/s0-case-evidence.mjs'
+import { cardCaseIds } from './s0-card-selection.mjs'
+import { browserCaseDigests, caseDigest } from '../stand/s0-case-evidence.mjs'
 import { assertRequiredAudits } from './lighthouse-required.mjs'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
@@ -125,10 +126,19 @@ export function auditPlan(root, identity, options) {
     'invalid-run-identity'
   )
   const { choices, catalogue, assignments } = auditScope(root, options)
+  const cardOnly =
+    options?.s0 &&
+    (options.cardOnly ??
+      (process.env.AMCORE_EXPECTED_AUDIT_PLAN
+        ? JSON.parse(process.env.AMCORE_EXPECTED_AUDIT_PLAN).cardOnly === true
+        : false))
+  const browserCases = options?.s0 ? browserCaseDigests(root, Object.keys(assignments)) : undefined
+  if (cardOnly) browserCases['configured-standard'] = caseDigest(cardCaseIds)
   const plan = {
     version: 1,
+    ...(cardOnly ? { cardOnly: true } : {}),
     ...(options?.configured ? { execution: 'configured' } : {}),
-    ...(options?.s0 ? { browserCases: browserCaseDigests(root, Object.keys(assignments)) } : {}),
+    ...(browserCases ? { browserCases } : {}),
     ...identity,
     config: digest(choices),
     descriptors: digest(catalogue),

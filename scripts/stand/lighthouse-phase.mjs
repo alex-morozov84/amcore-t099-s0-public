@@ -27,7 +27,11 @@ export async function runAuditPhase(m, token) {
   const plan = auditPlan(
     m.worktree,
     { run: expected.run, attempt: expected.attempt, source: expected.source },
-    { configured: expected.execution === 'configured', s0: Boolean(expected.browserCases) }
+    {
+      configured: expected.execution === 'configured',
+      s0: Boolean(expected.browserCases),
+      cardOnly: expected.cardOnly === true,
+    }
   )
   invariant(
     plan.digest === expected.digest && plan.assignments[lane]?.length,

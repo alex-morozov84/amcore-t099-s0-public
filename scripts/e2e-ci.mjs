@@ -1,3 +1,4 @@
+import { selectCardFromPr } from './lib/s0-card-selection.mjs'
 import { laneJobMinutes } from './lib/lighthouse-deadlines.mjs'
 import { publishPlan } from './lighthouse/ci-plan.mjs'
 import { productAdminE2ePlans } from './product-admin-e2e-plan.mjs'
@@ -18,7 +19,11 @@ const lanes = ciLanes(root, { configured, s0 })
 const matrix = ['--matrix', '--configured-matrix'].includes(requested)
 const plan = matrix
   ? auditScope(root, { configured, s0 })
-  : auditPlan(root, runIdentity(root), { configured, s0 })
+  : auditPlan(root, runIdentity(root), {
+      configured,
+      s0,
+      ...(requested === '--plan-ci' && s0 ? { cardOnly: selectCardFromPr(root) } : {}),
+    })
 if (
   process.env.AMCORE_EXPECTED_AUDIT_PLAN &&
   JSON.parse(process.env.AMCORE_EXPECTED_AUDIT_PLAN).digest !== plan.digest
@@ -69,6 +74,7 @@ async function browserLane(lane, epoch) {
                 lane,
                 plan: plan.digest,
                 expected: plan.browserCases[lane],
+                cardOnly: plan.cardOnly === true && lane === 'configured-standard',
               }),
             }
           : {}),

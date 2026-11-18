@@ -72,7 +72,9 @@ export async function test(m, lane, token, extra = [], group, auditOnly = false)
       else if (!m.s0Scenario) await profileInventory(m, lane, options, extra)
     }
     const filters =
-      !auditOnly && group ? await groupArguments(m, group, options, evidence?.expected) : []
+      !auditOnly && group
+        ? await groupArguments(m, group, options, evidence?.expected, evidence?.cardOnly)
+        : []
     if (!auditOnly)
       await run(
         'pnpm',
