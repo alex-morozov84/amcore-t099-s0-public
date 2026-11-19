@@ -29,9 +29,7 @@ export function ForgotPasswordForm({ actionBase = '/auth' }: { actionBase?: Auth
 
   const { mutate, isPending, error } = useForgotPassword(form.setError, actionBase)
 
-  if (submitted) {
-    return <p role="status" className="text-sm text-muted-foreground">{t('forgotPasswordSuccess')}</p>
-  }
+  if (submitted) return null
 
   const onSubmit = (data: ForgotPasswordInput) => {
     mutate(data, { onSuccess: () => setSubmitted(true) })
