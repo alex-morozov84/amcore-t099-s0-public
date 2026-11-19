@@ -912,7 +912,7 @@ jobs:
             # also keeps this a real readiness check — it proves a localized
             # page actually renders, not merely that a redirect header is
             # emitted.
-            status="$(curl -fsSL -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/ || true)"
+            status="$(curl -fsSL -H "Host: ${FRONTEND_URL#*://}" -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/ || true)"
             if [ "$status" = "200" ]; then
               echo "web 200"
               break

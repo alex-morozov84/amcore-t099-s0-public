@@ -1,7 +1,14 @@
 import type { INestApplication } from '@nestjs/common'
 import request from 'supertest'
 
-import { AuthErrorCode, type OAuthTokens, type OAuthUserProfile } from '@amcore/shared'
+import {
+  AuthErrorCode,
+  DEFAULT_LOCALE,
+  localePathPrefix,
+  SERVED_LOCALES,
+  type OAuthTokens,
+  type OAuthUserProfile,
+} from '@amcore/shared'
 
 import { hashOAuthStateNonce } from '../src/core/auth/oauth/oauth-nonce'
 import { type OAuthStateData, OAuthStateService } from '../src/core/auth/oauth/oauth-state.service'
@@ -195,9 +202,10 @@ describe('OAuth (e2e)', () => {
     // the authorize step, carried through the one-time state into account
     // creation. Drives the real authorize → cookie → callback path.
     it('seeds a new OAuth user locale from the authorize-time Accept-Language', async () => {
+      const locale = SERVED_LOCALES.find((value) => value !== DEFAULT_LOCALE) ?? DEFAULT_LOCALE
       const authorizeRes = await request(app.getHttpServer())
         .get('/auth/oauth/google')
-        .set('Accept-Language', 'en-US,en;q=0.9')
+        .set('Accept-Language', locale)
         .expect(302)
 
       const state = new URL(authorizeRes.headers.location!).searchParams.get('state')!
@@ -212,7 +220,7 @@ describe('OAuth (e2e)', () => {
       const user = await prisma.user.findUnique({
         where: { emailCanonical: 'oauth-user@example.com' },
       })
-      expect(user?.locale).toBe('en')
+      expect(user?.locale).toBe(locale)
     })
 
     // The login redirect must carry the locale the account actually ends up
@@ -238,7 +246,7 @@ describe('OAuth (e2e)', () => {
         where: { emailCanonical: 'oauth-user@example.com' },
       })
       expect(user?.locale).toBe('ru')
-      expect(res.headers.location).toContain('/ru/auth/callback?ticket=')
+      expect(res.headers.location).toContain(`${localePathPrefix('ru')}/auth/callback?ticket=`)
       expect(res.headers.location).not.toContain('/en/')
     })
 
@@ -260,7 +268,7 @@ describe('OAuth (e2e)', () => {
       const user = await prisma.user.findUnique({
         where: { emailCanonical: 'oauth-user@example.com' },
       })
-      expect(user?.locale).toBe('en')
+      expect(user?.locale).toBe(DEFAULT_LOCALE)
     })
 
     it('should set refresh_token cookie on successful callback', async () => {
@@ -666,7 +674,9 @@ describe('OAuth (e2e)', () => {
         .set('Cookie', OAUTH_STATE_COOKIE)
         .expect(302)
 
-      expect(res.headers.location).toContain('/ru/settings/linked-accounts?linked=google')
+      expect(res.headers.location).toContain(
+        `${localePathPrefix('ru')}/settings/linked-accounts?linked=google`
+      )
       expect(res.headers.location).not.toContain('ticket=')
       expect(res.headers.location).not.toContain('token=')
     })
