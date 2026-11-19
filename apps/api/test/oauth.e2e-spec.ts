@@ -182,7 +182,9 @@ describe('OAuth (e2e)', () => {
         .expect(302)
 
       // Should redirect to frontend with a one-time login ticket, never an access token.
-      expect(res.headers.location).toMatch(/\/(en|ru)\/auth\/callback\?ticket=/)
+      expect(res.headers.location).toContain(
+        `${localePathPrefix(DEFAULT_LOCALE)}/auth/callback?ticket=`
+      )
       expect(res.headers.location).not.toContain('token=')
 
       // User should be created in database
@@ -730,7 +732,9 @@ describe('OAuth (e2e)', () => {
         .send({ code: 'auth-code', state, user: APPLE_USER_FIELD })
         .expect(302)
 
-      expect(res.headers.location).toMatch(/\/(en|ru)\/auth\/callback\?ticket=/)
+      expect(res.headers.location).toContain(
+        `${localePathPrefix(DEFAULT_LOCALE)}/auth/callback?ticket=`
+      )
       expect(res.headers.location).not.toContain('token=')
 
       const user = await prisma.user.findUnique({
@@ -870,7 +874,9 @@ describe('OAuth (e2e)', () => {
         .send({ code: 'auth-code', state, user: APPLE_USER_FIELD })
         .expect(302)
 
-      expect(res.headers.location).toMatch(/\/(en|ru)\/settings\/linked-accounts\?linked=apple/)
+      expect(res.headers.location).toContain(
+        `${localePathPrefix(DEFAULT_LOCALE)}/settings/linked-accounts?linked=apple`
+      )
       expect(res.headers.location).not.toContain('ticket=')
 
       const linked = await prisma.user.findUnique({
