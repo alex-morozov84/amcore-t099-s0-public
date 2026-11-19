@@ -55,7 +55,7 @@ test('browser planning and validation consume the same selected inventory', () =
       'auto'
     )
 
-  const inventory = '${{ fromJSON(needs.ci-plan.outputs.plan).inventory }}'
+  const inventory = "${{ fromJSON(needs.ci-plan.outputs.plan).inventory || 's0' }}"
   const audit = '${{ needs.web-e2e-plan.outputs.audit-plan }}'
   const webPlan = jobs['web-e2e-plan'].steps.find(({ id }) => id === 'plan')
   assert.equal(webPlan.env.AMCORE_E2E_INVENTORY, inventory)
