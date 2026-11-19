@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, s0-general-hosted-base, s0-general-hosted-loss]
+    branches: [main, s0-general-hosted-base, s0-general-hosted-loss, t099-settings-s2-base]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
