@@ -7,8 +7,9 @@ require('@nestjs/core')
 require('@nestjs/bullmq')
 
 // No frontend runs in the API fixture. Use distinct canonical test origins for host placement.
+const { env } = require('node:process')
 const placement = require('../../../packages/shared/src/config/product-admin.json')
 if (placement.mode === 'host') {
-  process.env.FRONTEND_URL ??= 'https://product.example.test'
-  process.env.PRODUCT_ADMIN_ORIGIN ??= 'https://staff.example.test'
+  env.FRONTEND_URL ??= 'https://product.example.test'
+  env.PRODUCT_ADMIN_ORIGIN ??= 'https://staff.example.test'
 }

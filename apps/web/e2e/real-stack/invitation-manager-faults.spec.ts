@@ -97,11 +97,14 @@ for (const locale of SERVED_LOCALES)
       (request) => request.method() === 'GET' && primaryRoute(new URL(request.url()))
     )
     const replacementConflict = page.waitForResponse(
-      (response) => response.url().endsWith('/reissue') && response.status() === 409
+      (response) => response.url().endsWith('/reissue') && response.request().method() === 'POST',
+      { timeout: 15_000 }
     )
     await dialog.getByRole('checkbox', { name: t.reissueConfirmation, exact: true }).check()
     await dialog.getByRole('button', { name: t.resend, exact: true }).click()
-    expect(await (await replacementConflict).json()).toMatchObject({
+    const replacementResponse = await replacementConflict
+    expect(replacementResponse.status()).toBe(409)
+    expect(await replacementResponse.json()).toMatchObject({
       errorCode: 'INVITE_GENERATION_CONFLICT',
     })
     await firstRead
@@ -142,11 +145,13 @@ for (const locale of SERVED_LOCALES)
     const revokeConflict = page.waitForResponse(
       (response) =>
         response.request().method() === 'DELETE' &&
-        new URL(response.url()).pathname.includes(`/organizations/${org.id}/invites/`) &&
-        response.status() === 409
+        new URL(response.url()).pathname.includes(`/organizations/${org.id}/invites/`),
+      { timeout: 15_000 }
     )
     await page.getByRole('alertdialog').getByRole('button', { name: t.revoke, exact: true }).click()
-    expect(await (await revokeConflict).json()).toMatchObject({
+    const revokeResponse = await revokeConflict
+    expect(revokeResponse.status()).toBe(409)
+    expect(await revokeResponse.json()).toMatchObject({
       errorCode: 'INVITE_GENERATION_CONFLICT',
     })
     await secondRead

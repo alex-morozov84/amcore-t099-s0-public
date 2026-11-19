@@ -12,9 +12,10 @@
  * @see https://react.email/docs/introduction#testing
  */
 
-import { DEFAULT_LOCALE } from '@amcore/shared'
 import { render } from '@react-email/render'
 import { describe, expect, it } from 'vitest'
+
+import { DEFAULT_LOCALE } from '@amcore/shared'
 
 import { emailMessages, type Locale } from '../messages'
 
