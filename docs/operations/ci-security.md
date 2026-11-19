@@ -19,14 +19,15 @@ of workflow self-hardening to keep the example forkable.
 | `workflow-lint.yml`     | `push`, `pull_request`                  | actionlint, zizmor, action pin verifier                                                             | blocking                             |
 | `pr-title.yml`          | `pull_request`                          | Conventional-Commits PR-title lint                                                                  | blocking (squash title = commit msg) |
 
-The `CI required` job checks every job in `ci.yml`, including Web E2E and Storybook.
-It rejects missing, failed, cancelled or skipped dependencies. It does not replace
-the API and Web aggregates' inventory and evidence checks. Secret scanning and
-other companion workflows retain their own results.
+The S0 `CI required` job compares workflow results with the committed selection
+plan. It accepts a skip when the plan records the exclusion. Missing, failed,
+cancelled or unexpectedly skipped selected jobs block the result. The API and
+Web aggregates verify their own inventories and evidence. Other workflows
+retain their own results.
 
-Adding this job does not make it merge-blocking automatically. The repository owner
-must first observe a successful run, then require its exact check name in the live
-ruleset. Keep existing required checks until that transition is verified.
+The tracked ruleset declares this check for strict setup. Verify its exact
+name, publisher and enforcement in the live repository before relying on it.
+`CI required` success is evidence about the workflow run.
 
 ## Lighthouse evidence admission
 

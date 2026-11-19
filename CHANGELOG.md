@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Record the upstream aggregate CI gate requirement for strict setup. S0
+  retains its plan-aware aggregate and test inventory.
+
 - Extend guarded SDK cleanup admission to the six remaining normal browser CI
   configurations. Require read-only, build-free mail collectors while preserving
   provisioning compatibility and mandatory cleanup on unsafe runners.
