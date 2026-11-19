@@ -38,3 +38,24 @@ export function configuredBrowserCases(root, identity, collection) {
     })
   )
 }
+
+/** Preserve every applicable base case when source settings are unchanged. */
+export function requireConfiguredBaseCases(identity, baseCollection, headCollection) {
+  const { lanes, ...baseIdentity } = baseCollection
+  assert.deepEqual(baseIdentity, identity, 'Configured base collection identity mismatch')
+  for (const [lane, cases] of Object.entries(lanes)) {
+    const current = new Set(
+      (headCollection.lanes[lane] ?? [])
+        .filter(({ expectedStatus }) => expectedStatus === 'passed')
+        .map(({ caseId }) => caseId)
+    )
+    const missing = cases
+      .filter(({ expectedStatus, caseId }) => expectedStatus === 'passed' && !current.has(caseId))
+      .map(({ file, title, caseId }) => `${lane}: ${file} — ${title} (${caseId})`)
+    assert.ok(
+      missing.length === 0,
+      `Missing mandatory configured browser cases:
+${missing.join('\n')}`
+    )
+  }
+}

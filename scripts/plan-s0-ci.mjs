@@ -1,5 +1,8 @@
 import { productBrowserInventory } from './e2e-ci-plan.mjs'
-import { configuredBrowserCases } from './lib/configured-browser-cases.mjs'
+import {
+  configuredBrowserCases,
+  requireConfiguredBaseCases,
+} from './lib/configured-browser-cases.mjs'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
@@ -101,6 +104,15 @@ const casesPath = process.env.S0_STANDARD_COLLECTION
 if (process.env.GITHUB_ACTIONS === 'true' && groups.web !== 'none' && !casesPath)
   throw new Error('Missing S0 standard collection')
 const policyRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const settings = ['locales', 'admin-console', 'product-admin'].map(
+  (name) => `packages/shared/src/config/${name}.json`
+)
+const sameSettings = pr && !git('diff', '--name-only', base, identity.source, '--', ...settings)
+function readBaseCollection() {
+  const path = process.env.S0_STANDARD_BASE_COLLECTION
+  if (!path) throw new Error('Missing browser base collection')
+  return JSON.parse(readFileSync(path, 'utf8'))
+}
 const inventory = productBrowserInventory(root)
 const s0 = inventory === 's0'
 let standardCases
@@ -112,9 +124,7 @@ if (casesPath && groups.web !== 'none') {
     assert.deepEqual(collectedIdentity, identity, 'S0 collection identity mismatch')
     let baseIds
     if (pr) {
-      const basePath = process.env.S0_STANDARD_BASE_COLLECTION
-      if (!basePath) throw new Error('Missing S0 standard base collection')
-      const { ids: requiredIds, ...baseIdentity } = JSON.parse(readFileSync(basePath, 'utf8'))
+      const { ids: requiredIds, ...baseIdentity } = readBaseCollection()
       assert.deepEqual(
         baseIdentity,
         { ...identity, source: base },
@@ -124,6 +134,8 @@ if (casesPath && groups.web !== 'none') {
     }
     standardCases = admitStandardCases(root, policyRoot, ids, baseIds)
   } else {
+    if (sameSettings)
+      requireConfiguredBaseCases({ ...identity, source: base }, readBaseCollection(), cases)
     configuredCases = configuredBrowserCases(root, identity, cases)
   }
 }
