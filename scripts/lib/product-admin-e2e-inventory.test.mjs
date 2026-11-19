@@ -25,6 +25,7 @@ function profileConfig(plan) {
       exports,
       process: { env: {} },
       require(name) {
+        if (name === '@amcore/shared') return { ADMIN_CONSOLE_SETTINGS: { mode: 'path' } }
         if (name === '@playwright/test')
           return { defineConfig: (config) => config, devices: { 'Desktop Chrome': {} } }
         if (name === '../../scripts/product-admin-e2e-plan.mjs') return { s0Scenarios }

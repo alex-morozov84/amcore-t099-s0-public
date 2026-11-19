@@ -1,13 +1,19 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { DEFAULT_LOCALE, localePathPrefix, SERVED_LOCALES } from '@amcore/shared'
+import {
+  DEFAULT_LOCALE,
+  localePathPrefix,
+  PRODUCT_ADMIN_CONFIG,
+  SERVED_LOCALES,
+} from '@amcore/shared'
 import { type APIResponse, expect, test } from '@playwright/test'
 
 import { ROOT_CLIENT_NAMESPACES } from '../../src/i18n/message-selection'
 import { embeddedFlight, serializedClientMessages } from '../shared/client-message-payload'
 
-import { registerViaUi, uniqueEmail } from './helpers'
+import { ensureAdministrationSession, registerViaUi, uniqueEmail } from './helpers'
+import { organizationUi } from './organization-context.helpers'
 
 const messages = JSON.parse(
   readFileSync(join(__dirname, `../../messages/${DEFAULT_LOCALE}.json`), 'utf8')
@@ -21,7 +27,8 @@ test('sibling navigation sends new section messages without the departed section
     if (entry.type() === 'error' && entry.text().includes('MISSING_MESSAGE'))
       missing.push(entry.text())
   })
-  await registerViaUi(page, uniqueEmail('message-boundaries'))
+  const email = uniqueEmail('message-boundaries')
+  await registerViaUi(page, email)
   async function navigate(label: string) {
     const link = page.getByRole('link', { name: label, exact: true })
     const href = await link.getAttribute('href')
@@ -46,7 +53,24 @@ test('sibling navigation sends new section messages without the departed section
     expect(boundaries.length).toBeGreaterThan(0)
     return Object.assign({}, ...boundaries)
   }
-  const organizations = await navigate(messages.organizationAccess.title)
+  const organizations =
+    PRODUCT_ADMIN_CONFIG.mode === 'host'
+      ? await readStaffMessages()
+      : await navigate(messages.organizationAccess.title)
+  async function readStaffMessages() {
+    const context = page.context()
+    await ensureAdministrationSession(context, email)
+    const staff = await context.newPage()
+    try {
+      const response = await staff.goto(organizationUi().url())
+      expect(response?.ok()).toBe(true)
+      const boundaries = serializedClientMessages(embeddedFlight(await response!.text()))
+      expect(boundaries.length).toBeGreaterThan(0)
+      return Object.assign({}, ...boundaries)
+    } finally {
+      await staff.close()
+    }
+  }
   expect(organizations.organizationCreation).toEqual(messages.organizationCreation)
   expect(organizations).not.toHaveProperty('apiKeyPresentation')
   const keys = await navigate(messages.ownApiKeys.title)

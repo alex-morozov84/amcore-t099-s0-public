@@ -608,13 +608,15 @@ jobs:
       COMPOSE_PROFILES: local-infra
       COMPOSE_PROJECT_NAME: amcore-smoke
       WEB_FRONTEND_CONTEXT_KEY: ci-fake-frontend-context-key-never-a-real-secret
-      FRONTEND_URL: http://127.0.0.1:3000
     if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'docker-image-smoke') }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Set fixture frontend origins
+        run: bash scripts/ci-compose-frontend.sh http://127.0.0.1:3000
 
       - name: Docker Hub mirror
         run: bash scripts/docker-registry-mirror.sh
@@ -1394,6 +1396,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Set fixture frontend origins
+        run: bash scripts/ci-compose-frontend.sh
 
       - name: Docker Hub mirror
         run: bash scripts/docker-registry-mirror.sh
