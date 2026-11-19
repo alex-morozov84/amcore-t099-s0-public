@@ -1,14 +1,20 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { createInvitationOperationId, localizedFrontendUrl, SERVED_LOCALES } from '@amcore/shared'
+import { createInvitationOperationId, SERVED_LOCALES } from '@amcore/shared'
 import { expect, type Route, test } from '@playwright/test'
 
 import { activeTarget } from '../support/managed-target.mjs'
 import { resetBrowserProbeDomainBudget } from '../support/mfa-domain-fixture.mjs'
 
 import { directApi } from './credential-containment.helpers'
-import { browserCredentialRequest, TEST_PASSWORD, uniqueEmail } from './helpers'
+import {
+  browserCredentialRequest,
+  ensureAdministrationSession,
+  TEST_PASSWORD,
+  uniqueEmail,
+} from './helpers'
+import { organizationUi } from './organization-context.helpers'
 
 for (const locale of SERVED_LOCALES)
   test(`manager ${locale}: primary faults, dirty generation, unknown recovery and completed late response after session denial`, async ({
@@ -32,12 +38,8 @@ for (const locale of SERVED_LOCALES)
       readFileSync(join(target.snapshot, `apps/web/messages/${locale}.json`), 'utf8')
     ).organizationInvitations
     const email = uniqueEmail('manager-dirty')
-    const href = localizedFrontendUrl(
-      target.origins.product,
-      locale,
-      `organizations/${org.id}/invites`
-    )
-    await page.goto(href)
+    await ensureAdministrationSession(context, ownerEmail)
+    await page.goto(organizationUi(locale).url(`/${org.id}/invites`))
     const invite = page.getByRole('button', { name: t.invite, exact: true, includeHidden: true })
     await expect(invite).toBeEnabled()
     await invite.click()
@@ -236,6 +238,7 @@ for (const locale of SERVED_LOCALES)
         })
       ).status()
     ).toBe(201)
+    await ensureAdministrationSession(context, replacement)
     await page.evaluate(() => window.dispatchEvent(new Event('focus')))
     await expect(page.getByText(t.denied, { exact: true })).toBeVisible()
     finish()

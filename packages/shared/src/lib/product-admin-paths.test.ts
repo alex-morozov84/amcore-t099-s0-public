@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { productAdminConfigSchema, productAdminReturnSchema } from '../schemas/frontend-context'
 
 import {
+  PRODUCT_ADMIN_CONFIG,
   parseProductAdminReturn,
   productAdminPath,
   productAdminReturnPath,
@@ -57,6 +58,7 @@ describe('product administration destinations', () => {
       page: 'organizations',
       query: { view: 'list', page: 2 },
     })
-    expect(productAdminReturnPath(target)).toBe('/manage/organizations?page=2&view=list')
+    const prefix = PRODUCT_ADMIN_CONFIG.mode === 'path' ? `/${PRODUCT_ADMIN_CONFIG.alias}` : ''
+    expect(productAdminReturnPath(target)).toBe(`${prefix}/organizations?page=2&view=list`)
   })
 })
