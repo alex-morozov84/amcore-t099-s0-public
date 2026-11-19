@@ -39,7 +39,7 @@ jobs:
           POLICY_SOURCE: ${{ github.event.pull_request.base.sha || github.sha }}
         run: |
           mkdir "$RUNNER_TEMP/s0-policy"
-          git archive "$POLICY_SOURCE" scripts .github/ci-paths.yml | tar -x -C "$RUNNER_TEMP/s0-policy"
+          git archive "$POLICY_SOURCE" scripts packages/shared/src/constants/locales.ts .github/ci-paths.yml | tar -x -C "$RUNNER_TEMP/s0-policy"
       - name: Classify PR paths
         id: changes
         if: github.event_name == 'pull_request'
@@ -106,7 +106,7 @@ jobs:
           CI_RESULTS: ${{ toJSON(needs) }}
         run: |
           mkdir "$RUNNER_TEMP/s0-policy"
-          git archive "$POLICY_SOURCE" scripts | tar -x -C "$RUNNER_TEMP/s0-policy"
+          git archive "$POLICY_SOURCE" scripts packages/shared/src/constants/locales.ts | tar -x -C "$RUNNER_TEMP/s0-policy"
           node "$RUNNER_TEMP/s0-policy/scripts/require-s0-ci.mjs"
 
   lint:
@@ -312,7 +312,7 @@ jobs:
           CI_RESULTS: ${{ toJSON(needs) }}
         run: |
           mkdir "$RUNNER_TEMP/s0-policy"
-          git archive "$POLICY_SOURCE" scripts | tar -x -C "$RUNNER_TEMP/s0-policy"
+          git archive "$POLICY_SOURCE" scripts packages/shared/src/constants/locales.ts | tar -x -C "$RUNNER_TEMP/s0-policy"
           node "$RUNNER_TEMP/s0-policy/scripts/require-s0-ci.mjs" test
 
   # Diagnostic full coverage. Live required status is enabled only after Linux admission.
