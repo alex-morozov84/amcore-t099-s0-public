@@ -43,7 +43,7 @@ jobs:
       - name: Classify PR paths
         id: changes
         if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
           filters: ${{ runner.temp }}/s0-policy/.github/ci-paths.yml
           list-files: json
