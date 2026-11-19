@@ -968,7 +968,7 @@ jobs:
         env:
           NODE_OPTIONS: --import=${{ github.workspace }}/scripts/lighthouse/action-deadline.mjs
           AMCORE_ACTION_DEADLINE: ${{ env.AMCORE_STATUS_TRANSFER_END }}
-        if: always() && steps.transfer.outcome == 'success'
+        if: always() && steps.transfer.outcome == 'success' && matrix.lane != 'configured-standard'
         timeout-minutes: 1
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
