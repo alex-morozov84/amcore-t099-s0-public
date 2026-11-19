@@ -7,7 +7,7 @@ test('measurement uses fresh cold stores only in API jobs and retains runner evi
   const workflow = parse(readFileSync('.github/workflows/ci.yml', 'utf8'))
   assert.equal(workflow.env.API_E2E_CACHE_MODE, 'warm')
   const planSteps = workflow.jobs['api-e2e-plan'].steps
-  assert.match(planSteps.find((step) => step.id === 'plan').run, /--plan=3\)/)
+  assert.match(planSteps.find((step) => step.id === 'plan').run, /--plan="\$API_E2E_SHARD_COUNT"/)
   assert.equal(
     workflow.jobs['api-e2e-shards'].strategy.matrix,
     '${{ fromJSON(needs.api-e2e-plan.outputs.matrix) }}'
