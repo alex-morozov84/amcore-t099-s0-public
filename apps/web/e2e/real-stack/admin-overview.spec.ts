@@ -270,17 +270,19 @@ test.describe('enabled path Console', () => {
   })
 })
 
-test('disabled Console refuses its page and BFF for an authenticated operator', async ({
-  page,
-}) => {
+test.describe(() => {
   test.skip(ADMIN_CONSOLE_SETTINGS.mode !== 'disabled', 'Requires disabled source Console')
-  const email = uniqueEmail('console-disabled')
-  await registerViaUi(page, email)
-  setSystemRole(email, 'SUPER_ADMIN')
-  await page.context().clearCookies()
-  await loginViaUi(page, email)
-  await expect(page).toHaveURL(isProductHome)
-  expect((await page.goto(overviewPath))?.status()).toBe(404)
-  const response = await page.request.get('/api/console/organization-establishment/session')
-  expect(response.status()).toBe(404)
+  test('disabled Console refuses its page and BFF for an authenticated operator', async ({
+    page,
+  }) => {
+    const email = uniqueEmail('console-disabled')
+    await registerViaUi(page, email)
+    setSystemRole(email, 'SUPER_ADMIN')
+    await page.context().clearCookies()
+    await loginViaUi(page, email)
+    await expect(page).toHaveURL(isProductHome)
+    expect((await page.goto(overviewPath))?.status()).toBe(404)
+    const response = await page.request.get('/api/console/organization-establishment/session')
+    expect(response.status()).toBe(404)
+  })
 })

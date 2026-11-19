@@ -86,10 +86,12 @@ test('register form rejects a weak password without calling the BFF', async ({ p
   expect(registerRequestSeen).toBe(false)
 })
 
-test('registration hint is localized in Russian', async ({ page }) => {
+test.describe(() => {
   test.skip(!new Set<string>(SERVED_LOCALES).has('ru'), 'Russian locale is not enabled')
-  await page.goto('/ru/register')
-  await expectPasswordHint(page, 'ru')
+  test('registration hint is localized in Russian', async ({ page }) => {
+    await page.goto(localizedFrontendUrl('', 'ru', '/register'))
+    await expectPasswordHint(page, 'ru')
+  })
 })
 
 test('reset form explains the password rule and rejects a weak password locally', async ({
@@ -111,14 +113,16 @@ test('reset form explains the password rule and rejects a weak password locally'
   expect(resetRequestSeen).toBe(false)
 })
 
-test('reset hint is localized in Russian and absent without a token', async ({ page }) => {
+test.describe(() => {
   test.skip(!new Set<string>(SERVED_LOCALES).has('ru'), 'Russian locale is not enabled')
-  await page.goto(`/ru/reset-password?token=${'a'.repeat(64)}`)
-  await expectPasswordHint(page, 'ru')
+  test('reset hint is localized in Russian and absent without a token', async ({ page }) => {
+    await page.goto(localizedFrontendUrl('', 'ru', '/reset-password', { token: 'a'.repeat(64) }))
+    await expectPasswordHint(page, 'ru')
 
-  await page.goto('/ru/reset-password')
-  await expect(page.locator('input[type="password"]')).toHaveCount(0)
-  await expect(page.getByText(passwordHints.ru, { exact: true })).toHaveCount(0)
+    await page.goto(localizedFrontendUrl('', 'ru', '/reset-password'))
+    await expect(page.locator('input[type="password"]')).toHaveCount(0)
+    await expect(page.getByText(passwordHints.ru, { exact: true })).toHaveCount(0)
+  })
 })
 
 test('valid reset submission reaches the BFF and replaces the form on success', async ({
