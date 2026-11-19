@@ -22,6 +22,8 @@ export function startProxy(port) {
       state.records.push({ method: 'GET', path: req.url, status: res.statusCode })
       return
     }
+    // A response belongs to the observation window that dispatched its request.
+    const records = state.records
     const target =
       state.mode === 'old-html' && req.headers.accept?.includes('text/html')
         ? port + 1
@@ -35,7 +37,7 @@ export function startProxy(port) {
         headers: { ...req.headers, host: `127.0.0.1:${port}` },
       },
       (response) => {
-        state.records.push({
+        records.push({
           method: req.method,
           path: req.url.split('?')[0],
           status: response.statusCode,
