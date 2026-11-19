@@ -350,8 +350,10 @@ jobs:
         run: node scripts/api-e2e-ci.mjs --prepare
       - name: Discover complete inventory
         id: plan
+        env:
+          API_E2E_SHARD_COUNT: ${{ fromJSON(needs.ci-plan.outputs.plan).apiShards }}
         run: |
-          matrix="$(node scripts/api-e2e-ci.mjs --plan=3)"
+          matrix="$(node scripts/api-e2e-ci.mjs --plan="$API_E2E_SHARD_COUNT")"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
       - name: Retain canonical inventory
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1083,6 +1085,7 @@ jobs:
           JS
       - name: Require every planned E2E lane to succeed
         env:
+          S0_PLAN: ${{ needs.ci-plan.outputs.plan }}
           E2E_RESULTS: ${{ toJSON(needs) }}
         run: |
           node -e '
@@ -1090,7 +1093,11 @@ jobs:
             let validPlan = false;
             try {
               const {digest, ...plan} = JSON.parse(process.env.AMCORE_EXPECTED_AUDIT_PLAN);
-              validPlan = results["web-e2e-plan"]?.result === "success" &&
+              const selection = JSON.parse(process.env.S0_PLAN);
+              validPlan = results["ci-plan"]?.result === "success" &&
+                results["web-e2e-plan"]?.result === "success" &&
+                selection.audit === digest && selection.source === plan.source &&
+                selection.run === plan.run && selection.attempt === plan.attempt &&
                 plan.version === 1 && plan.run === process.env.GITHUB_RUN_ID &&
                 plan.attempt === process.env.GITHUB_RUN_ATTEMPT && plan.source === process.env.GITHUB_SHA &&
                 Array.isArray(plan.pages) && plan.pages.length > 0 && plan.pages.length <= 3 &&

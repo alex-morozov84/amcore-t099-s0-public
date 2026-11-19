@@ -32,7 +32,7 @@ function s0Jobs(groups, audit, wide) {
   if (groups.build) jobs.push('build')
   if (groups.scripts) jobs.push('script-contracts')
   // The existing job runs both pnpm test and the real-Redis integration.
-  if (groups.build || groups.redis) jobs.push('test-unit-redis')
+  if (groups.quality === 'code' || groups.redis) jobs.push('test-unit-redis')
   if (groups.api) jobs.push('api-e2e-plan', 'api-e2e-shards', 'api-e2e')
   if (groups.storybook) jobs.push('storybook')
   if (groups.notification) jobs.push('test-notification-ai')

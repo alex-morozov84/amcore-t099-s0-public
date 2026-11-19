@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { test } from 'node:test'
@@ -109,4 +110,53 @@ test('plan gate rejects missing selected outcomes and mismatched source, run or 
         ),
       })
     )
+})
+
+test('API inventory takes its shard count from the common plan', () => {
+  const { jobs } = parse(readFileSync('.github/workflows/ci.yml', 'utf8'))
+  const step = jobs['api-e2e-plan'].steps.find(({ id }) => id === 'plan')
+  assert.equal(
+    step.env.API_E2E_SHARD_COUNT,
+    '${{ fromJSON(needs.ci-plan.outputs.plan).apiShards }}'
+  )
+  assert.match(step.run, /--plan="\$API_E2E_SHARD_COUNT"/)
+})
+
+test('browser aggregate rejects a different valid audit plan or attempt', () => {
+  const { jobs } = parse(readFileSync('.github/workflows/ci.yml', 'utf8'))
+  const step = jobs['web-e2e'].steps.find(
+    ({ name }) => name === 'Require every planned E2E lane to succeed'
+  )
+  assert.equal(step.env.S0_PLAN, '${{ needs.ci-plan.outputs.plan }}')
+  const plan = { ...identity, version: 1, pages: [{ id: 'login' }] }
+  const signed = (value) => ({
+    ...value,
+    digest: createHash('sha256').update(JSON.stringify(value)).digest('hex'),
+  })
+  const browser = signed(plan)
+  const results = Object.fromEntries(
+    ['ci-plan', 'web-e2e-plan', 'web-e2e-lanes'].map((job) => [job, { result: 'success' }])
+  )
+  function verdict(selection, evidence = browser) {
+    return spawnSync('bash', ['-e', '-c', step.run], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        GITHUB_STEP_SUMMARY: '/dev/null',
+        GITHUB_SHA: identity.source,
+        GITHUB_RUN_ID: identity.run,
+        GITHUB_RUN_ATTEMPT: identity.attempt,
+        E2E_RESULTS: JSON.stringify(results),
+        AMCORE_EXPECTED_AUDIT_PLAN: JSON.stringify(evidence),
+        S0_PLAN: JSON.stringify(selection),
+      },
+    })
+  }
+  const selection = { ...identity, audit: browser.digest }
+  assert.equal(verdict(selection).status, 0)
+  const other = signed({ ...plan, pages: [{ id: 'members' }] })
+  for (const rejected of [verdict(selection, other), verdict({ ...selection, attempt: '2' })]) {
+    assert.equal(rejected.status, 1)
+    assert.match(rejected.stderr, /Expected inventory unavailable/)
+  }
 })
