@@ -6,6 +6,7 @@ import { expect, test } from '@playwright/test'
 
 import { registerViaUi, uniqueEmail } from '../real-stack/helpers'
 import { expectNoAxeViolations } from '../shared/axe'
+import { loginToConsoleHost } from '../shared/console-host-login'
 import { completeMfaSignIn } from '../shared/mfa-login'
 import { isProductHome, messages, messagesForLocale, productPath } from '../shared/product-settings'
 import { activeTarget } from '../support/managed-target.mjs'
@@ -44,11 +45,7 @@ test('host-mode Overview panel renders real readiness, version and process role,
     ignoreHTTPSErrors: true,
   })
   const consolePage = await console.newPage()
-  await consolePage.goto(productPath('/login'))
-  await consolePage.getByLabel(messages.auth.email, { exact: true }).fill(email)
-  await consolePage.getByLabel(messages.auth.password, { exact: true }).fill('Test1234Secure')
-  await consolePage.getByRole('button', { name: messages.auth.login, exact: true }).click()
-  await completeMfaSignIn(consolePage, email)
+  await loginToConsoleHost(consolePage, email, 'Test1234Secure')
   await expect(consolePage).toHaveURL(
     (url) => url.origin === standTarget.origins.console && isProductHome(url)
   )

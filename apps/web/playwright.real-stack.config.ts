@@ -49,7 +49,7 @@ const config = defineConfig({
 if (target.settingsPolicy === 'preserve' && !scenario) {
   config.grepInvert = [
     /summary fixture/,
-    ...(process.env.AMCORE_CONFIGURED_CASES === '1' && ADMIN_CONSOLE_SETTINGS.mode === 'disabled'
+    ...(ADMIN_CONSOLE_SETTINGS.mode === 'disabled'
       ? []
       : [/disabled Console refuses its page and BFF for an authenticated operator/]),
   ]

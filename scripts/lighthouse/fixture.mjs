@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { registerViaUi, loginViaUi, TEST_PASSWORD } from '../../apps/web/e2e/real-stack/helpers.ts'
+import { loginToConsoleHost } from '../../apps/web/e2e/shared/console-host-login.ts'
 import { guardedSql } from '../../apps/web/e2e/support/managed-target.mjs'
 import { invariant, scenarioUrl } from '../lib/lighthouse-plan.mjs'
 
@@ -83,7 +84,8 @@ export async function prepareFixture(context, m, scenario, alias) {
   })
   const measured = await session.newPage()
   measured.setDefaultTimeout(15_000)
-  await loginViaUi(measured, email)
+  if (fixture.consoleHost) await loginToConsoleHost(measured, email, TEST_PASSWORD)
+  else await loginViaUi(measured, email)
   await context.close()
   return {
     page: measured,
