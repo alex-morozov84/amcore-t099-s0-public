@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -11,6 +12,7 @@ const root = process.cwd()
 const { chromium } = createRequire(join(root, 'apps/web/package.json'))('@playwright/test')
 const workspace = await mkdtemp(join(tmpdir(), 'amcore-version-e2e-'))
 const port = Number(process.env.VERSION_E2E_PORT ?? 3420)
+const contextKey = randomBytes(32).toString('hex')
 const children = []
 const logs = []
 let proxy, browser
@@ -23,6 +25,8 @@ async function start(artifact, targetPort) {
       PORT: String(targetPort),
       HOSTNAME: '127.0.0.1',
       NODE_ENV: 'production',
+      FRONTEND_URL: `http://127.0.0.1:${port}`,
+      WEB_FRONTEND_CONTEXT_KEY: contextKey,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -38,7 +42,7 @@ async function start(artifact, targetPort) {
     }
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
-  throw new Error('Web startup timeout')
+  throw new Error(`Web startup timeout on ${targetPort}: ${logs.join('')}`)
 }
 
 try {

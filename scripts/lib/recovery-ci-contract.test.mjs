@@ -10,7 +10,7 @@ test('Linux recovery regressions are blocking steps in the ordinary Docker PR jo
   assert.equal(ci.on.pull_request.paths, undefined)
   const job = ci.jobs['docker-image-smoke']
   assert.equal(job['runs-on'], 'ubuntu-latest')
-  assert.equal(job.if, undefined)
+  assert.match(job.if, /ci-plan.+docker-image-smoke/)
   assert.equal(job['continue-on-error'], undefined)
   const step = job.steps.find((s) => s.run?.includes('recover-ownership.live.mjs'))
   assert.ok(step, 'Linux ownership regression must run automatically')
