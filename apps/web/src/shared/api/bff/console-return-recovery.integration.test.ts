@@ -1,6 +1,6 @@
-import { DEFAULT_LOCALE } from '@amcore/shared'
 import { randomUUID } from 'node:crypto'
 
+import { DEFAULT_LOCALE } from '@amcore/shared'
 import { RedisContainer, type StartedRedisContainer } from '@testcontainers/redis'
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from 'vitest'
 
