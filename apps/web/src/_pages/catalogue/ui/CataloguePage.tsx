@@ -5,8 +5,8 @@ import { ProductCard } from './ProductCard'
 export async function CataloguePage() {
   const t = await getTranslations('catalogue')
   return (
-    <section>
-      <h1>{t('title')}</h1>
+    <section aria-labelledby="catalogue-title">
+      <h1 id="catalogue-title">{t('title')}</h1>
       <ProductCard name="AMCore Mug" price="$12.00" />
     </section>
   )
