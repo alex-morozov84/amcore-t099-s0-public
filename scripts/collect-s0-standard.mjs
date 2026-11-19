@@ -3,6 +3,7 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { allocateControlSocket } from './stand/control-socket.mjs'
 import { supervise } from './stand/supervisor.mjs'
+import { runIdentity } from './lighthouse/identity.mjs'
 import { groupArguments } from './stand/test-inventory.mjs'
 
 const worktree = process.cwd()
@@ -49,7 +50,9 @@ try {
       if (expectedStatus !== 'passed') throw new Error('Unexpected S0 collection skip')
       return caseId
     })
-    await writeFile(process.argv[2], JSON.stringify(ids), { flag: 'wx' })
+    await writeFile(process.argv[2], JSON.stringify({ ...runIdentity(worktree), ids }), {
+      flag: 'wx',
+    })
   } finally {
     await close()
   }

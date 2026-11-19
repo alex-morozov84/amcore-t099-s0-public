@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -98,10 +99,12 @@ const casesPath = process.env.S0_STANDARD_COLLECTION
 if (process.env.GITHUB_ACTIONS === 'true' && groups.web !== 'none' && !casesPath)
   throw new Error('Missing S0 standard collection')
 const policyRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const standardCases =
-  casesPath && groups.web !== 'none'
-    ? admitStandardCases(root, policyRoot, JSON.parse(readFileSync(casesPath, 'utf8')))
-    : undefined
+let standardCases
+if (casesPath && groups.web !== 'none') {
+  const { ids, ...collectedIdentity } = JSON.parse(readFileSync(casesPath, 'utf8'))
+  assert.deepEqual(collectedIdentity, identity, 'S0 collection identity mismatch')
+  standardCases = admitStandardCases(root, policyRoot, ids)
+}
 const audit = auditPlan(root, identity, {
   configured: true,
   s0: true,
