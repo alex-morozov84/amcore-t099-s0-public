@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { localizedFrontendUrl, localePathPrefix, SERVED_LOCALES } from '@amcore/shared'
+import { localePathPrefix, localizedFrontendUrl, SERVED_LOCALES } from '@amcore/shared'
 import { expect, test } from '@playwright/test'
 
 import { expectNoAxeViolations } from '../shared/axe'
