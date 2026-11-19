@@ -2,6 +2,7 @@ import { expect, test } from '@playwright/test'
 
 import { registerViaUi, uniqueEmail } from '../real-stack/helpers'
 import { completeMfaSignIn } from '../shared/mfa-login'
+import { isProductHome, messages, productPath } from '../shared/product-settings'
 import { storageSettingJourney } from '../shared/storage-setting-journey'
 import { activeTarget } from '../support/managed-target.mjs'
 
@@ -21,17 +22,17 @@ test('Overview Edit/Cancel/Save and operator reset in HTTPS host topology', asyn
   try {
     const page = await product.newPage()
     await registerViaUi(page, email)
-    await expect(page).toHaveURL(/\/en\/?$/)
+    await expect(page).toHaveURL(isProductHome)
     setSystemRole(email, 'SUPER_ADMIN')
     const operator = await console.newPage()
     // Protected pages intentionally fail closed before the separate host login.
-    expect((await operator.goto('/en'))?.status()).toBe(404)
-    await operator.goto('/en/login')
-    await operator.getByLabel(/email/i).fill(email)
-    await operator.getByLabel(/^password$/i).fill('Test1234Secure')
-    await operator.getByRole('button', { name: /sign in/i }).click()
+    expect((await operator.goto(productPath()))?.status()).toBe(404)
+    await operator.goto(productPath('/login'))
+    await operator.getByLabel(messages.auth.email, { exact: true }).fill(email)
+    await operator.getByLabel(messages.auth.password, { exact: true }).fill('Test1234Secure')
+    await operator.getByRole('button', { name: messages.auth.login, exact: true }).click()
     await completeMfaSignIn(operator, email)
-    await expect(operator).toHaveURL(/\/en\/?$/)
+    await expect(operator).toHaveURL(isProductHome)
     await storageSettingJourney(operator, '/api/runtime-settings/storage-probe')
   } finally {
     await product.close()

@@ -1,5 +1,7 @@
 import { defineConfig, devices } from '@playwright/test'
 
+import { s0Scenarios } from '../../scripts/product-admin-e2e-plan.mjs'
+
 import { activeTarget, outputPaths, testOptions } from './e2e/support/managed-target.mjs'
 
 // The managed runner provisions a fresh local Docker stack and owns its cleanup.
@@ -8,7 +10,9 @@ const testDir =
   activeTarget().fixtureProfile === 'organization-setup'
     ? './e2e/organization-setup'
     : './e2e/real-stack'
-export default defineConfig({
+const target = activeTarget()
+const scenario = target.s0Scenario ? s0Scenarios[target.s0Scenario] : undefined
+const config = defineConfig({
   ...outputPaths(),
   testDir,
   ...(activeTarget().fixtureProfile === 'organization-provisioning'
@@ -40,3 +44,20 @@ export default defineConfig({
     },
   ],
 })
+
+if (target.settingsPolicy === 'preserve' && !scenario) {
+  config.grepInvert = [
+    /summary fixture/,
+    /disabled Console refuses its page and BFF for an authenticated operator/,
+  ]
+}
+if (scenario) {
+  config.testDir = './e2e'
+  config.testMatch = [
+    ...scenario.files.map((file) => '**/' + scenario.directory + '/' + file),
+    ...(scenario.extraFiles ?? []).map((file) => '**/' + scenario.extraDirectory + '/' + file),
+  ]
+  if (scenario.grep) config.grep = new RegExp(scenario.grep)
+  delete config.testIgnore
+}
+export default config

@@ -1,3 +1,4 @@
+import { assertPreserveRequest, recordSettings, sourceSettings } from './settings-policy.mjs'
 import { prepareProductAdminSource, productAdminProfiles } from './product-admin-source.mjs'
 import { setConsoleMode } from './console-mode.mjs'
 import { operatorMfaWanted } from './operator-mfa.mjs'
@@ -15,13 +16,26 @@ import {
   prepareOrganizationSetupSource,
 } from './organization-setup-fixture.mjs'
 
-export async function create(id, purpose, topology, mocked = false, fixtureProfile, onAllocated) {
+export async function create(
+  id,
+  purpose,
+  topology,
+  mocked = false,
+  fixtureProfile,
+  onAllocated,
+  settingsPolicy = 'variant',
+  s0Scenario
+) {
   const choices = await projectChoices(root)
+  assertPreserveRequest(settingsPolicy, fixtureProfile, topology, choices, s0Scenario)
+  const originalSettings = await sourceSettings(root)
   const pathOAuth = fixtureProfile === 'product-admin-oauth-path'
   if (pathOAuth && !choices.consoleEnabled)
     throw new Error('Path OAuth HTTPS fixture requires the enabled Console rehearsal')
   const productAdminHost =
-    !pathOAuth && (choices.productAdminHost || productAdminProfiles.includes(fixtureProfile))
+    !s0Scenario &&
+    !pathOAuth &&
+    (choices.productAdminHost || productAdminProfiles.includes(fixtureProfile))
   let consoleTopology =
     fixtureProfile === 'product-admin-three-host' ? 'host' : choices.consoleTopology
   if (['support-mail-path', 'support-mail-host'].includes(fixtureProfile)) {
@@ -62,7 +76,7 @@ export async function create(id, purpose, topology, mocked = false, fixtureProfi
             : `http://${hostnames.product}:${ports.web}`,
           api: `http://127.0.0.1:${ports.api}`,
         }
-  if (productAdminHost && (consoleTopology !== 'host' || !choices.consoleEnabled))
+  if (s0Scenario || (productAdminHost && (consoleTopology !== 'host' || !choices.consoleEnabled)))
     delete origins.console
   if (fixtureProfile === 'console-summary') origins.metrics = `http://127.0.0.1:${ports.tls}`
   if (mocked) {
@@ -72,10 +86,13 @@ export async function create(id, purpose, topology, mocked = false, fixtureProfi
   }
   const m = {
     version: 1,
+    settingsPolicy,
+    sourceSettings: originalSettings,
     ...choices,
     productAdminHost,
     consoleTopology,
     fixtureVersion: 2,
+    s0Scenario,
     fixtureProfile,
     operatorMfa: operatorMfaWanted({
       purpose,
@@ -111,10 +128,11 @@ export async function create(id, purpose, topology, mocked = false, fixtureProfi
   onAllocated?.(m)
   m.sourceHash = await snapshot(root, m.snapshot)
   await prepareOrganizationSetupSource(m)
-  if (['support-mail-path', 'support-mail-host'].includes(fixtureProfile)) {
+  if (!s0Scenario && ['support-mail-path', 'support-mail-host'].includes(fixtureProfile)) {
     await setConsoleMode(m.snapshot, consoleTopology, 'Support mail Console disabled')
   }
   if (
+    settingsPolicy !== 'preserve' &&
     topology === 'host' &&
     (!productAdminHost || (choices.consoleEnabled && consoleTopology === 'host'))
   ) {
@@ -122,6 +140,7 @@ export async function create(id, purpose, topology, mocked = false, fixtureProfi
   }
   await prepareProductAdminSource(m)
   await prepareAccountMfaPreview(m)
+  await recordSettings(m)
   await save(m)
   return m
 }

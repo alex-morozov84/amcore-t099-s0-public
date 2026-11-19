@@ -128,6 +128,33 @@ test('owner resolver keeps one exact audit assignment in all four topologies and
         JSON.stringify({ version: 1, mode: consoleMode, alias: 'ops' })
       )
       const p = auditPlan(dir, identity)
+      const native = auditPlan(dir, identity, { configured: true })
+      assert.equal(native.execution, 'configured')
+      assert.ok(native.assignments['configured-standard'].includes('login'))
+      assert.ok(native.assignments['configured-standard'].includes('members'))
+      assert.ok(
+        native.assignments[
+          consoleMode === 'host' ? 'configured-console' : 'configured-standard'
+        ].includes('console-overview')
+      )
+      assert.deepEqual(Object.values(native.assignments).flat().sort(), [
+        'console-overview',
+        'login',
+        'members',
+      ])
+      assert.notEqual(native.digest, p.digest)
+      for (const lane of Object.keys(native.assignments).filter(
+        (k) => native.assignments[k].length
+      )) {
+        const args = auditCommand(native, lane, 'native-audit')
+        assert.ok(args.includes('preserve'))
+        assert.equal(args.includes('--fixture'), false)
+        assert.equal(
+          args[args.indexOf('--lane') + 1],
+          lane === 'configured-console' ? 'console-real-stack' : 'real-stack'
+        )
+      }
+
       for (const owner of Object.keys(p.assignments).filter((lane) => p.assignments[lane].length)) {
         const args = auditCommand(p, owner, 'audit-example')
         assert.equal(
@@ -169,6 +196,9 @@ test('owner resolver keeps one exact audit assignment in all four topologies and
     JSON.stringify({ version: 1, mode: 'disabled', alias: 'admin' })
   )
   const off = auditPlan(dir, identity)
+  const nativeOff = auditPlan(dir, identity, { configured: true })
+  assert.equal(nativeOff.assignments['configured-console'], undefined)
+  assert.deepEqual(Object.values(nativeOff.assignments).flat().sort(), ['login', 'members'])
   assert.equal(off.choices.console, null)
   assert.deepEqual(off.exclusions, [{ feature: 'admin_console', reason: 'disabled-by-settings' }])
   assert.deepEqual(Object.values(off.assignments).flat().sort(), ['login', 'members'])

@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { PRODUCT_ADMIN_CONFIG } from '@amcore/shared'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('server-only', () => ({}))
 
@@ -12,6 +13,16 @@ const mutableConfig = ADMIN_CONSOLE_CONFIG as unknown as {
 const originalEnabled = ADMIN_CONSOLE_CONFIG.enabled
 const originalMode = ADMIN_CONSOLE_CONFIG.mode
 
+beforeEach(() => {
+  vi.stubEnv('FRONTEND_URL', 'https://app.example.test')
+  vi.stubEnv(
+    'PRODUCT_ADMIN_ORIGIN',
+    PRODUCT_ADMIN_CONFIG.mode === 'host' ? 'https://staff.example.test' : 'https://app.example.test'
+  )
+  mutableConfig.enabled = true
+  mutableConfig.mode = 'path'
+})
+
 afterEach(() => {
   vi.unstubAllEnvs()
   mutableConfig.enabled = originalEnabled
@@ -23,7 +34,6 @@ afterEach(() => {
 describe('console host guard', () => {
   it('allows only the website host in generated path mode', () => {
     mutableConfig.mode = 'path'
-    vi.stubEnv('FRONTEND_URL', 'https://app.example.test')
 
     expect(isConsoleHost('app.example.test')).toBe(true)
     expect(isConsoleHost('console.example.test')).toBe(false)

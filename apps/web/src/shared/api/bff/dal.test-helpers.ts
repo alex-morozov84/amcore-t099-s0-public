@@ -1,11 +1,15 @@
 import { cookies, headers } from 'next/headers'
-import type { UserResponse } from '@amcore/shared'
+import { PRODUCT_ADMIN_CONFIG, type UserResponse } from '@amcore/shared'
 import { vi } from 'vitest'
 
 import type { VaultEntry } from './session-vault.types'
 
 export function mockSessionCookie(value: string | undefined) {
   vi.stubEnv('FRONTEND_URL', 'https://app.example.test')
+  vi.stubEnv(
+    'PRODUCT_ADMIN_ORIGIN',
+    PRODUCT_ADMIN_CONFIG.mode === 'host' ? 'https://staff.example.test' : ''
+  )
   vi.stubEnv('WEB_FRONTEND_CONTEXT_KEY', '<fake-test-context-key-at-least-32-characters>')
   vi.mocked(headers).mockResolvedValue(new Headers({ host: 'app.example.test' }) as never)
   vi.mocked(cookies).mockResolvedValue({

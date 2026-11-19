@@ -1,3 +1,4 @@
+import { PRODUCT_ADMIN_CONFIG } from '@amcore/shared'
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -16,8 +17,12 @@ import { isConsoleRequestOriginTrusted, resolveConsoleAccessToken } from './auth
 import { isTrustedConsoleOrigin } from './origin-guard'
 import { getConsoleSessionEntry } from './session'
 
-const mutableConfig = ADMIN_CONSOLE_CONFIG as { mode: 'disabled' | 'path' | 'host' }
+const mutableConfig = ADMIN_CONSOLE_CONFIG as {
+  enabled: boolean
+  mode: 'disabled' | 'path' | 'host'
+}
 const originalMode = ADMIN_CONSOLE_CONFIG.mode
+const originalEnabled = ADMIN_CONSOLE_CONFIG.enabled
 
 function request(method = 'PATCH'): Request {
   const host = mutableConfig.mode === 'host' ? 'console.example.test' : 'app.example.test'
@@ -31,15 +36,24 @@ function request(method = 'PATCH'): Request {
 }
 
 beforeEach(() => {
+  vi.stubEnv('FRONTEND_URL', 'https://app.example.test')
+  vi.stubEnv(
+    'PRODUCT_ADMIN_ORIGIN',
+    PRODUCT_ADMIN_CONFIG.mode === 'host' ? 'https://staff.example.test' : 'https://app.example.test'
+  )
   vi.clearAllMocks()
   vi.stubEnv('WEB_FRONTEND_CONTEXT_KEY', 'test-key-'.repeat(8))
-  vi.stubEnv('FRONTEND_URL', 'https://app.example.test')
   vi.stubEnv('ADMIN_CONSOLE_ORIGIN', 'https://console.example.test')
   vi.stubEnv('ADMIN_CONSOLE_HOSTNAME', 'console.example.test')
-  mutableConfig.mode = originalMode
+  mutableConfig.enabled = true
+  mutableConfig.mode = 'path'
 })
 
-afterEach(() => vi.unstubAllEnvs())
+afterEach(() => {
+  mutableConfig.enabled = originalEnabled
+  mutableConfig.mode = originalMode
+  vi.unstubAllEnvs()
+})
 
 describe('isConsoleRequestOriginTrusted', () => {
   it('uses the strict console-host check in host mode', () => {

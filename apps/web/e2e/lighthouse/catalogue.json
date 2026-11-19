@@ -20,6 +20,11 @@
   ],
   "coverage": [
     {
+      "route": "app:/catalogue",
+      "kind": "excluded",
+      "reason": "The catalogue scenario runs its accessibility scan in Playwright."
+    },
+    {
       "route": "app:/forgot-password",
       "kind": "excluded",
       "reason": "Account-specific state requires a separate fixture; this initial audit does not measure this page."

@@ -6,7 +6,11 @@ import { test } from 'node:test'
 import { runInNewContext } from 'node:vm'
 import ts from 'typescript'
 
-import { productAdminCiLanes, productAdminE2ePlans } from '../product-admin-e2e-plan.mjs'
+import {
+  productAdminCiLanes,
+  productAdminE2ePlans,
+  s0Scenarios,
+} from '../product-admin-e2e-plan.mjs'
 import { ciLanes, specFiles } from '../e2e-ci-plan.mjs'
 
 function profileConfig(plan) {
@@ -23,9 +27,10 @@ function profileConfig(plan) {
       require(name) {
         if (name === '@playwright/test')
           return { defineConfig: (config) => config, devices: { 'Desktop Chrome': {} } }
+        if (name === '../../scripts/product-admin-e2e-plan.mjs') return { s0Scenarios }
         if (name === './e2e/support/managed-target.mjs')
           return {
-            activeTarget: () => ({ fixtureProfile: plan.fixture }),
+            activeTarget: () => ({ fixtureProfile: plan.fixture, s0Scenario: plan.scenario }),
             outputPaths: () => ({}),
             testOptions: () => ({}),
           }
@@ -104,4 +109,21 @@ test('actual staff collection fails on missing, extra or duplicate discovered te
     [...tests, { id: 'extra', file: 'e2e/product-admin-real-stack/extra.spec.ts' }],
   ])
     assert.throws(() => assertProfileInventory(broken, plan))
+})
+
+test('S0 selects specialist specs through the real-stack config', () => {
+  for (const [scenario, plan] of Object.entries(s0Scenarios)) {
+    const config = profileConfig({ ...plan, lane: 'real-stack', scenario })
+    assert.equal(config.testDir, './e2e')
+    assert.equal(config.testIgnore, undefined)
+    const paths = [
+      ...plan.files.map((file) => plan.directory + '/' + file),
+      ...(plan.extraFiles ?? []).map((file) => plan.extraDirectory + '/' + file),
+    ]
+    assert.deepEqual(
+      [...config.testMatch],
+      paths.map((path) => '**/' + path)
+    )
+    for (const path of paths) assert.ok(existsSync('apps/web/e2e/' + path), path)
+  }
 })

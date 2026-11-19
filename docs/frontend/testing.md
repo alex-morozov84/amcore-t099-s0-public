@@ -149,6 +149,28 @@ to one profile; missing declared files fail inventory checks. Signed path OAuth
 uses its dedicated fixture, outside ordinary path groups. These fixtures prove
 application transport and verified identity handling, not live provider registration.
 
+For Docker checks against the source settings, inspect
+`node scripts/e2e-ci.mjs --configured-matrix`. This read-only command needs no
+installed dependencies or Git history. It lists `configured-standard`,
+`configured-disruptive` when disruptive specs exist, and `configured-console`
+only when the source Console uses host mode.
+
+Run one listed lane with `node scripts/e2e-ci.mjs configured-standard` (or the
+other listed name). Each uses the managed stand with `--settings-policy preserve`,
+without a topology fixture. Standard/disruptive retain the existing discovered
+spec groups. The standard lane owns the login and product-administration audits;
+a host Console has its own audit owner. A path Console remains in standard.
+A disabled Console contributes an explicit audit exclusion.
+
+This is the configured **Docker** subset, not a complete replacement for
+`--all` or the required workflow. It does not include mocked browser flows,
+stand safety contracts or starter-only integration fixtures. The workflow still
+uses its existing full plan. Native mocked transport for host source settings
+is not admitted; the stand refuses it before allocation. Source-specific staff
+journeys and their runtime proof remain necessary before adopting a complete
+product CI plan. A matrix or audit assignment proves neither browser success
+nor a faster CI run.
+
 The separate `setup-cli` lane proves closed-registration installation with the
 compiled command and an actual captured recovery email. It always applies.
 

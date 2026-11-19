@@ -5,6 +5,7 @@ import {
   coerceSupportedLocale,
   DEFAULT_LOCALE,
   localizedFrontendUrl,
+  PRODUCT_ADMIN_CONFIG,
 } from '@amcore/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -50,7 +51,10 @@ function makeRequest(pathAndQuery: string): Request {
 beforeEach(() => {
   vi.clearAllMocks()
   vi.stubEnv('FRONTEND_URL', 'https://app.example.test')
-  vi.stubEnv('PRODUCT_ADMIN_ORIGIN', '')
+  vi.stubEnv(
+    'PRODUCT_ADMIN_ORIGIN',
+    PRODUCT_ADMIN_CONFIG.mode === 'host' ? 'https://staff.example.test' : ''
+  )
   vi.stubEnv('WEB_FRONTEND_CONTEXT_KEY', '<fake-test-context-key-with-at-least-32>')
   vi.mocked(recoverPublishedInvitedOAuth).mockResolvedValue(null)
 })

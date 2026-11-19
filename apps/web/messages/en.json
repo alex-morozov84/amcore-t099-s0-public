@@ -1,4 +1,5 @@
 {
+  "catalogue": { "title": "Catalogue" },
   "productAdmin": {
     "visitSite": "Go to website",
     "unavailableTitle": "Page unavailable",

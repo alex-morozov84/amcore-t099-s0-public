@@ -41,6 +41,23 @@ concurrent scenarios within a test retain their own process and stand orchestrat
 | Delete preview data explicitly       | `pnpm stand down --purge`                    | Deletes only proved-owned resources, built images too   |
 | Recover interrupted run              | `pnpm stand recover --id <stand-id> --purge` | Requires stopped children and resource ownership        |
 
+For a native source-settings check, add `--settings-policy preserve` to a fresh
+`e2e --lane real-stack` command. This refuses fixture profiles and transport
+changes that conflict with the source configuration. The stand records source
+and exercised locale, Console and product-admin settings in its manifest. It
+checks equality after preparation and again before startup. A mismatch fails
+before infrastructure starts. Existing commands default to `variant`; those
+commands can rehearse an alternative topology in the isolated source copy.
+Preserving settings does not make a test written for another topology applicable.
+With `preserve`, the runner derives transport from the source settings, including
+when reusing a retained host stand. `console-real-stack` then requires an enabled
+host Console. Starter staff fixtures cannot be combined with preservation.
+Reuse with `preserve` requires an existing `preserve` policy. For a legacy stand
+without a policy, use a fresh stand ID; the runner does not upgrade its manifest.
+Native mocked host transport is not prepared; that request fails before stand
+allocation. Use the configured Docker commands in the
+[testing guide](../frontend/testing.md) for the source-settings subset.
+
 `--id <stand-id>` selects a recorded identity, never an arbitrary URL or Compose
 project. Default preview ID is `preview` within this checkout; e2e uses a fresh ID.
 E2E refuses preview-purpose IDs so tests cannot change acceptance data.

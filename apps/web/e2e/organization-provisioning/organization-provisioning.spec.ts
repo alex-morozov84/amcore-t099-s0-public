@@ -5,11 +5,15 @@ import { DEFAULT_LOCALE, localizedFrontendUrl, SERVED_LOCALES } from '@amcore/sh
 import { expect, test } from '@playwright/test'
 
 import { expectNoAxeViolations } from '../shared/axe'
+import { completeMfaSignIn } from '../shared/mfa-login'
 import { activeTarget, guardedSql } from '../support/managed-target.mjs'
+import { resetBrowserProbeDomainBudget } from '../support/mfa-domain-fixture.mjs'
 import { proveSetupMailbox, SETUP_PASSWORD, setupCommand } from '../support/organization-setup'
 
 import { acceptAdministrator } from './recipient'
 
+// Initial setup commits once. A retry would reuse a changed database.
+test.describe.configure({ retries: 0 })
 test.use({ trace: 'off', video: 'off', screenshot: 'off' })
 test('operator steps, lost reply and actual recipient consent produce a working ADMIN', async ({
   page,
@@ -30,17 +34,24 @@ test('operator steps, lost reply and actual recipient consent produce a working 
     'UPDATE core.users SET "systemRole"=\'SUPER_ADMIN\' WHERE id=:\'id\' AND "emailVerified"=true;',
     { id: prepared.userId }
   )
+  const consoleApi = m.consoleTopology === 'host' ? '/api' : '/api/console'
   const consoleOrigin = m.origins.console ?? m.origins.product
+  const organizationPath =
+    m.consoleTopology === 'host' ? 'organizations' : `${m.consoleSlug}/organizations`
   await page.goto(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, 'login'))
   await page.getByRole('textbox', { name: en.auth.email, exact: true }).fill(operatorEmail)
   await page.getByLabel(en.auth.password, { exact: true }).fill(SETUP_PASSWORD)
+  const signIn = page.waitForResponse(
+    (r) => new URL(r.url()).pathname.endsWith('/auth/login') && r.request().method() === 'POST'
+  )
   await page.getByRole('button', { name: en.auth.login, exact: true }).click()
+  if ((await signIn).status() === 202) await completeMfaSignIn(page, operatorEmail)
   await page.waitForURL(
     (url) =>
       url.origin === consoleOrigin &&
       url.pathname === new URL(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE)).pathname
   )
-  await page.goto(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, 'organizations'))
+  await page.goto(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, organizationPath))
   const t = en.console.organizationProvisioning
   const flow = page
     .locator('[data-slot="card"]')
@@ -55,7 +66,7 @@ test('operator steps, lost reply and actual recipient consent produce a working 
   await expectNoAxeViolations(page)
   // Drop only the browser's success acknowledgment. The real browser request keeps
   // its own TLS/proxy/Host/Origin/cookies; APIRequestContext replay is a different transport.
-  await page.evaluate(() => {
+  await page.evaluate((createPath) => {
     const send = window.fetch.bind(window)
     let intercepted = false
     window.fetch = async (input, init) => {
@@ -64,19 +75,18 @@ test('operator steps, lost reply and actual recipient consent produce a working 
         location.origin
       )
       const target =
-        !intercepted &&
-        url.pathname === '/api/organization-provisionings' &&
-        (init?.method ?? 'GET') === 'POST'
+        !intercepted && url.pathname === createPath && (init?.method ?? 'GET') === 'POST'
       if (target) intercepted = true
       const response = await send(input, init)
       if (target && response.status === 201)
         throw new TypeError('Controlled lost creation acknowledgment')
       return response
     }
-  })
+  }, `${consoleApi}/organization-provisionings`)
   await flow.getByRole('button', { name: t.createAndInvite, exact: true }).click()
   await expect(flow.getByText(t.unknown, { exact: true })).toBeVisible()
   await expect(flow.getByRole('button', { name: t.checkResult, exact: true })).toBeEnabled()
+  resetBrowserProbeDomainBudget()
   await page.reload()
   await flow.getByRole('button', { name: t.checkResult, exact: true }).click()
   await expect(page.getByRole('heading', { name: t.created, exact: true })).toBeVisible()
@@ -84,6 +94,7 @@ test('operator steps, lost reply and actual recipient consent produce a working 
   const orgId = guardedSql("SELECT id FROM core.organizations WHERE slug='north-shop';").trim()
   expect(guardedSql('SELECT count(*) FROM core.org_members;').trim()).toBe('0')
 
+  resetBrowserProbeDomainBudget()
   const firstUserId = await acceptAdministrator(browser, recipientEmail, 'North shop', en)
   expect(
     guardedSql(
@@ -96,7 +107,10 @@ test('operator steps, lost reply and actual recipient consent produce a working 
       id: prepared.userId,
     }).trim()
   ).toBe('0')
-  await page.goto(localizedFrontendUrl(consoleOrigin, alternateLocale, `organizations/${orgId}`))
+  resetBrowserProbeDomainBudget()
+  await page.goto(
+    localizedFrontendUrl(consoleOrigin, alternateLocale, `${organizationPath}/${orgId}`)
+  )
   await page.setViewportSize({ width: 375, height: 900 })
   await expect(
     page.getByRole('heading', {
@@ -113,8 +127,20 @@ test('operator steps, lost reply and actual recipient consent produce a working 
   // New initial cancellation is terminal; a distinct additional invitation repairs the same organization.
   await page.setViewportSize({ width: 1280, height: 1000 })
   async function createOrganization(name: string, slug: string, email: string) {
-    await page.goto(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, 'organizations'))
-    await page.getByRole('button', { name: t.start, exact: true }).click()
+    resetBrowserProbeDomainBudget()
+    const destination = localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, organizationPath)
+    const sessionResponse = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === `${consoleApi}/organization-provisionings/session`,
+      { timeout: 10000 }
+    )
+    await page.goto(destination)
+    await expect(page).toHaveURL(destination)
+    await expect(page.locator('html')).toHaveAttribute('lang', DEFAULT_LOCALE)
+    expect((await sessionResponse).status(), `${name} operator admission`).toBe(200)
+    const start = flow.getByRole('button', { name: t.start, exact: true })
+    await expect(start).toBeEnabled()
+    await start.click()
     await page.getByLabel(t.name, { exact: true }).fill(name)
     await page.getByLabel(t.slug, { exact: true }).fill(slug)
     await page.getByRole('button', { name: t.next, exact: true }).click()
@@ -132,6 +158,8 @@ test('operator steps, lost reply and actual recipient consent produce a working 
     .getByRole('alertdialog')
     .getByRole('button', { name: t.confirmCancel, exact: true })
     .click()
+  // The repair invitation is a new administrative action after creation and cancellation.
+  resetBrowserProbeDomainBudget()
   const admin = en.console.organizationAdministration
   await expect(page.getByRole('button', { name: admin.invite, exact: true })).toBeEnabled()
   await page.getByRole('button', { name: admin.invite, exact: true }).click()
@@ -144,12 +172,14 @@ test('operator steps, lost reply and actual recipient consent produce a working 
   await invitation.getByRole('button', { name: admin.confirmInvite, exact: true }).click()
   await expect(page.getByText(admin.sent, { exact: true })).toBeVisible()
   await createOrganization('West shop', 'west-shop', 'later-admin@e2e.amcore.test')
-  await page.goto(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, 'organizations'))
+  resetBrowserProbeDomainBudget()
+  await page.goto(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, organizationPath))
   const attention = page
     .locator('[data-slot="card"]')
     .filter({ has: page.getByRole('heading', { name: admin.attentionTitle, exact: true }) })
   await expect(attention.getByRole('heading', { name: 'South shop', exact: true })).toBeVisible()
   await expect(attention.getByRole('heading', { name: 'West shop', exact: true })).toBeVisible()
+  resetBrowserProbeDomainBudget()
   await acceptAdministrator(browser, 'second-admin@e2e.amcore.test', 'South shop', en)
   await attention.getByRole('button', { name: admin.attentionRefresh, exact: true }).click()
   await expect(attention.getByRole('heading', { name: 'South shop', exact: true })).toHaveCount(0)
@@ -159,7 +189,10 @@ test('operator steps, lost reply and actual recipient consent produce a working 
     `INSERT INTO core.org_members (id,"userId","organizationId","createdAt") VALUES ('proof-south-member',:'user',:'org',CURRENT_TIMESTAMP); INSERT INTO core.member_roles (id,"memberId","roleId") SELECT 'proof-south-member-role','proof-south-member',id FROM core.roles WHERE name='MEMBER' AND "organizationId" IS NULL;`,
     { user: firstUserId, org: southId }
   )
-  await page.goto(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, `organizations/${southId}`))
+  resetBrowserProbeDomainBudget()
+  await page.goto(
+    localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, `${organizationPath}/${southId}`)
+  )
   await page.getByRole('button', { name: admin.promote, exact: true }).click()
   const promotion = page.getByRole('dialog')
   await promotion.getByLabel(admin.reason, { exact: true }).fill('TEST-49 verified member addition')
@@ -172,10 +205,11 @@ test('operator steps, lost reply and actual recipient consent produce a working 
       { org: southId }
     ).trim()
   ).toBe('2')
+  resetBrowserProbeDomainBudget()
   for (const [locale, messages] of SERVED_LOCALES.map(
     (locale) => [locale, copy(locale)] as const
   )) {
-    await page.goto(localizedFrontendUrl(consoleOrigin, locale, `organizations/${southId}`))
+    await page.goto(localizedFrontendUrl(consoleOrigin, locale, `${organizationPath}/${southId}`))
     await page.setViewportSize({ width: 375, height: 900 })
     await expect(
       page.getByRole('heading', {

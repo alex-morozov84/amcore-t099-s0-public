@@ -1,3 +1,5 @@
+import { cardCaseIds } from './s0-card-selection.mjs'
+import { browserCaseDigests, caseDigest } from '../stand/s0-case-evidence.mjs'
 import { assertRequiredAudits } from './lighthouse-required.mjs'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
@@ -78,11 +80,17 @@ export function auditCatalogue(root, choices = auditChoices(root)) {
   return { scenarios, coverage }
 }
 
-export function auditScope(root) {
+export function auditScope(root, { configured = false, s0 = false } = {}) {
   const choices = auditChoices(root)
   const catalogue = auditCatalogue(root, choices)
-  const lanes = ciLanes(root)
+  const lanes = ciLanes(root, { configured, s0 })
   const owner = (scope) => {
+    if (configured) {
+      if (scope === 'product' || scope === 'product-admin') return 'configured-standard'
+      if (scope === 'console')
+        return choices.console.mode === 'host' ? 'configured-console' : 'configured-standard'
+      throw new Error('unknown-scenario-scope')
+    }
     if (scope === 'product') return 'path-standard'
     if (scope === 'product-admin')
       return choices.productAdmin.mode === 'host' ? 'staff-oauth' : 'path-standard'
@@ -100,19 +108,37 @@ export function auditScope(root) {
     'missing-required-owner'
   )
   invariant(catalogue.scenarios.length <= 3, 'scenario-count-requires-budget-admission')
+  if (s0) {
+    invariant(
+      JSON.stringify(assignments['configured-standard']) ===
+        JSON.stringify(['login', 'members', 'console-overview']),
+      'missing-s0-standard-audit'
+    )
+  }
   return { choices, catalogue, assignments }
 }
 
-export function auditPlan(root, identity) {
+export function auditPlan(root, identity, options) {
   invariant(
     /^[a-zA-Z0-9-]+$/.test(identity.run) &&
       /^\d+$/.test(identity.attempt) &&
       /^[a-f0-9]{40}$/.test(identity.source),
     'invalid-run-identity'
   )
-  const { choices, catalogue, assignments } = auditScope(root)
+  const { choices, catalogue, assignments } = auditScope(root, options)
+  const cardOnly =
+    options?.s0 &&
+    (options.cardOnly ??
+      (process.env.AMCORE_EXPECTED_AUDIT_PLAN
+        ? JSON.parse(process.env.AMCORE_EXPECTED_AUDIT_PLAN).cardOnly === true
+        : false))
+  const browserCases = options?.s0 ? browserCaseDigests(root, Object.keys(assignments)) : undefined
+  if (cardOnly) browserCases['configured-standard'] = caseDigest(cardCaseIds)
   const plan = {
     version: 1,
+    ...(cardOnly ? { cardOnly: true } : {}),
+    ...(options?.configured ? { execution: 'configured' } : {}),
+    ...(browserCases ? { browserCases } : {}),
     ...identity,
     config: digest(choices),
     descriptors: digest(catalogue),

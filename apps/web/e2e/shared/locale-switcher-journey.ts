@@ -1,11 +1,10 @@
-import { SERVED_LOCALES } from '@amcore/shared'
+import { localePathPrefix, SERVED_LOCALES } from '@amcore/shared'
 import { expect, type Page } from '@playwright/test'
 
 /** Run against production as well: development does not exercise Next's route cache. */
 export async function verifyLocaleUrl(page: Page) {
   const first = SERVED_LOCALES[0]
   const second = SERVED_LOCALES.at(-1)!
-  expect(first).not.toBe(second)
   const query = '?tag=a&tag=b&encoded=%23value'
   const profileRequests: string[] = []
   page.on('request', (request) => {
@@ -20,7 +19,17 @@ export async function verifyLocaleUrl(page: Page) {
     await expect(page.getByRole('combobox')).toHaveValue(locale)
     await expect(page.getByRole('combobox')).toBeEnabled()
   }
-  await page.goto(`/${first}/login${query}#first`)
+  await page.goto(`${localePathPrefix(first)}/login${query}#first`)
+  if (SERVED_LOCALES.length === 1) {
+    await expect(page).toHaveURL(`${new URL(page.url()).origin}/login${query}#first`)
+    await expect(page.locator('html')).toHaveAttribute('lang', first)
+    await expect(page.getByRole('combobox')).toHaveCount(0)
+    await page.reload()
+    await expect(page).toHaveURL(`${new URL(page.url()).origin}/login${query}#first`)
+    await expect(page.locator('html')).toHaveAttribute('lang', first)
+    expect(profileRequests).toEqual([])
+    return
+  }
   await change(second, '#first')
   await page.evaluate(() => window.history.replaceState(window.history.state, '', '#second#tail'))
   await change(first, '#second#tail')

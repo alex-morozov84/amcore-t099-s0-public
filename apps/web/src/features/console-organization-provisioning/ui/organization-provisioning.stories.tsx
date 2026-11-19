@@ -9,6 +9,12 @@ import messages from '../../../../messages/en.json'
 
 import { OrganizationProvisioning } from './organization-provisioning'
 
+const modeledConsole = ADMIN_CONSOLE_CONFIG as {
+  enabled: boolean
+  mode: 'disabled' | 'path' | 'host'
+  alias: string
+}
+
 const t = messages.console.organizationProvisioning
 const root = '/api/console/organization-provisionings'
 const binding = 'a'.repeat(64)
@@ -28,7 +34,12 @@ const meta = {
     msw: { handlers: [session, readiness] },
   },
   beforeEach: () => {
+    const original = { ...modeledConsole }
+    Object.assign(modeledConsole, { enabled: true, mode: 'path', alias: 'admin' })
     localStorage.removeItem('amcore:organization-provisioning:v1:create')
+    return () => {
+      Object.assign(modeledConsole, original)
+    }
   },
 } satisfies Meta<typeof OrganizationProvisioning>
 export default meta
@@ -188,8 +199,7 @@ export const CreatedResult: Story = {
     )
     expect(within(dialog).getByRole('link', { name: t.openOrganization })).toHaveAttribute(
       'href',
-      // Rendered as `en`; the locale prefix exists only when several locales are served, and
-      // the folder is the Console alias from the settings file.
+      // This story explicitly models an enabled path Console rendered in English.
       `${localePathPrefix('en')}/${ADMIN_CONSOLE_CONFIG.alias}/organizations/north-shop`
     )
     expect(canvas.queryByText(t.pendingHelp)).not.toBeInTheDocument()

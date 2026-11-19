@@ -55,3 +55,5 @@ export function productAdminCiLanes(root) {
   }
   return Object.keys(productAdminE2ePlans)
 }
+
+export { s0Scenarios } from './stand/s0-scenarios.mjs'

@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { PRODUCT_ADMIN_CONFIG } from '@amcore/shared'
 import { afterEach, expect, it, vi } from 'vitest'
 
 vi.mock('server-only', () => ({}))
@@ -26,6 +27,10 @@ afterEach(() => {
 })
 it('preserves the HTTP429 code and Retry-After at the public error boundary', async () => {
   vi.stubEnv('FRONTEND_URL', 'https://app.example.test')
+  vi.stubEnv(
+    'PRODUCT_ADMIN_ORIGIN',
+    PRODUCT_ADMIN_CONFIG.mode === 'host' ? 'https://staff.example.test' : ''
+  )
   vi.stubEnv('WEB_FRONTEND_CONTEXT_KEY', '<fake-settings-context-key-at-least-32>')
   const request = new Request('https://app.example.test/api/auth/mfa', {
     headers: {

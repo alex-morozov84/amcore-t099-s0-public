@@ -1,3 +1,6 @@
+import { s0Scenarios } from './stand/s0-scenarios.mjs'
+import { preservedTopology } from './stand/settings-policy.mjs'
+import { projectChoices } from './stand/project.mjs'
 import { standDeadline } from './lib/lighthouse-deadlines.mjs'
 import { productAdminProfiles } from './stand/product-admin-source.mjs'
 import { snapshot } from './stand/snapshot.mjs'
@@ -20,7 +23,26 @@ const [action = 'help', ...args] = process.argv.slice(2)
 const value = (flag, fallback) => (args.includes(flag) ? args[args.indexOf(flag) + 1] : fallback)
 const lane = value('--lane', 'real-stack')
 const group = value('--ci-group')
-const fixture = value('--fixture')
+const requestedFixture = value('--fixture')
+const scenario = value('--s0-scenario')
+const fixture = scenario ? s0Scenarios[scenario]?.fixture : requestedFixture
+const settingsPolicy = value('--settings-policy', 'variant')
+if (!['preserve', 'variant'].includes(settingsPolicy)) throw new Error('Invalid settings policy')
+if (args.includes('--s0-scenario')) {
+  if (
+    !s0Scenarios[scenario] ||
+    settingsPolicy !== 'preserve' ||
+    action !== 'e2e' ||
+    lane !== 'real-stack' ||
+    group ||
+    args.includes('--fixture') ||
+    args.includes('--') ||
+    args.includes('--audit-only')
+  )
+    throw new Error('Invalid S0 scenario request')
+  const { admitS0 } = await import('./e2e-ci-plan.mjs')
+  admitS0(root)
+}
 const auditOnly = args.includes('--audit-only')
 const reuseAudit = args.includes('--reuse-audit')
 if (reuseAudit && (!auditOnly || process.env.CI === 'true'))
@@ -60,12 +82,15 @@ if (group && (lane !== 'real-stack' || !['standard', 'disruptive'].includes(grou
 const lanes = ['mocked', 'real-stack', 'product-admin-real-stack']
 if (lane === 'product-admin-real-stack' && fixture && !productAdminProfiles.includes(fixture))
   throw new Error('Staff lane requires a staff fixture')
-if (productAdminProfiles.includes(fixture) && lane !== 'product-admin-real-stack')
+if (!scenario && productAdminProfiles.includes(fixture) && lane !== 'product-admin-real-stack')
   throw new Error('Staff fixture requires the staff lane')
 let topology
 if (lane === 'product-admin-real-stack') topology = 'host'
 lanes.push('console-real-stack')
 if (lane === 'console-real-stack') topology = 'host'
+if (settingsPolicy === 'preserve' && ['up', 'preview', 'e2e'].includes(action))
+  topology = preservedTopology(lane, await projectChoices(root))
+if (scenario && s0Scenarios[scenario].https) topology = 'host'
 const id = value('--id', action === 'e2e' ? `e2e-${randomUUID()}` : 'preview')
 // Explicit risk acceptance for a build whose Docker export is not proved finished;
 // recorded in the manifest as acceptance, never as proof (see local-stands guide).
@@ -144,7 +169,8 @@ async function execute() {
       if (e.code !== 'ENOENT') throw e
     })
     if (existing) {
-      if (fixture) throw new Error('Organization setup fixture requires a fresh stand ID')
+      if (fixture || scenario)
+        throw new Error('Organization setup fixture requires a fresh stand ID')
       if (Boolean(existing.mocked) !== (lane === 'mocked'))
         throw new Error('Cannot switch a recorded stand between mocked and Docker lanes')
       if (action === 'e2e' && existing.purpose !== 'e2e')
@@ -154,6 +180,10 @@ async function execute() {
       if (action === 'e2e' && (existing.topology === 'host') !== (topology === 'host'))
         throw new Error('E2E topology does not match selected lane')
       if (existing.state === 'purged') throw new Error('Purged ID; select a fresh stand ID')
+      if (settingsPolicy === 'preserve' && !existing.settingsPolicy)
+        throw new Error('Legacy stand has no settings policy; use a fresh stand ID for preserve')
+      if (existing.settingsPolicy && existing.settingsPolicy !== settingsPolicy)
+        throw new Error('Cannot switch the settings policy of an existing stand')
       m = existing
       if (lane !== 'mocked' && !['stopped', 'allocated', 'configured'].includes(m.state))
         await dataAdmission(m)
@@ -173,7 +203,9 @@ async function execute() {
               (lane === 'product-admin-real-stack' ? 'product-admin-three-host' : undefined)),
         (allocated) => {
           m = allocated
-        }
+        },
+        settingsPolicy,
+        scenario
       )
     if (lane !== 'mocked') await boot(m, !existing)
     if (interrupted) throw new Error('Interrupted startup')

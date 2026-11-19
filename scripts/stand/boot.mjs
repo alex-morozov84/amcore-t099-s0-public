@@ -34,7 +34,9 @@ export async function boot(m, fresh, steps = defaults) {
         m.topology,
         m.mocked,
         m.fixtureProfile,
-        (allocated) => adoptAllocation(m, allocated)
+        (allocated) => adoptAllocation(m, allocated),
+        m.settingsPolicy,
+        m.s0Scenario
       )
       if (hash !== next.sourceHash)
         throw new Error('Source changed during bind recovery; start a fresh review iteration')

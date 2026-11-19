@@ -1,3 +1,4 @@
+import { assertCompiledSettings } from './settings-policy.mjs'
 import { standDeadline } from '../lib/lighthouse-deadlines.mjs'
 import { toolingFingerprint, compiledFingerprint } from '../lighthouse/reuse.mjs'
 import { runAuditPhase } from './lighthouse-phase.mjs'
@@ -5,14 +6,15 @@ import { setProcessDeadline } from './process.mjs'
 import { prepareMfaE2E } from './mfa-e2e.mjs'
 import { admitInvocation, endInvocation } from './invocation.mjs'
 import { join } from 'node:path'
-import { mkdir } from 'node:fs/promises'
+import assert from 'node:assert/strict'
+import { mkdir, readFile } from 'node:fs/promises'
 import { run, cleanEnvironment } from './process.mjs'
 import { relay } from './relay.mjs'
 import { directory, save } from './state.mjs'
 import { supervise } from './supervisor.mjs'
 import { mockEnvironment } from './mock-environment.mjs'
 import { allocateControlSocket } from './control-socket.mjs'
-import { groupArguments, profileInventory } from './test-inventory.mjs'
+import { groupArguments, profileInventory, s0Inventory } from './test-inventory.mjs'
 
 export async function test(m, lane, token, extra = [], group, auditOnly = false) {
   m.auditOnly = auditOnly
@@ -56,8 +58,23 @@ export async function test(m, lane, token, extra = [], group, auditOnly = false)
         AMCORE_STAND_TOKEN: token,
       }),
     }
-    if (!auditOnly && !group) await profileInventory(m, lane, options, extra)
-    const filters = !auditOnly && group ? await groupArguments(m, group, options) : []
+    const evidence = process.env.AMCORE_S0_EVIDENCE
+      ? JSON.parse(process.env.AMCORE_S0_EVIDENCE)
+      : undefined
+    const reportFile = join(tmp, 's0-browser-evidence.json')
+    if (evidence) {
+      assert.equal(m.settingsPolicy, 'preserve', 'S0 evidence requires preserved settings')
+      await assertCompiledSettings(m)
+      options.env.AMCORE_S0_REPORT = JSON.stringify({ ...evidence, file: reportFile })
+    }
+    if (!auditOnly && !group) {
+      if (evidence) await s0Inventory(options, lane, evidence.expected)
+      else if (!m.s0Scenario) await profileInventory(m, lane, options, extra)
+    }
+    const filters =
+      !auditOnly && group
+        ? await groupArguments(m, group, options, evidence?.expected, evidence?.cardOnly)
+        : []
     if (!auditOnly)
       await run(
         'pnpm',
@@ -73,6 +90,12 @@ export async function test(m, lane, token, extra = [], group, auditOnly = false)
         ],
         options
       )
+    if (evidence) {
+      await assertCompiledSettings(m)
+      const { expected, ...identity } = evidence
+      m.browserEvidence = JSON.parse(await readFile(reportFile, 'utf8'))
+      assert.deepEqual(m.browserEvidence, { ...identity, observed: expected })
+    }
     m.testOutcome = auditOnly ? 'not_run_local_audit' : 'passed'
     if (process.env.AMCORE_AUDIT_OWNER) await runAuditPhase(m, token)
   } catch (error) {

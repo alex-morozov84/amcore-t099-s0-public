@@ -13,7 +13,7 @@ const required = ruleset.rules
 test('the script contracts job runs the root test:scripts command', () => {
   const job = ci.jobs['script-contracts']
   assert.equal(job.name, 'Script contracts')
-  assert.deepEqual(job.needs, ['lint', 'typecheck'])
+  assert.deepEqual(job.needs, ['ci-plan', 'lint', 'typecheck'])
   const step = job.steps.find((item) => item.name === 'Run script contract tests')
   assert.equal(step.run, 'pnpm test:scripts')
   assert.equal(

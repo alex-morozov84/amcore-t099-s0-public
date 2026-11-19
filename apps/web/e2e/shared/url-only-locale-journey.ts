@@ -1,3 +1,4 @@
+import { localePathPrefix, SERVED_LOCALES } from '@amcore/shared'
 import { expect, type Page, test } from '@playwright/test'
 
 import { saveContextDiagnostics } from '../support/context-read-diagnostics'
@@ -33,24 +34,39 @@ export async function verifyUrlOnlyLocale(
     }
   })
   try {
-    await page.goto(`/en${path}?tag=a&tag=b#locale`)
-    await expect(page.getByRole('main').getByText(ready.en, { exact: true })).toBeVisible()
+    const first = SERVED_LOCALES[0]
+    await page.goto(`${localePathPrefix(first)}${path}?tag=a&tag=b#locale`)
+    await expect(page.getByRole('main').getByText(ready[first], { exact: true })).toBeVisible()
     await expect(page.locator('[aria-busy="true"]')).toHaveCount(0)
-    await capture('ready-ui-en', ready.title.en)
-    await expectDocumentTitle(page, ready.title.en)
-    await capture('before-axe-en', ready.title.en)
+    await expect(page.locator('html')).toHaveAttribute('lang', first)
+    await capture(`ready-ui-${first}`, ready.title[first])
+    await expectDocumentTitle(page, ready.title[first])
+    await capture(`before-axe-${first}`, ready.title[first])
     await expectNoAxeViolations(page)
     expect(profileCalls).toBe(0)
-    await page.getByRole('combobox', { name: 'Language', exact: true }).selectOption('ru')
-    await expect(page).toHaveURL(`${new URL(page.url()).origin}/ru${path}?tag=a&tag=b#locale`)
-    await expect(page.getByRole('main').getByText(ready.ru, { exact: true })).toBeVisible()
-    await expect(page.locator('[aria-busy="true"]')).toHaveCount(0)
-    await expect(page.getByRole('combobox', { name: 'Язык', exact: true })).toBeEnabled()
-    await capture('ready-ui-ru', ready.title.ru)
-    await expectDocumentTitle(page, ready.title.ru)
-    await capture('before-axe-ru', ready.title.ru)
-    await expectNoAxeViolations(page)
-    expect(profileCalls).toBe(0)
+    if (SERVED_LOCALES.length === 1) {
+      await expect(page.getByRole('combobox')).toHaveCount(0)
+      await expect(page).toHaveURL(`${new URL(page.url()).origin}${path}?tag=a&tag=b#locale`)
+    } else {
+      const second = SERVED_LOCALES.at(-1)!
+      await page
+        .getByRole('combobox', { name: first === 'en' ? 'Language' : 'Язык', exact: true })
+        .selectOption(second)
+      await expect(page).toHaveURL(
+        `${new URL(page.url()).origin}${localePathPrefix(second)}${path}?tag=a&tag=b#locale`
+      )
+      await expect(page.getByRole('main').getByText(ready[second], { exact: true })).toBeVisible()
+      await expect(page.locator('[aria-busy="true"]')).toHaveCount(0)
+      await expect(page.locator('html')).toHaveAttribute('lang', second)
+      await expect(
+        page.getByRole('combobox', { name: second === 'en' ? 'Language' : 'Язык', exact: true })
+      ).toBeEnabled()
+      await capture(`ready-ui-${second}`, ready.title[second])
+      await expectDocumentTitle(page, ready.title[second])
+      await capture(`before-axe-${second}`, ready.title[second])
+      await expectNoAxeViolations(page)
+      expect(profileCalls).toBe(0)
+    }
   } catch (error) {
     primaryFailed = true
     primaryError = error

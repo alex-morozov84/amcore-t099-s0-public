@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { DEFAULT_LOCALE } from '@amcore/shared'
+import { DEFAULT_LOCALE, localizedFrontendUrl, productAdminPath } from '@amcore/shared'
 import { expect, test } from '@playwright/test'
 
 import { acceptAdministrator } from '../organization-provisioning/recipient'
@@ -10,13 +10,16 @@ import { proveSetupMailbox, SETUP_PASSWORD, setupCommand } from '../support/orga
 
 test.use({ trace: 'off', screenshot: 'off', video: 'off' })
 
-test('closed signup still admits invited registration and real email proof before membership on staff host', async ({
+test('closed signup still admits invited registration and real email proof before membership for product administration', async ({
   browser,
 }) => {
   test.setTimeout(180000)
   const target = activeTarget()
   const { product, staff } = target.origins
-  if (!staff || target.fixtureProfile !== 'product-admin-closed-signup')
+  const admin = staff ?? product
+  const administration = (path: string) =>
+    localizedFrontendUrl(admin, DEFAULT_LOCALE, staff ? path : productAdminPath(path))
+  if ((!staff && !target.s0Scenario) || target.fixtureProfile !== 'product-admin-closed-signup')
     throw new Error('Closed staff fixture required')
   const messages = JSON.parse(
     readFileSync(join(target.snapshot, `apps/web/messages/${DEFAULT_LOCALE}.json`), 'utf8')
@@ -41,15 +44,15 @@ test('closed signup still admits invited registration and real email proof befor
     ).toBe('created')
     await page.goto(`${product}/en/register`)
     await expect(page.getByText(messages.auth.publicSignupClosed, { exact: true })).toBeVisible()
-    await page.goto(`${staff}/en/login`)
+    await page.goto(administration('/login'))
     await page.getByLabel(messages.auth.email, { exact: true }).fill(operator)
     await page.getByLabel(messages.auth.password, { exact: true }).fill(SETUP_PASSWORD)
     await page.getByRole('button', { name: messages.auth.login, exact: true }).click()
-    await page.waitForURL((url) => url.origin === staff && !url.pathname.endsWith('/login'))
+    await page.waitForURL((url) => url.origin === admin && !url.pathname.endsWith('/login'))
     const org = guardedSql(
       "SELECT id FROM core.organizations WHERE slug='staff-invitation-proof';"
     ).trim()
-    await page.goto(`${staff}/en/organizations/${org}/invites`)
+    await page.goto(administration(`/organizations/${org}/invites`))
     await page
       .getByRole('button', { name: messages.organizationInvitations.invite, exact: true })
       .click()
@@ -64,7 +67,7 @@ test('closed signup still admits invited registration and real email proof befor
       recipient,
       'Staff invitation proof',
       messages,
-      staff
+      admin
     )
     expect(
       guardedSql(

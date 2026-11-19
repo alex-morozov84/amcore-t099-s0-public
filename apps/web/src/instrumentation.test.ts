@@ -1,3 +1,4 @@
+import { PRODUCT_ADMIN_CONFIG } from '@amcore/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { logServerError } from '@/shared/lib/server-logger'
@@ -14,6 +15,11 @@ vi.mock('@/shared/lib/admin-console-startup', () => ({
 
 beforeEach(() => {
   vi.clearAllMocks()
+  vi.stubEnv('FRONTEND_URL', 'https://app.example.test')
+  vi.stubEnv(
+    'PRODUCT_ADMIN_ORIGIN',
+    PRODUCT_ADMIN_CONFIG.mode === 'host' ? 'https://staff.example.test' : ''
+  )
   vi.stubEnv('WEB_FRONTEND_CONTEXT_KEY', '<fake-context-key-at-least-32-characters>')
 })
 

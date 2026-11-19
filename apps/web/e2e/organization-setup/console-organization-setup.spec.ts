@@ -16,8 +16,13 @@ test.use({ trace: 'off', video: 'off', screenshot: 'off' })
 
 test('Console recovers a deleted recipient and lost replies without duplicating access', async ({
   page,
+  browser,
 }) => {
   const m = activeTarget()
+  const consoleApi = m.consoleTopology === 'host' ? '/api' : '/api/console'
+  const consoleOrigin = m.origins.console ?? m.origins.product
+  const organizationPath =
+    m.consoleTopology === 'host' ? 'organizations' : `${m.consoleSlug}/organizations`
   const responses: Array<{ action: string; status: number; errorCode?: string }> = []
   page.on('response', async (response) => {
     const path = new URL(response.url()).pathname
@@ -54,7 +59,7 @@ test('Console recovers a deleted recipient and lost replies without duplicating 
     'UPDATE core.users SET "systemRole" = \'SUPER_ADMIN\' WHERE id = :\'id\' AND "emailVerified" = true;',
     { id: preparedOperator.userId }
   )
-  await page.goto(localizedFrontendUrl(m.origins.console, coerceSupportedLocale('en'), 'login'))
+  await page.goto(localizedFrontendUrl(consoleOrigin, coerceSupportedLocale('en'), 'login'))
   await page.getByRole('textbox', { name: login.email, exact: true }).fill(operator)
   await page.getByLabel(login.password, { exact: true }).fill(SETUP_PASSWORD)
   const signIn = page.waitForResponse(
@@ -64,18 +69,18 @@ test('Console recovers a deleted recipient and lost replies without duplicating 
   if ((await signIn).status() === 202) await completeMfaSignIn(page, operator)
   await page.waitForURL(
     (url) =>
-      url.origin === m.origins.console &&
+      url.origin === consoleOrigin &&
       url.pathname ===
-        new URL(localizedFrontendUrl(m.origins.console, coerceSupportedLocale('en'))).pathname
+        new URL(localizedFrontendUrl(consoleOrigin, coerceSupportedLocale('en'))).pathname
   )
   await page.goto(
-    localizedFrontendUrl(m.origins.console, coerceSupportedLocale('en'), 'organizations')
+    localizedFrontendUrl(consoleOrigin, coerceSupportedLocale('en'), organizationPath)
   )
   await setup.getByRole('button', { name: en.trustedStart, exact: true }).click()
   await expect(setup.getByRole('heading', { name: en.headings.administrator })).toBeVisible()
   await expectNoAxeViolations(page)
 
-  const preparePattern = '**/api/organization-establishment/accounts/prepare'
+  const preparePattern = `**${consoleApi}/organization-establishment/accounts/prepare`
   await page.route(preparePattern, async (route) => {
     await route.fetch()
     await route.abort()
@@ -100,7 +105,7 @@ test('Console recovers a deleted recipient and lost replies without duplicating 
   await expect(setup.getByLabel(en.name, { exact: true })).toHaveCount(0)
   // The mailbox-verification portion starts with an idle source budget.
   resetBrowserProbeDomainBudget()
-  const recipientPage = await page.context().newPage()
+  const recipientPage = await browser.newPage()
   await proveSetupMailbox(recipientPage, recipient)
   await setup.getByRole('button', { name: en.checkEmail, exact: true }).click()
   await expect(setup.getByText(en.verified, { exact: true })).toBeVisible()
@@ -125,7 +130,7 @@ test('Console recovers a deleted recipient and lost replies without duplicating 
   await expectNoAxeViolations(page)
 
   await page.goto(
-    localizedFrontendUrl(m.origins.console, coerceSupportedLocale('ru'), 'organizations')
+    localizedFrontendUrl(consoleOrigin, coerceSupportedLocale('ru'), organizationPath)
   )
   await page.setViewportSize({ width: 375, height: 900 })
   await expect(setup.getByText(ru.recipientUnavailable, { exact: true })).toBeVisible()
@@ -155,7 +160,7 @@ test('Console recovers a deleted recipient and lost replies without duplicating 
 
   // A separate lost-commit-response case retains all authority/state but isolates its source budget.
   resetBrowserProbeDomainBudget()
-  const bootstrapPattern = '**/api/organization-establishment/bootstrap'
+  const bootstrapPattern = `**${consoleApi}/organization-establishment/bootstrap`
   await page.route(bootstrapPattern, async (route) => {
     await route.fetch()
     await route.abort()

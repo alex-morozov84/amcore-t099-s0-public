@@ -1,4 +1,5 @@
 import { completeMfaSignIn } from '../shared/mfa-login'
+import { consolePath, isProductHome, messages, productPath } from '../shared/product-settings'
 import { activeTarget } from '../support/managed-target.mjs'
 
 const standTarget = activeTarget()
@@ -19,7 +20,7 @@ test('host-mode Organizations panel renders real data via the console session, w
   const productPage = await product.newPage()
   await registerViaUi(productPage, email)
   await expect(productPage).toHaveURL(
-    new RegExp('^' + escapeOrigin(standTarget.origins.product) + '/en/?$')
+    (url) => url.origin === standTarget.origins.product && isProductHome(url)
   )
   setSystemRole(email, 'SUPER_ADMIN')
 
@@ -32,13 +33,13 @@ test('host-mode Organizations panel renders real data via the console session, w
     ignoreHTTPSErrors: true,
   })
   const consolePage = await console.newPage()
-  await consolePage.goto('/en/login')
-  await consolePage.getByLabel(/email/i).fill(email)
-  await consolePage.getByLabel(/^password$/i).fill('Test1234Secure')
-  await consolePage.getByRole('button', { name: /sign in/i }).click()
+  await consolePage.goto(productPath('/login'))
+  await consolePage.getByLabel(messages.auth.email, { exact: true }).fill(email)
+  await consolePage.getByLabel(messages.auth.password, { exact: true }).fill('Test1234Secure')
+  await consolePage.getByRole('button', { name: messages.auth.login, exact: true }).click()
   await completeMfaSignIn(consolePage, email)
   await expect(consolePage).toHaveURL(
-    new RegExp('^' + escapeOrigin(standTarget.origins.console) + '/en/?$')
+    (url) => url.origin === standTarget.origins.console && isProductHome(url)
   )
 
   const requestsWithAuthHeader: string[] = []
@@ -46,8 +47,8 @@ test('host-mode Organizations panel renders real data via the console session, w
     if (request.headers().authorization) requestsWithAuthHeader.push(request.url())
   })
 
-  await consolePage.getByRole('link', { name: /organizations/i }).click()
-  await expect(consolePage).toHaveURL(/\/en\/organizations$/)
+  await consolePage.getByRole('link', { name: messages.console.organizations, exact: true }).click()
+  await expect(consolePage).toHaveURL((url) => url.pathname === productPath('/organizations'))
   await expect(consolePage.getByRole('cell', { name: orgName })).toBeVisible()
   await expect(consolePage.getByRole('cell', { name: orgSlug })).toBeVisible()
 
@@ -70,7 +71,7 @@ test('host-mode Organizations panel denies a demoted session with a live re-chec
   const productPage = await product.newPage()
   await registerViaUi(productPage, email)
   await expect(productPage).toHaveURL(
-    new RegExp('^' + escapeOrigin(standTarget.origins.product) + '/en/?$')
+    (url) => url.origin === standTarget.origins.product && isProductHome(url)
   )
   setSystemRole(email, 'SUPER_ADMIN')
 
@@ -79,17 +80,17 @@ test('host-mode Organizations panel denies a demoted session with a live re-chec
     ignoreHTTPSErrors: true,
   })
   const consolePage = await console.newPage()
-  await consolePage.goto('/en/login')
-  await consolePage.getByLabel(/email/i).fill(email)
-  await consolePage.getByLabel(/^password$/i).fill('Test1234Secure')
-  await consolePage.getByRole('button', { name: /sign in/i }).click()
+  await consolePage.goto(productPath('/login'))
+  await consolePage.getByLabel(messages.auth.email, { exact: true }).fill(email)
+  await consolePage.getByLabel(messages.auth.password, { exact: true }).fill('Test1234Secure')
+  await consolePage.getByRole('button', { name: messages.auth.login, exact: true }).click()
   await completeMfaSignIn(consolePage, email)
   await expect(consolePage).toHaveURL(
-    new RegExp('^' + escapeOrigin(standTarget.origins.console) + '/en/?$')
+    (url) => url.origin === standTarget.origins.console && isProductHome(url)
   )
 
   setSystemRole(email, 'USER')
-  const response = await consolePage.goto('/en/organizations')
+  const response = await consolePage.goto(productPath('/organizations'))
   expect(response?.status()).toBe(404)
 
   await product.close()
@@ -107,7 +108,7 @@ test('the admin route is denied on the product host even for a real SUPER_ADMIN 
   const productPage = await product.newPage()
   await registerViaUi(productPage, email)
   await expect(productPage).toHaveURL(
-    new RegExp('^' + escapeOrigin(standTarget.origins.product) + '/en/?$')
+    (url) => url.origin === standTarget.origins.product && isProductHome(url)
   )
   setSystemRole(email, 'SUPER_ADMIN')
 
@@ -115,12 +116,8 @@ test('the admin route is denied on the product host even for a real SUPER_ADMIN 
   // `admin/layout.tsx` on the *incoming Host header*, independent of
   // `requireSuperAdmin()` - the physical path must 404 on the wrong host
   // even for a genuinely privileged product session.
-  const response = await productPage.goto('/en/admin/organizations')
+  const response = await productPage.goto(consolePath('/organizations'))
   expect(response?.status()).toBe(404)
 
   await product.close()
 })
-
-function escapeOrigin(origin: string): string {
-  return origin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}

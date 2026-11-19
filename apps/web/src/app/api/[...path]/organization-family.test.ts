@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { cookies } from 'next/headers'
+import { PRODUCT_ADMIN_CONFIG } from '@amcore/shared'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import * as route from '@/app/api/[...path]/route'
@@ -21,6 +22,10 @@ describe('composed generic organization aliases close before authentication', ()
     '%s cannot bypass the typed boundary',
     async (method) => {
       vi.stubEnv('FRONTEND_URL', 'https://web.test')
+      vi.stubEnv(
+        'PRODUCT_ADMIN_ORIGIN',
+        PRODUCT_ADMIN_CONFIG.mode === 'host' ? 'https://staff.example.test' : ''
+      )
       vi.stubEnv('WEB_FRONTEND_CONTEXT_KEY', '<fake-context-key-at-least-32-characters>')
       const fetch = vi.fn()
       vi.stubGlobal('fetch', fetch)

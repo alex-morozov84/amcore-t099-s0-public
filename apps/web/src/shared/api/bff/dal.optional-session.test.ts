@@ -1,6 +1,6 @@
 // @vitest-environment node
 import type * as ReactModule from 'react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { getOptionalSession, getOptionalSessionEntry } from './dal'
 import { fakeUser, fakeVaultEntry, mockSessionCookie } from './dal.test-helpers'
@@ -11,6 +11,8 @@ import {
   SessionRefreshUnsafeError,
   SessionVaultUnavailableError,
 } from './errors'
+
+afterEach(() => vi.unstubAllEnvs())
 
 vi.mock('server-only', () => ({}))
 vi.mock('next/headers', () => ({ cookies: vi.fn(), headers: vi.fn(async () => new Headers()) }))

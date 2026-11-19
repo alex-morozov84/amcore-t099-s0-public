@@ -1,0 +1,83 @@
+import { s0Scenarios } from './s0-scenarios.mjs'
+import { readFile } from 'node:fs/promises'
+import assert from 'node:assert/strict'
+import { pathToFileURL } from 'node:url'
+import { join } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
+
+export async function sourceSettings(root) {
+  return Object.fromEntries(
+    await Promise.all(
+      ['locales', 'admin-console', 'product-admin'].map(async (name) => [
+        name,
+        JSON.parse(await readFile(join(root, `packages/shared/src/config/${name}.json`), 'utf8')),
+      ])
+    )
+  )
+}
+
+/** Retain source and exercised choices in the existing stand manifest. */
+export async function recordSettings(m) {
+  m.exercisedSettings = await sourceSettings(m.snapshot)
+  await assertSettings(m)
+}
+
+export async function assertSettings(m) {
+  if (!m.settingsPolicy) return // Existing retained stands predate this manifest field.
+  if (!['preserve', 'variant'].includes(m.settingsPolicy))
+    throw new Error('Invalid settings policy')
+  const exercised = await sourceSettings(m.snapshot)
+  if (!isDeepStrictEqual(exercised, m.exercisedSettings))
+    throw new Error('Stand settings changed after preparation')
+  if (m.settingsPolicy === 'preserve' && !isDeepStrictEqual(m.sourceSettings, exercised))
+    throw new Error('Product execution must preserve source settings')
+}
+
+export async function assertCompiledSettings(m) {
+  await assertSettings(m)
+  const settings = m.exercisedSettings
+  assert.deepEqual(settings, await sourceSettings(m.worktree), 'S0 source settings changed')
+  const shared = await import(pathToFileURL(join(m.snapshot, 'packages/shared/dist/index.js')).href)
+  assert.deepEqual(shared.SERVED_LOCALES, settings.locales.enabled)
+  assert.equal(shared.DEFAULT_LOCALE, settings.locales.default)
+  assert.deepEqual(shared.ADMIN_CONSOLE_SETTINGS, settings['admin-console'])
+  assert.deepEqual(shared.PRODUCT_ADMIN_CONFIG, settings['product-admin'])
+  const product = new URL(m.origins.product)
+  assert.equal(m.consoleTopology, 'path')
+  assert.equal(m.productAdminHost, false)
+  assert.equal(m.origins.console ?? m.origins.staff, undefined)
+  assert.equal(product.protocol, s0Scenarios[m.s0Scenario]?.https ? 'https:' : 'http:')
+}
+
+export function assertPreserveRequest(policy, fixture, topology, choices, scenario) {
+  if (!['preserve', 'variant'].includes(policy)) throw new Error('Invalid settings policy')
+  if (scenario) {
+    const plan = s0Scenarios[scenario]
+    if (
+      policy !== 'preserve' ||
+      !plan ||
+      plan.fixture !== fixture ||
+      choices.topology !== 'path' ||
+      !choices.consoleEnabled ||
+      topology !== (plan.https ? 'host' : 'path')
+    )
+      throw new Error('S0 stand does not match the declared scenario')
+    return
+  }
+  if (policy === 'preserve' && (fixture || (topology && topology !== choices.topology)))
+    throw new Error('Preserved settings cannot use a topology variant or fixture')
+}
+
+/** Admit native transport before allocating a stand or contacting its engine. */
+export function preservedTopology(lane, choices) {
+  if (
+    lane === 'console-real-stack' &&
+    (!choices.consoleEnabled || choices.consoleTopology !== 'host')
+  )
+    throw new Error('Native Console lane requires enabled host source settings')
+  if (lane === 'product-admin-real-stack')
+    throw new Error('Native product checks use real-stack, not starter staff fixtures')
+  if (lane === 'mocked' && choices.topology === 'host')
+    throw new Error('Native mocked host transport is not prepared')
+  return choices.topology
+}

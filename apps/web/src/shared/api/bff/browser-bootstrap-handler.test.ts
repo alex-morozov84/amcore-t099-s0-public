@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { PRODUCT_ADMIN_CONFIG } from '@amcore/shared'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
 import { fetchBackendResponse } from '../backend-transport'
@@ -20,7 +21,10 @@ vi.mock('./browser-auth-attempt', () => ({
 beforeEach(() => {
   vi.clearAllMocks()
   vi.stubEnv('FRONTEND_URL', 'https://app.example.test')
-  vi.stubEnv('PRODUCT_ADMIN_ORIGIN', '')
+  vi.stubEnv(
+    'PRODUCT_ADMIN_ORIGIN',
+    PRODUCT_ADMIN_CONFIG.mode === 'host' ? 'https://staff.example.test' : ''
+  )
   vi.stubEnv('WEB_FRONTEND_CONTEXT_KEY', '<fake-bootstrap-private-key-at-least-32>')
 })
 afterEach(() => vi.unstubAllEnvs())

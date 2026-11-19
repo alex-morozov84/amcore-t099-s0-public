@@ -29,9 +29,12 @@ export function testOptions() {
 export function outputPaths() {
   const m = activeTarget()
   const dir = `${m.worktree}/.amcore/stands/${m.id}`
+  const reporter = standReporters(m, dir)
+  if (process.env.AMCORE_S0_REPORT)
+    reporter.push([join(m.snapshot, 'apps/web/e2e/support/s0-results.mjs')])
   return {
     outputDir: `${dir}/test-results`,
-    reporter: standReporters(m, dir),
+    reporter,
   }
 }
 export function standReporters(m, dir) {

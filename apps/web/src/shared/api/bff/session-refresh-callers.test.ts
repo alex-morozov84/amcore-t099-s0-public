@@ -1,7 +1,7 @@
 // @vitest-environment node
 import type * as ReactModule from 'react'
 import { cookies, headers } from 'next/headers'
-import { AMCORE_CLIENT_IP_HEADER } from '@amcore/shared'
+import { AMCORE_CLIENT_IP_HEADER, PRODUCT_ADMIN_CONFIG } from '@amcore/shared'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
 import { proxyToBackend } from './authenticated-proxy'
@@ -43,6 +43,10 @@ vi.mock('./ensure-fresh-session', () => ({
 
 beforeEach(() => {
   vi.stubEnv('FRONTEND_URL', 'https://app.example.test')
+  vi.stubEnv(
+    'PRODUCT_ADMIN_ORIGIN',
+    PRODUCT_ADMIN_CONFIG.mode === 'host' ? 'https://staff.example.test' : ''
+  )
   vi.stubEnv('WEB_FRONTEND_CONTEXT_KEY', '<fake-test-context-key-at-least-32-characters>')
   vi.stubEnv('WEB_TRUSTED_CLIENT_IP_HEADER', 'x-real-ip')
   vi.mocked(cookies).mockResolvedValue({ get: () => ({ value: 'vault-id' }) } as never)

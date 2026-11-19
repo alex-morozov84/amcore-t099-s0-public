@@ -1,3 +1,5 @@
+import { cardSpec } from '../lib/s0-card-selection.mjs'
+import { caseDigest } from './s0-case-evidence.mjs'
 import assert from 'node:assert/strict'
 import { writeFile } from 'node:fs/promises'
 import { selectedFiles, specFiles } from '../e2e-ci-plan.mjs'
@@ -11,12 +13,15 @@ const flatten = (suites, directory = 'real-stack') =>
         id: `${spec.id}:${test.projectName}`,
         file: `e2e/${directory}/${spec.file}`,
         title: spec.title,
+        caseId: spec.id,
+        expectedStatus: test.expectedStatus,
       }))
     ),
     ...flatten(suite.suites ?? [], directory),
   ])
 
 async function collect(options, args = [], lane = 'real-stack') {
+  const config = lane === 'mocked' ? 'playwright.config.ts' : `playwright.${lane}.config.ts`
   const report = JSON.parse(
     await run(
       'pnpm',
@@ -26,7 +31,7 @@ async function collect(options, args = [], lane = 'real-stack') {
         'exec',
         'playwright',
         'test',
-        `--config=playwright.${lane}.config.ts`,
+        `--config=${config}`,
         ...args,
         '--list',
         '--reporter=json',
@@ -38,16 +43,34 @@ async function collect(options, args = [], lane = 'real-stack') {
   return flatten(report.suites, lane)
 }
 
-export async function groupArguments(m, group, options) {
+function assertCollectedCases(tests, expected) {
+  assert.ok(
+    tests.every((test) => test.expectedStatus === 'passed'),
+    'Unexpected S0 collection skip'
+  )
+  assert.equal(
+    caseDigest(tests.map((test) => test.caseId)),
+    expected,
+    'S0 collection differs from plan'
+  )
+}
+
+export async function s0Inventory(options, lane, expected) {
+  assertCollectedCases(await collect(options, [], lane), expected)
+}
+
+export async function groupArguments(m, group, options, caseSet, cardOnly = false) {
   const tests = await collect(options)
   assert.equal(new Set(tests.map((test) => test.id)).size, tests.length, 'Duplicate test IDs')
   assert.deepEqual([...new Set(tests.map((test) => test.file))].sort(), specFiles(m.snapshot))
-  const files = selectedFiles(m.snapshot, group)
+  assert.ok(!cardOnly || (group === 'standard' && caseSet), 'Invalid card selection')
+  const files = cardOnly ? [cardSpec] : selectedFiles(m.snapshot, group)
   assert.ok(files.length, 'Empty E2E group refused')
   const args = files.map((file) => RegExp.escape(file) + '$')
   const expected = tests.filter((test) => files.includes(test.file))
   assert.ok(expected.length, 'No tests selected')
   assert.deepEqual(await collect(options, args), expected, 'E2E selection lost or duplicated tests')
+  if (caseSet) assertCollectedCases(expected, caseSet)
   await writeFile(
     `${m.worktree}/.amcore/stands/${m.id}/inventory.json`,
     JSON.stringify(

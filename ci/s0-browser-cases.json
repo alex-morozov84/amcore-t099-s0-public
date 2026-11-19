@@ -1,0 +1,15 @@
+{
+  "mocked": "a1977460be50da7796b4c0fb383cb69ecac9c10245a1dce231f861aef97c9100",
+  "configured-standard": "e035952b2b3c3d5e7c3846647f9ef0f59f1a30f3fc5dc2c40757916b14d2bb7e",
+  "configured-disruptive": "d5456eb2aa68c9b3f92a740c0d1301e7e45de0970ed82d8b984fc22a5ebd206b",
+  "configured-console-summary": "4316d4ad12c98e92e2eaa18f1dd5537fbf705d873b771ca89e097859780387ae",
+  "configured-setup": "0b7821d32cb9c0db5cb2117c0c7b2efc852d3a571d394209a571f32c5a793fc1",
+  "configured-console-setup": "440556dbae46ec86686d9c22ce80aa8174257289ea70b409b891153f0a5eb7fb",
+  "configured-provisioning": "253af97576ab6705d73b4ffe5f8d2b74808439b9ff369ceb8446873bfe55f898",
+  "configured-path-oauth": "1734f6ee00a7ed0c45d0a3219719c5d0f8606c424c734bbe90770ec1fc673200",
+  "configured-invitation": "5dc89e3981dec0831131a0a2cfeb17e1f69d68c1a87ffdf4c20a04acfa9e1ec5",
+  "configured-support-mail": "a62985a2b9a7036d9e34bed1f58b8deccaa80e264fd7205d7ae07eabba501079",
+  "configured-placement": "304c5e798369b84e4d849092d18112244fb8ac8576d1102bd587e043e4d51b14",
+  "configured-console-session": "07d05bce6cc9ff421cac01b8082898e0a472bd18797913bfa8714d9985a5fa41",
+  "configured-invitation-https": "7e29a2a044e2251292e3c88122afb2a70838d3f94e923d4f435b7e8bca87cfa6"
+}

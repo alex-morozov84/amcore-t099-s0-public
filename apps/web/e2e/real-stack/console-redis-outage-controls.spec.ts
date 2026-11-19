@@ -1,16 +1,23 @@
+import { ADMIN_CONSOLE_SETTINGS } from '@amcore/shared'
 import { type BrowserContext, expect, test } from '@playwright/test'
 
+import { consolePath, isProductHome, messages } from '../shared/product-settings'
 import { settingsProof } from '../support/runtime-settings-proof'
 
 import { setSystemRole } from './admin-helpers'
 import { loginViaUi, registerViaUi, uniqueEmail } from './helpers'
+
+test.skip(
+  ADMIN_CONSOLE_SETTINGS.mode !== 'path',
+  'Requires configured path Console; isolated-host scenarios run in the host family'
+)
 
 // Console route under a stalled session vault: the temporary state is the only difference an
 // outsider may see, and only for a request that carries some session cookie. Operator identity,
 // queue data and the shell never render. Normal denial returns after recovery.
 test.describe.configure({ mode: 'serial' })
 
-const URL = '/en/admin/background-work'
+const URL = consolePath('/background-work')
 const STALL_MS = 40_000 // `pause-redis` pauses the stand's Redis for 40 s
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -39,7 +46,7 @@ test('Console vault stall preserves four isolated sessions and recovery', async 
     const operator = await createContext()
     const page = await user.newPage()
     await registerViaUi(page, uniqueEmail('console-outage-user'))
-    await expect(page).toHaveURL(/\/en\/?$/)
+    await expect(page).toHaveURL(isProductHome)
     await invented.addCookies([{ name: 'amcore_session', value: 'A'.repeat(43), url: baseURL! }])
     const operatorPage = await operator.newPage()
     const email = uniqueEmail('console-outage-operator')
@@ -102,7 +109,9 @@ test('Console vault stall preserves four isolated sessions and recovery', async 
     await test.step('operator board returns after recovery', async () => {
       await expect(async () => {
         await operatorPage.goto(URL)
-        await expect(operatorPage.getByRole('table', { name: 'Background queues' })).toBeVisible({
+        await expect(
+          operatorPage.getByRole('table', { name: messages.console.backgroundWork.tableLabel })
+        ).toBeVisible({
           timeout: 5000,
         })
       }).toPass({ timeout: 90_000, intervals: [2000, 5000] })

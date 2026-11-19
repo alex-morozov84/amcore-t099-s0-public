@@ -3,9 +3,10 @@ import { invariant } from './lighthouse-plan.mjs'
 export function auditCommand(plan, lane, id, reuse = false) {
   invariant(plan.assignments[lane]?.length, 'select-an-audit-owning-lane')
   let standLane = lane === 'staff-oauth' ? 'product-admin-real-stack' : 'real-stack'
-  if (lane === 'host') standLane = 'console-real-stack'
+  if (lane === 'host' || lane === 'configured-console') standLane = 'console-real-stack'
   const args = ['scripts/stand.mjs', 'e2e', '--lane', standLane, '--audit-only', '--id', id]
   if (lane === 'staff-oauth' && !reuse) args.push('--fixture', 'product-admin-oauth')
+  if (plan.execution === 'configured') args.push('--settings-policy', 'preserve')
   if (reuse) args.push('--reuse-audit')
   return args
 }

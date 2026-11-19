@@ -1,3 +1,4 @@
+import { assertSettings } from './settings-policy.mjs'
 import { writeView } from '../lib/lighthouse-view-export.mjs'
 import { admitAuditAfterTests } from '../lib/lighthouse-admission.mjs'
 import { packReports } from '../lib/lighthouse-archive.mjs'
@@ -18,12 +19,20 @@ export async function runAuditPhase(m, token) {
   invariant(!invoked.has(m), 'duplicate-audit-phase')
   invoked.add(m)
   const expected = JSON.parse(process.env.AMCORE_AUDIT_PLAN)
+  if (expected.execution === 'configured') {
+    invariant(m.settingsPolicy === 'preserve', 'configured-audit-requires-preserved-settings')
+    await assertSettings(m)
+  }
   const lane = process.env.AMCORE_AUDIT_OWNER
-  const plan = auditPlan(m.worktree, {
-    run: expected.run,
-    attempt: expected.attempt,
-    source: expected.source,
-  })
+  const plan = auditPlan(
+    m.worktree,
+    { run: expected.run, attempt: expected.attempt, source: expected.source },
+    {
+      configured: expected.execution === 'configured',
+      s0: Boolean(expected.browserCases),
+      cardOnly: expected.cardOnly === true,
+    }
+  )
   invariant(
     plan.digest === expected.digest && plan.assignments[lane]?.length,
     'unassigned-audit-phase'

@@ -1,4 +1,4 @@
-import { BULL_BOARD_CONTENT_SECURITY_POLICY } from '@amcore/shared'
+import { BULL_BOARD_CONTENT_SECURITY_POLICY, DEFAULT_LOCALE } from '@amcore/shared'
 import { expect, type Locator, type Page } from '@playwright/test'
 
 import { probeRefusalEvidence } from '../real-stack/helpers'
@@ -13,6 +13,12 @@ import {
 } from '../support/queue-fixture'
 
 import { expectNoAxeViolations } from './axe'
+import { messages, translate } from './product-settings'
+
+const workNames = {
+  en: { default: 'Default queue', email: 'Email delivery' },
+  ru: { default: 'Общая очередь', email: 'Отправка писем' },
+}[DEFAULT_LOCALE]
 
 export const QUEUES_ROUTE = /\/api\/(?:console\/)?background-work\/queues$/
 
@@ -29,19 +35,29 @@ export async function backgroundWorkJourney(page: Page, url: string): Promise<vo
   try {
     await page.clock.install()
     await page.goto(url)
-    await expect(page.getByRole('heading', { level: 1, name: 'Background work' })).toBeVisible()
+    await expect(
+      page.getByRole('heading', { level: 1, name: messages.console.backgroundWork.title })
+    ).toBeVisible()
 
     // First snapshot: server-rendered, with the paused default queue counted as waiting.
     const queue = page
-      .getByRole('table', { name: 'Background queues' })
-      .getByRole('row', { name: /Default/ })
-    await expect(queue).toContainText('Paused')
+      .getByRole('table', { name: messages.console.backgroundWork.tableLabel })
+      .getByRole('row', { name: messages.console.backgroundWork.queues.default.title })
+    await expect(queue).toContainText(messages.console.backgroundWork.paused)
     await expect(queue.getByRole('cell').nth(2)).toHaveText('3')
-    await expect(queue).toContainText('At least 5 minutes')
+    await expect(queue).toContainText(
+      translate('console.backgroundWork.ageAtLeast', {
+        age: translate('console.backgroundWork.ageMinutes', { n: 5 }),
+      })
+    )
     await expect(
-      page.getByRole('table', { name: 'Background queues' }).getByRole('row', { name: /Email/ })
-    ).toContainText('Not paused')
-    await expect(page.getByText('Unavailable', { exact: true })).toHaveCount(0)
+      page
+        .getByRole('table', { name: messages.console.backgroundWork.tableLabel })
+        .getByRole('row', { name: messages.console.backgroundWork.queues.email.title })
+    ).toContainText(messages.console.backgroundWork.notPaused)
+    await expect(
+      page.getByText(messages.console.backgroundWork.unavailable, { exact: true })
+    ).toHaveCount(0)
 
     // Live refresh: a new job appears after the automatic period, with no navigation.
     addDefaultQueueJob('e2e-extra')
@@ -51,20 +67,19 @@ export async function backgroundWorkJourney(page: Page, url: string): Promise<vo
     await expect(queue.getByRole('cell').nth(2)).toHaveText('4')
 
     // Manual refresh works while auto-refresh is paused, and pausing never touches the queue.
-    const auto = page.getByRole('button', { name: 'Auto-refresh: on' })
+    const auto = page.getByRole('button', { name: messages.console.backgroundWork.autoRefreshOn })
     await expect(auto).toHaveAttribute('aria-pressed', 'true')
     await auto.click()
-    await expect(page.getByRole('button', { name: 'Auto-refresh: paused' })).toHaveAttribute(
-      'aria-pressed',
-      'false'
-    )
+    await expect(
+      page.getByRole('button', { name: messages.console.backgroundWork.autoRefreshOff })
+    ).toHaveAttribute('aria-pressed', 'false')
     let automatic = 0
     page.on('request', (request) => QUEUES_ROUTE.test(request.url()) && automatic++)
     await page.clock.runFor(120_000)
     expect(automatic).toBe(0)
-    await expect(queue).toContainText('Paused')
+    await expect(queue).toContainText(messages.console.backgroundWork.paused)
     const manual = page.waitForRequest((request) => QUEUES_ROUTE.test(request.url()))
-    await page.getByRole('button', { name: 'Refresh', exact: true }).click()
+    await page.getByRole('button', { name: messages.console.overviewRefresh, exact: true }).click()
     await manual
 
     // Real command UUIDs must use wall time, not the advanced polling-test clock.
@@ -72,45 +87,114 @@ export async function backgroundWorkJourney(page: Page, url: string): Promise<vo
     await page.clock.resume()
 
     // Native commands use captured confirmation/receipts; Board remains view-only.
-    const controls = page.getByRole('region', { name: 'Task management' })
+    const controls = page.getByRole('region', {
+      name: messages.console.backgroundWork.control.title,
+    })
     const external = controls
       .getByRole('article')
-      .filter({ has: page.getByRole('heading', { name: /Default queue/ }) })
-    await expect(external.getByText('Queue-wide pause is not supported')).toBeVisible()
-    await expect(external.getByRole('button', { name: /^(Pause|Resume)$/ })).toHaveCount(0)
+      .filter({ has: page.getByRole('heading', { name: workNames.default }) })
+    await expect(
+      external.getByText(messages.console.backgroundWork.control.unsupportedQueue)
+    ).toBeVisible()
+    await expect(
+      external
+        .getByRole('button', {
+          name: messages.console.backgroundWork.control.actions.pause,
+          exact: true,
+        })
+        .or(
+          external.getByRole('button', {
+            name: messages.console.backgroundWork.control.actions.resume,
+            exact: true,
+          })
+        )
+    ).toHaveCount(0)
     const work = controls
       .getByRole('article')
-      .filter({ has: page.getByRole('heading', { name: /Email delivery/ }) })
-    await expect(work.getByRole('button', { name: 'Pause', exact: true })).toBeEnabled()
-    await expect(work.getByRole('button', { name: 'Resume', exact: true })).toHaveCount(0)
-    await work.getByRole('button', { name: 'Pause', exact: true }).click()
-    const confirmation = page.getByRole('dialog', { name: 'Pause: Email delivery' })
-    await confirmation.getByText('Technical details', { exact: true }).click()
-    await expect(confirmation).toContainText('Captured work state version:')
+      .filter({ has: page.getByRole('heading', { name: workNames.email }) })
+    await expect(
+      work.getByRole('button', {
+        name: messages.console.backgroundWork.control.actions.pause,
+        exact: true,
+      })
+    ).toBeEnabled()
+    await expect(
+      work.getByRole('button', {
+        name: messages.console.backgroundWork.control.actions.resume,
+        exact: true,
+      })
+    ).toHaveCount(0)
+    await work
+      .getByRole('button', {
+        name: messages.console.backgroundWork.control.actions.pause,
+        exact: true,
+      })
+      .click()
+    const confirmation = page.getByRole('dialog', {
+      name: translate('console.backgroundWork.control.confirmTitle', {
+        operation: messages.console.backgroundWork.control.actions.pause,
+        work: workNames.email,
+      }),
+    })
+    await confirmation
+      .getByText(messages.console.backgroundWork.control.technicalDetails, { exact: true })
+      .click()
+    await expect(confirmation).toContainText(
+      translate('console.backgroundWork.control.capturedRevision', { revision: '' })
+    )
     await expectNoAxeViolations(page)
-    await confirmation.getByRole('button', { name: 'Cancel', exact: true }).click()
-    await expect(work.getByRole('button', { name: 'Pause', exact: true })).toBeEnabled()
+    await confirmation.getByRole('button', { name: messages.common.cancel, exact: true }).click()
+    await expect(
+      work.getByRole('button', {
+        name: messages.console.backgroundWork.control.actions.pause,
+        exact: true,
+      })
+    ).toBeEnabled()
     const apply = async (button: Locator, dialog: Locator, opposite: Locator, notice: Locator) => {
       await button.click()
       await dialog
-        .getByLabel('Reason for the action — recorded in the audit log')
+        .getByLabel(messages.console.backgroundWork.control.reason)
         .fill('Browser control conformance')
-      await dialog.getByRole('button', { name: 'Confirm action' }).click()
+      await dialog
+        .getByRole('button', { name: messages.console.backgroundWork.control.confirm })
+        .click()
       await expect(dialog).toBeHidden()
       await expect(notice).toBeVisible()
       await expect(opposite).toBeEnabled()
     }
     await apply(
-      work.getByRole('button', { name: 'Pause', exact: true }),
-      page.getByRole('dialog', { name: 'Pause: Email delivery' }),
-      work.getByRole('button', { name: 'Resume', exact: true }),
-      page.getByText('Processing paused', { exact: true })
+      work.getByRole('button', {
+        name: messages.console.backgroundWork.control.actions.pause,
+        exact: true,
+      }),
+      page.getByRole('dialog', {
+        name: translate('console.backgroundWork.control.confirmTitle', {
+          operation: messages.console.backgroundWork.control.actions.pause,
+          work: workNames.email,
+        }),
+      }),
+      work.getByRole('button', {
+        name: messages.console.backgroundWork.control.actions.resume,
+        exact: true,
+      }),
+      page.getByText(messages.console.backgroundWork.control.success.pause, { exact: true })
     )
     await apply(
-      work.getByRole('button', { name: 'Resume', exact: true }),
-      page.getByRole('dialog', { name: 'Resume: Email delivery' }),
-      work.getByRole('button', { name: 'Pause', exact: true }),
-      page.getByText('Processing resumed', { exact: true })
+      work.getByRole('button', {
+        name: messages.console.backgroundWork.control.actions.resume,
+        exact: true,
+      }),
+      page.getByRole('dialog', {
+        name: translate('console.backgroundWork.control.confirmTitle', {
+          operation: messages.console.backgroundWork.control.actions.resume,
+          work: workNames.email,
+        }),
+      }),
+      work.getByRole('button', {
+        name: messages.console.backgroundWork.control.actions.pause,
+        exact: true,
+      }),
+      page.getByText(messages.console.backgroundWork.control.success.resume, { exact: true })
     )
     await expect(page.locator('a[href*="/admin/queues"]')).toHaveCount(0)
 
@@ -121,10 +205,16 @@ export async function backgroundWorkJourney(page: Page, url: string): Promise<vo
 
     // Narrow screens show cards, not a squeezed table.
     await page.setViewportSize({ width: 375, height: 800 })
-    await expect(page.getByRole('table', { name: 'Background queues' })).toBeHidden()
-    await expect(page.getByRole('list', { name: 'Background queues' })).toBeVisible()
+    await expect(
+      page.getByRole('table', { name: messages.console.backgroundWork.tableLabel })
+    ).toBeHidden()
+    await expect(
+      page.getByRole('list', { name: messages.console.backgroundWork.tableLabel })
+    ).toBeVisible()
     // The page's own content fits the viewport (the Console header is shell-owned, outside this page).
-    const box = await page.getByRole('list', { name: 'Background queues' }).boundingBox()
+    const box = await page
+      .getByRole('list', { name: messages.console.backgroundWork.tableLabel })
+      .boundingBox()
     expect(box).not.toBeNull()
     expect((box?.x ?? 0) + (box?.width ?? 0)).toBeLessThanOrEqual(375)
     await expectNoAxeViolations(page)
@@ -197,17 +287,17 @@ export async function queueBoardJourney(
   seedBoardDiagnostics()
   try {
     await page.goto(pageUrl)
-    await expect(
-      page.getByText('Bull Board provides a separate technical, view-only queue dashboard.')
-    ).toBeVisible()
-    await expect(page.getByLabel(/Retrying or deleting jobs and managing queues/)).toBeVisible()
-    const entry = page.getByRole('link', { name: /Open queue board/ })
+    await expect(page.getByText(messages.console.backgroundWork.boardPointer)).toBeVisible()
+    await expect(page.getByLabel(messages.console.backgroundWork.board.noteBody)).toBeVisible()
+    const entry = page.getByRole('link', { name: messages.console.backgroundWork.board.openLink })
     await expect(entry).toHaveAttribute('href', boardPath)
     await expect(entry).toHaveAttribute('target', '_blank')
     await expect(entry).toHaveAttribute('rel', 'noopener noreferrer')
-    const rowLinks = page.getByRole('table', { name: 'Background queues' }).getByRole('link', {
-      name: /Open in queue board/,
-    })
+    const rowLinks = page
+      .getByRole('table', { name: messages.console.backgroundWork.tableLabel })
+      .getByRole('link', {
+        name: messages.console.backgroundWork.board.rowLink,
+      })
     await expect(rowLinks).toHaveCount(4)
     await expect(rowLinks.first()).toHaveAttribute('href', `${boardPath}/queue/email`)
     await expectNoAxeViolations(page)
@@ -247,7 +337,7 @@ export async function queueBoardJourney(
     )
     await board.getByRole('tab', { name: 'Data' }).click()
     await expect(board.getByText('[hidden]').first()).toBeVisible()
-    await board.getByRole('tab', { name: 'Logs' }).click()
+    await board.getByRole('tab', { name: messages.console.externalToolsLogs }).click()
     await expect(board.getByText('Logs are not displayed in this board.')).toBeVisible()
     await expect(board.locator('[class*="jobFlowCard-"]')).toHaveCount(0)
     await expect(board.locator('body')).not.toContainText(BOARD_CANARY)

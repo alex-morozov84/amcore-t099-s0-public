@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { NextResponse } from 'next/server'
+import { PRODUCT_ADMIN_CONFIG } from '@amcore/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('server-only', () => ({}))
@@ -13,8 +14,9 @@ import { handleConsoleLogin } from './auth-handler'
 import { consoleBrowserContext } from './browser-context'
 import { isTrustedConsoleOrigin } from './origin-guard'
 
-const config = ADMIN_CONSOLE_CONFIG as { mode: 'path' | 'host' }
+const config = ADMIN_CONSOLE_CONFIG as { enabled: boolean; mode: 'disabled' | 'path' | 'host' }
 const original = config.mode
+const originalEnabled = config.enabled
 function request(path = '/api/console/auth/login', host = 'console.example.test') {
   return new Request(`https://${host}${path}`, {
     method: 'POST',
@@ -23,11 +25,18 @@ function request(path = '/api/console/auth/login', host = 'console.example.test'
   })
 }
 beforeEach(() => {
+  vi.stubEnv('FRONTEND_URL', 'https://shop.example.test')
+  vi.stubEnv(
+    'PRODUCT_ADMIN_ORIGIN',
+    PRODUCT_ADMIN_CONFIG.mode === 'host'
+      ? 'https://staff.example.test'
+      : 'https://shop.example.test'
+  )
   vi.clearAllMocks()
+  config.enabled = true
   config.mode = 'host'
   vi.stubEnv('ADMIN_CONSOLE_HOSTNAME', 'console.example.test')
   vi.stubEnv('ADMIN_CONSOLE_ORIGIN', 'https://console.example.test')
-  vi.stubEnv('FRONTEND_URL', 'https://shop.example.test')
   vi.stubEnv('WEB_FRONTEND_CONTEXT_KEY', '<fake-console-private-context-key-at-least-32>')
   vi.mocked(isTrustedConsoleOrigin).mockReturnValue(true)
   vi.mocked(handleBrowserPassword).mockResolvedValue(
@@ -38,6 +47,7 @@ beforeEach(() => {
   )
 })
 afterEach(() => {
+  config.enabled = originalEnabled
   config.mode = original
   vi.unstubAllEnvs()
 })

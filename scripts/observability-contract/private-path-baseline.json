@@ -170,18 +170,6 @@
       "kind": "debt"
     },
     {
-      "file": "apps/web/e2e/real-stack/csp-nonce.spec.ts",
-      "target": "ai/models-talk.md",
-      "count": 2,
-      "kind": "debt"
-    },
-    {
-      "file": "apps/web/e2e/real-stack/csp-nonce.spec.ts",
-      "target": "ai/STATUS.md",
-      "count": 1,
-      "kind": "debt"
-    },
-    {
       "file": "apps/web/e2e/real-stack/register-and-logout.spec.ts",
       "target": "ai/models-talk.md",
       "count": 1,

@@ -19,6 +19,15 @@ of workflow self-hardening to keep the example forkable.
 | `workflow-lint.yml`     | `push`, `pull_request`                  | actionlint, zizmor, action pin verifier                                                             | blocking                             |
 | `pr-title.yml`          | `pull_request`                          | Conventional-Commits PR-title lint                                                                  | blocking (squash title = commit msg) |
 
+The `CI required` job checks every job in `ci.yml`, including Web E2E and Storybook.
+It rejects missing, failed, cancelled or skipped dependencies. It does not replace
+the API and Web aggregates' inventory and evidence checks. Secret scanning and
+other companion workflows retain their own results.
+
+Adding this job does not make it merge-blocking automatically. The repository owner
+must first observe a successful run, then require its exact check name in the live
+ruleset. Keep existing required checks until that transition is verified.
+
 ## Lighthouse evidence admission
 
 The Web E2E workflow declares explicit Lighthouse owners and exact current-run/attempt
@@ -814,3 +823,23 @@ Separate queue, setup, cache and container costs; do not infer speed from a shor
 Rollback of the repeat removal restores the focused/background job, its fresh
 prepare and artifact upload, the Test dependency and expected set, contract tests
 and documentation together. It does not migrate dependencies or persistent data.
+
+### Synthetic S0 browser inventory
+
+This product selects its complete S0 inventory in Web E2E. Run the source-only
+plan from the repository root with
+`AMCORE_E2E_INVENTORY=s0 node scripts/e2e-ci.mjs --matrix`. Use `--audit-plan` to
+see the case-set hashes and assigned audits. Broad, mixed and unknown changes
+use this inventory. The standard group retains all its applicable cases.
+
+The plan requires both served locales, Console at `/admin`, and product
+administration at `/manage`. The invitation HTTPS group uses the existing web
+TLS configuration. Setup, provisioning, support mail and closed-signup
+invitation groups use the existing isolated data and mail preparations.
+
+When changing cases, compare Playwright's collection in each affected managed
+group with the intended inventory before updating `ci/s0-browser-cases.json`.
+Each value is a SHA-256 digest of the JSON array of sorted Playwright case IDs.
+The aggregate requires matching execution evidence from the current checkout
+and attempt. It also requires the `login`, `members` and `console-overview`
+audit reports from `configured-standard`.

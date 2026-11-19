@@ -1,4 +1,5 @@
 import { completeMfaSignIn } from '../shared/mfa-login'
+import { isProductHome, messages, productPath } from '../shared/product-settings'
 import { activeTarget } from '../support/managed-target.mjs'
 
 const standTarget = activeTarget()
@@ -19,7 +20,7 @@ test('host-mode Users inventory uses only the isolated console session', async (
   const productPage = await product.newPage()
   await registerViaUi(productPage, email, { name: 'Console Inventory User' })
   await expect(productPage).toHaveURL(
-    new RegExp('^' + escapeOrigin(standTarget.origins.product) + '/en/?$')
+    (url) => url.origin === standTarget.origins.product && isProductHome(url)
   )
   setSystemRole(email, 'SUPER_ADMIN')
 
@@ -28,22 +29,22 @@ test('host-mode Users inventory uses only the isolated console session', async (
     ignoreHTTPSErrors: true,
   })
   const consolePage = await console.newPage()
-  await consolePage.goto('/en/login')
-  await consolePage.getByLabel(/email/i).fill(email)
-  await consolePage.getByLabel(/^password$/i).fill('Test1234Secure')
-  await consolePage.getByRole('button', { name: /sign in/i }).click()
+  await consolePage.goto(productPath('/login'))
+  await consolePage.getByLabel(messages.auth.email, { exact: true }).fill(email)
+  await consolePage.getByLabel(messages.auth.password, { exact: true }).fill('Test1234Secure')
+  await consolePage.getByRole('button', { name: messages.auth.login, exact: true }).click()
   await completeMfaSignIn(consolePage, email)
   await expect(consolePage).toHaveURL(
-    new RegExp('^' + escapeOrigin(standTarget.origins.console) + '/en/?$')
+    (url) => url.origin === standTarget.origins.console && isProductHome(url)
   )
 
   const requestsWithAuthHeader: string[] = []
   consolePage.on('request', (request) => {
     if (request.headers().authorization) requestsWithAuthHeader.push(request.url())
   })
-  await consolePage.getByRole('link', { name: /users/i }).click()
+  await consolePage.getByRole('link', { name: messages.console.users, exact: true }).click()
 
-  await expect(consolePage).toHaveURL(/\/en\/users$/)
+  await expect(consolePage).toHaveURL((url) => url.pathname === productPath('/users'))
   await expect(consolePage.getByText(email)).toBeVisible()
   expect(await consolePage.content()).not.toContain('Bearer ')
   expect(requestsWithAuthHeader).toHaveLength(0)
@@ -53,7 +54,3 @@ test('host-mode Users inventory uses only the isolated console session', async (
   await product.close()
   await console.close()
 })
-
-function escapeOrigin(origin: string): string {
-  return origin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}

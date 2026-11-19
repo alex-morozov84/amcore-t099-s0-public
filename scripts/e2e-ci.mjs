@@ -1,3 +1,4 @@
+import { selectCardFromPr } from './lib/s0-card-selection.mjs'
 import { laneJobMinutes } from './lib/lighthouse-deadlines.mjs'
 import { publishPlan } from './lighthouse/ci-plan.mjs'
 import { productAdminE2ePlans } from './product-admin-e2e-plan.mjs'
@@ -8,12 +9,33 @@ import { runIdentity } from './lighthouse/identity.mjs'
 import { auditEnvironment, laneEpoch } from './lib/lighthouse-command.mjs'
 import { readFile, mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { ciLanes } from './e2e-ci-plan.mjs'
+import { ciLanes, configuredArguments, s0Arguments } from './e2e-ci-plan.mjs'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
-const lanes = ciLanes(root)
 const requested = process.argv[2]
-const plan = requested === '--matrix' ? auditScope(root) : auditPlan(root, runIdentity(root))
+const s0 = process.env.AMCORE_E2E_INVENTORY === 's0'
+const configured = s0 || requested === '--configured-matrix' || requested?.startsWith('configured-')
+const lanes = ciLanes(root, { configured, s0 })
+const matrix = ['--matrix', '--configured-matrix'].includes(requested)
+const plan = matrix
+  ? auditScope(root, { configured, s0 })
+  : auditPlan(root, runIdentity(root), {
+      configured,
+      s0,
+      ...(requested === '--plan-ci' && s0
+        ? { cardOnly: !process.env.S0_PLAN && selectCardFromPr(root) }
+        : {}),
+    })
+if (
+  process.env.AMCORE_EXPECTED_AUDIT_PLAN &&
+  JSON.parse(process.env.AMCORE_EXPECTED_AUDIT_PLAN).digest !== plan.digest
+)
+  throw new Error('Unexpected Web E2E plan')
+if (requested === '--plan-ci' && process.env.S0_PLAN) {
+  const selection = JSON.parse(process.env.S0_PLAN)
+  if (selection.audit !== plan.digest)
+    throw new Error('Web E2E inventory differs from the selected CI plan')
+}
 const auditDirectory = (lane) =>
   join(root, '.amcore/lighthouse-results', plan.run, plan.attempt, lane)
 
@@ -38,6 +60,8 @@ async function browserLane(lane, epoch) {
   if (lane === 'host') args.splice(5, 1, 'console-real-stack')
   if (lane === 'setup-console')
     args.splice(5, 1, 'console-real-stack', '--fixture', 'organization-setup')
+  if (s0) args.splice(4, args.length - 4, ...s0Arguments(root, lane))
+  else if (configured) args.splice(4, args.length - 4, ...configuredArguments(root, lane))
   const staffPlan = productAdminE2ePlans[lane]
   if (staffPlan)
     args.splice(5, 1, staffPlan.lane, '--fixture', staffPlan.fixture, '--', ...staffPlan.files)
@@ -48,6 +72,19 @@ async function browserLane(lane, epoch) {
       cwd: root,
       env: cleanEnvironment({
         CI: 'true',
+        ...(s0
+          ? {
+              AMCORE_S0_EVIDENCE: JSON.stringify({
+                source: plan.source,
+                run: plan.run,
+                attempt: plan.attempt,
+                lane,
+                plan: plan.digest,
+                expected: plan.browserCases[lane],
+                cardOnly: plan.cardOnly === true && lane === 'configured-standard',
+              }),
+            }
+          : {}),
         ...(process.env.GITHUB_ACTIONS === 'true' ? { AMCORE_E2E_EPOCH: String(epoch) } : {}),
         ...(plan.assignments[lane].length
           ? auditEnvironment(plan, lane, epoch, join(auditDirectory(lane), 'bundle'))
@@ -85,6 +122,7 @@ async function browserLane(lane, epoch) {
       setup: m?.testOutcome ? 'passed' : 'failed',
       test: m?.testOutcome ?? 'failed',
       termination,
+      browserEvidence: m?.browserEvidence,
       cleanup: lane === 'mocked' || m?.state === 'purged' ? 'passed' : 'failed',
     }),
     { mode: 0o600 }
@@ -92,7 +130,7 @@ async function browserLane(lane, epoch) {
   return status
 }
 
-if (requested === '--matrix')
+if (matrix)
   console.log(
     JSON.stringify({
       include: lanes.map((lane) => ({

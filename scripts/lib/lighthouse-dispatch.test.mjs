@@ -96,7 +96,7 @@ function fakeRuntime(root) {
         if(args[0]!=='scripts/stand.mjs') throw Error('Unexpected runner');
         if(env.AMCORE_AUDIT_OWNER) {
           const epoch=Number(env.AMCORE_AUDIT_EPOCH), began=Date.now();
-          appendFileSync('clock-proof.jsonl',JSON.stringify({lane:env.AMCORE_AUDIT_OWNER,epoch,began})+'\\n');
+          appendFileSync('clock-proof.jsonl',JSON.stringify({lane:env.AMCORE_AUDIT_OWNER,epoch,began,args,plan:JSON.parse(env.AMCORE_AUDIT_PLAN)})+'\\n');
           phaseDeadline(epoch,began);
         }
         mkdirSync('.amcore/stands/fake-lane',{recursive:true});
@@ -137,6 +137,14 @@ test('sequential local owners get independent clocks while hosted setup time can
   assert.ok(local.rows.length >= 2)
   assert.ok(local.rows[1].began - local.rows[0].began > 20 * 60_000)
   for (const row of local.rows) assert.equal(row.epoch, row.began)
+  const native = clockDispatch(root, 'configured-standard', epoch)
+  assert.equal(native.result.status, 0, native.result.stderr)
+  assert.equal(native.rows[0].plan.execution, 'configured')
+  const args = native.rows[0].args
+  assert.equal(args[args.indexOf('--lane') + 1], 'real-stack')
+  assert.equal(args[args.indexOf('--ci-group') + 1], 'standard')
+  assert.equal(args[args.indexOf('--settings-policy') + 1], 'preserve')
+  assert.equal(args.includes('--fixture'), false)
   const hosted = clockDispatch(root, 'path-standard', epoch + 5 * 60_000, epoch)
   assert.equal(hosted.result.status, 0, hosted.result.stderr)
   assert.equal(hosted.rows[0].epoch, epoch)

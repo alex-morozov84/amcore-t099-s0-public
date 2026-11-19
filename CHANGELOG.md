@@ -9,25 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Rewrite steps 4 and 5 of the PostgreSQL major-upgrade guide after an end-to-end
-  rehearsal (PostgreSQL 16.15 to 18.6): validate the restored data with the matching
-  API and worker on a separate validation copy, then restore the same dump into a
-  separate cutover database, recreate every database consumer, check readiness and run
-  a canary before opening ingress. State what the rehearsal did and did not cover, and
-  treat the first application start against the cutover database as the rollback boundary.
-
-- Make the native `pnpm dev` path start web: Turborepo's strict environment mode
-  filtered the web-to-API proof key and Redis URL, and `dev` did not build shared first.
-  Pass the key, Redis URL and origin settings through, build shared before `dev`, and ship
-  `WEB_FRONTEND_CONTEXT_KEY` empty in `.env.example` instead of a usable placeholder, so
-  web refuses to start until a generated value is exported. If your `.env` still holds the old
-  placeholder, replace it with an empty value or your generated key; otherwise the API accepts
-  that public string while web refuses to start.
-
-- Pass the full source commit to the web image build in the deploy template, as the API
-  and migrator builds already did, so MFA deployment artifacts from all three images can
-  pass preflight. Make the template's placeholder messages state that no job validates staging.
-
 - Extend guarded SDK cleanup admission to the six remaining normal browser CI
   configurations. Require read-only, build-free mail collectors while preserving
   provisioning compatibility and mandatory cleanup on unsafe runners.

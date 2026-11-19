@@ -1,4 +1,5 @@
 {
+  "catalogue": { "title": "Каталог" },
   "productAdmin": {
     "visitSite": "Перейти на сайт",
     "unavailableTitle": "Страница недоступна",
