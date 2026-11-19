@@ -42,6 +42,7 @@ export function startProxy(port) {
           path: req.url.split('?')[0],
           status: response.statusCode,
           id: req.headers['x-deployment-id'],
+          actionNotFound: response.headers['x-nextjs-action-not-found'],
         })
         res.writeHead(response.statusCode, response.headers)
         response.pipe(res)

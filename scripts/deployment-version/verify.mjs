@@ -37,7 +37,11 @@ async function transition(tab, state, port, target, observe = 60_000) {
   const old = `version-test-${target === 'A' ? 'B' : 'A'}`
   const stale = state.records.filter((r) => r.method === 'POST' && r.id === old)
   assert.ok(stale.length <= 100)
-  assert.ok(stale.every((r) => r.status === 404))
+  assert.deepEqual(
+    stale.map(({ status, actionNotFound }) => ({ status, actionNotFound })),
+    stale.map(() => ({ status: 409, actionNotFound: '1' })),
+    'The new build must reject each obsolete Server Action'
+  )
   assert.equal(count(state, 'GET', route), 1)
   state.records = []
   await tab.page.waitForTimeout(observe)
