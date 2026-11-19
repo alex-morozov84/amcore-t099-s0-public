@@ -103,7 +103,19 @@ let standardCases
 if (casesPath && groups.web !== 'none') {
   const { ids, ...collectedIdentity } = JSON.parse(readFileSync(casesPath, 'utf8'))
   assert.deepEqual(collectedIdentity, identity, 'S0 collection identity mismatch')
-  standardCases = admitStandardCases(root, policyRoot, ids)
+  let baseIds
+  if (pr) {
+    const basePath = process.env.S0_STANDARD_BASE_COLLECTION
+    if (!basePath) throw new Error('Missing S0 standard base collection')
+    const { ids: requiredIds, ...baseIdentity } = JSON.parse(readFileSync(basePath, 'utf8'))
+    assert.deepEqual(
+      baseIdentity,
+      { ...identity, source: base },
+      'S0 base collection identity mismatch'
+    )
+    baseIds = requiredIds
+  }
+  standardCases = admitStandardCases(root, policyRoot, ids, baseIds)
 }
 const audit = auditPlan(root, identity, {
   configured: true,

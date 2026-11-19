@@ -839,9 +839,11 @@ TLS configuration. Setup, provisioning, support mail and closed-signup
 invitation groups use the existing isolated data and mail preparations.
 
 CI collects standard with Playwright `--list` in a separate read-only job.
-The trusted planner checks that collection against the mandatory standard IDs
-in the policy base. Additions enter the current plan automatically. Removal
-or replacement of a mandatory ID requires a separately reviewed baseline change.
+For PRs, a separate read-only job collects standard from the exact PR base.
+The trusted planner checks both collections against their source and attempt
+and requires the checkout to retain all base IDs. The original mandatory IDs
+also provide a minimum for the base. Additions enter the plan automatically
+and become required on subsequent PRs once they are present in the base.
 Other browser groups still use their declared case-set hashes.
 Each hash is SHA-256 over the JSON array of sorted Playwright case IDs.
 The aggregate requires matching execution evidence from the current checkout

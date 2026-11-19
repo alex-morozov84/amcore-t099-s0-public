@@ -17,12 +17,20 @@ test('admission covers every workflow job, including browser and component famil
   const { jobs } = parse(readFileSync('.github/workflows/ci.yml', 'utf8'))
   assert.deepEqual(
     Object.keys(jobs)
-      .filter((name) => !['ci-required', 's0-browser-collection'].includes(name))
+      .filter(
+        (name) =>
+          !['ci-required', 's0-browser-collection', 's0-browser-base-collection'].includes(name)
+      )
       .sort(),
     [...workflowInventory].sort()
   )
-  assert.deepEqual(jobs['ci-plan'].needs, ['s0-browser-collection'])
+  assert.deepEqual(jobs['ci-plan'].needs, ['s0-browser-collection', 's0-browser-base-collection'])
+  assert.match(jobs['ci-plan'].if, /needs\.s0-browser-base-collection\.result == 'success'/)
   const plan = jobs['ci-plan'].steps.find(({ id }) => id === 'plan')
+  assert.equal(
+    plan.env.S0_STANDARD_BASE_IDS,
+    '${{ needs.s0-browser-base-collection.outputs.standard }}'
+  )
   assert.equal(plan.env.S0_STANDARD_IDS, '${{ needs.s0-browser-collection.outputs.standard }}')
   assert.deepEqual([...jobs['ci-required'].needs].sort(), [...workflowInventory].sort())
   assert.equal(jobs['ci-required'].if, '${{ always() }}')

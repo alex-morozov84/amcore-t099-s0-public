@@ -23,13 +23,19 @@ export function browserCaseDigests(root, lanes) {
   return cases
 }
 
-export function admitStandardCases(root, base, ids) {
+export function admitStandardCases(root, base, ids, baseIds = ids) {
   const required = JSON.parse(readFileSync(join(base, 'ci/s0-standard-required.json'), 'utf8'))
   const digests = JSON.parse(readFileSync(join(root, 'ci/s0-browser-cases.json'), 'utf8'))
   assert.equal(caseDigest(required), digests['configured-standard'], 'Untrusted S0 baseline')
+  caseDigest(baseIds)
+  const baseline = new Set(baseIds)
+  assert.ok(
+    required.every((id) => baseline.has(id)),
+    'Missing mandatory S0 browser case in base'
+  )
   const accepted = caseDigest(ids)
   const collected = new Set(ids)
-  const missing = required.filter((id) => !collected.has(id))
+  const missing = baseIds.filter((id) => !collected.has(id))
   assert.deepEqual(missing, [], 'Missing mandatory S0 browser case')
   return accepted
 }
