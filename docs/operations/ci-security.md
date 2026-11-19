@@ -825,6 +825,20 @@ Rollback of the repeat removal restores the focused/background job, its fresh
 prepare and artifact upload, the Test dependency and expected set, contract tests
 and documentation together. It does not migrate dependencies or persistent data.
 
+### Configured browser plan and result
+
+For local product-plan validation, set `AMCORE_E2E_INVENTORY=configured`.
+After preparing the installed shared package for the checked-out settings,
+run `node scripts/collect-s0-standard.mjs <collection.json>`. This command
+uses Playwright list mode. Set `AMCORE_CONFIGURED_COLLECTION` to that file
+and run the existing Web E2E planner with `--plan-ci`. Use the same SHA,
+run ID and attempt for collection, planning and verification.
+
+The configured plan selects all applicable cases from the native groups.
+Disabled Console requires an authenticated page and BFF refusal in standard.
+Host Console requires its own cases and Overview audit. The original lane
+evidence gate verifies the same plan digest and case digests.
+
 ### Synthetic S0 browser inventory
 
 This product selects its complete S0 inventory in Web E2E. Run the source-only

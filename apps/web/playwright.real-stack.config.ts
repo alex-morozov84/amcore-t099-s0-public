@@ -1,3 +1,4 @@
+import { ADMIN_CONSOLE_SETTINGS } from '@amcore/shared'
 import { defineConfig, devices } from '@playwright/test'
 
 import { s0Scenarios } from '../../scripts/product-admin-e2e-plan.mjs'
@@ -48,7 +49,9 @@ const config = defineConfig({
 if (target.settingsPolicy === 'preserve' && !scenario) {
   config.grepInvert = [
     /summary fixture/,
-    /disabled Console refuses its page and BFF for an authenticated operator/,
+    ...(process.env.AMCORE_CONFIGURED_CASES === '1' && ADMIN_CONSOLE_SETTINGS.mode === 'disabled'
+      ? []
+      : [/disabled Console refuses its page and BFF for an authenticated operator/]),
   ]
 }
 if (scenario) {

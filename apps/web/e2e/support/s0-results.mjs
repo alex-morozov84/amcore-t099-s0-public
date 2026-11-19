@@ -13,7 +13,10 @@ export default class S0Results {
     if (result.status !== 'passed') return
     try {
       const { expected, file, ...identity } = JSON.parse(process.env.AMCORE_S0_REPORT)
-      const observed = proveBrowserCases(this.tests, expected)
+      const tests = identity.configured
+        ? this.tests.filter(({ expectedStatus }) => expectedStatus !== 'skipped')
+        : this.tests
+      const observed = proveBrowserCases(tests, expected)
       writeFileSync(file, JSON.stringify({ ...identity, observed }), { flag: 'wx', mode: 0o600 })
     } catch (error) {
       logError(error.message)

@@ -1,3 +1,4 @@
+import { configuredBrowserCases } from './lib/configured-browser-cases.mjs'
 import { selectCardFromPr } from './lib/s0-card-selection.mjs'
 import { laneJobMinutes } from './lib/lighthouse-deadlines.mjs'
 import { publishPlan } from './lighthouse/ci-plan.mjs'
@@ -14,14 +15,29 @@ import { ciLanes, configuredArguments, s0Arguments } from './e2e-ci-plan.mjs'
 const root = fileURLToPath(new URL('../', import.meta.url))
 const requested = process.argv[2]
 const s0 = process.env.AMCORE_E2E_INVENTORY === 's0'
-const configured = s0 || requested === '--configured-matrix' || requested?.startsWith('configured-')
+const nativeEvidence = process.env.AMCORE_E2E_INVENTORY === 'configured'
+const configured =
+  nativeEvidence ||
+  s0 ||
+  requested === '--configured-matrix' ||
+  requested?.startsWith('configured-')
 const lanes = ciLanes(root, { configured, s0 })
 const matrix = ['--matrix', '--configured-matrix'].includes(requested)
+const identity = matrix ? undefined : runIdentity(root)
+const configuredCases =
+  nativeEvidence && requested === '--plan-ci'
+    ? configuredBrowserCases(
+        root,
+        identity,
+        JSON.parse(await readFile(process.env.AMCORE_CONFIGURED_COLLECTION, 'utf8'))
+      )
+    : undefined
 const plan = matrix
   ? auditScope(root, { configured, s0 })
-  : auditPlan(root, runIdentity(root), {
+  : auditPlan(root, identity, {
       configured,
       s0,
+      configuredCases,
       ...(requested === '--plan-ci' && s0
         ? {
             cardOnly: !process.env.S0_PLAN && selectCardFromPr(root),
@@ -41,6 +57,8 @@ if (requested === '--plan-ci' && process.env.S0_PLAN) {
   if (selection.audit !== plan.digest)
     throw new Error('Web E2E inventory differs from the selected CI plan')
 }
+if (nativeEvidence && !matrix && !plan.configuredCases)
+  throw new Error('Missing configured browser evidence plan')
 const auditDirectory = (lane) =>
   join(root, '.amcore/lighthouse-results', plan.run, plan.attempt, lane)
 
@@ -77,7 +95,7 @@ async function browserLane(lane, epoch) {
       cwd: root,
       env: cleanEnvironment({
         CI: 'true',
-        ...(s0
+        ...(plan.browserCases?.[lane]
           ? {
               AMCORE_S0_EVIDENCE: JSON.stringify({
                 source: plan.source,
@@ -86,6 +104,7 @@ async function browserLane(lane, epoch) {
                 lane,
                 plan: plan.digest,
                 expected: plan.browserCases[lane],
+                ...(nativeEvidence ? { configured: true } : {}),
                 cardOnly: plan.cardOnly === true && lane === 'configured-standard',
               }),
             }

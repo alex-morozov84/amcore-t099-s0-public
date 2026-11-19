@@ -20,7 +20,7 @@ const flatten = (suites, directory = 'real-stack') =>
     ...flatten(suite.suites ?? [], directory),
   ])
 
-async function collect(options, args = [], lane = 'real-stack') {
+export async function collect(options, args = [], lane = 'real-stack') {
   const config = lane === 'mocked' ? 'playwright.config.ts' : `playwright.${lane}.config.ts`
   const report = JSON.parse(
     await run(
@@ -43,7 +43,8 @@ async function collect(options, args = [], lane = 'real-stack') {
   return flatten(report.suites, lane)
 }
 
-function assertCollectedCases(tests, expected) {
+function assertCollectedCases(tests, expected, configured) {
+  if (configured) tests = tests.filter((test) => test.expectedStatus !== 'skipped')
   assert.ok(
     tests.every((test) => test.expectedStatus === 'passed'),
     'Unexpected S0 collection skip'
@@ -55,11 +56,18 @@ function assertCollectedCases(tests, expected) {
   )
 }
 
-export async function s0Inventory(options, lane, expected) {
-  assertCollectedCases(await collect(options, [], lane), expected)
+export async function s0Inventory(options, lane, expected, configured) {
+  assertCollectedCases(await collect(options, [], lane), expected, configured)
 }
 
-export async function groupArguments(m, group, options, caseSet, cardOnly = false) {
+export async function groupArguments(
+  m,
+  group,
+  options,
+  caseSet,
+  cardOnly = false,
+  configured = false
+) {
   const tests = await collect(options)
   assert.equal(new Set(tests.map((test) => test.id)).size, tests.length, 'Duplicate test IDs')
   assert.deepEqual([...new Set(tests.map((test) => test.file))].sort(), specFiles(m.snapshot))
@@ -70,7 +78,7 @@ export async function groupArguments(m, group, options, caseSet, cardOnly = fals
   const expected = tests.filter((test) => files.includes(test.file))
   assert.ok(expected.length, 'No tests selected')
   assert.deepEqual(await collect(options, args), expected, 'E2E selection lost or duplicated tests')
-  if (caseSet) assertCollectedCases(expected, caseSet)
+  if (caseSet) assertCollectedCases(expected, caseSet, configured)
   await writeFile(
     `${m.worktree}/.amcore/stands/${m.id}/inventory.json`,
     JSON.stringify(

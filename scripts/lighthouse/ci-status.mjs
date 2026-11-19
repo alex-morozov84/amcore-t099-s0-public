@@ -8,7 +8,10 @@ import { artifactUrl } from '../lib/lighthouse-view-model.mjs'
 
 const root = process.cwd()
 const s0 = process.env.AMCORE_E2E_INVENTORY === 's0'
-const plan = auditPlan(root, runIdentity(root), { configured: s0, s0 })
+const plan = auditPlan(root, runIdentity(root), {
+  configured: s0 || process.env.AMCORE_E2E_INVENTORY === 'configured',
+  s0,
+})
 invariant(
   JSON.parse(process.env.AMCORE_EXPECTED_AUDIT_PLAN).digest === plan.digest,
   'unexpected-ci-plan'

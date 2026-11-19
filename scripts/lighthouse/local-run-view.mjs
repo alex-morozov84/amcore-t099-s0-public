@@ -9,7 +9,11 @@ export async function writeLocalRunIndex(plan, root) {
   const current = auditPlan(
     root,
     { run: plan.run, attempt: plan.attempt, source: plan.source },
-    { configured: plan.execution === 'configured', s0: Boolean(plan.browserCases) }
+    {
+      configured: plan.execution === 'configured',
+      s0: Boolean(plan.browserCases) && !plan.configuredCases,
+      configuredCases: plan.configuredCases,
+    }
   )
   if (current.digest !== plan.digest) throw new Error('local-view-plan-changed')
   const output = join(root, '.amcore/lighthouse-results', plan.run, plan.attempt)

@@ -61,6 +61,7 @@ export async function test(m, lane, token, extra = [], group, auditOnly = false)
     const evidence = process.env.AMCORE_S0_EVIDENCE
       ? JSON.parse(process.env.AMCORE_S0_EVIDENCE)
       : undefined
+    if (evidence?.configured) options.env.AMCORE_CONFIGURED_CASES = '1'
     const reportFile = join(tmp, 's0-browser-evidence.json')
     if (evidence) {
       assert.equal(m.settingsPolicy, 'preserve', 'S0 evidence requires preserved settings')
@@ -68,12 +69,19 @@ export async function test(m, lane, token, extra = [], group, auditOnly = false)
       options.env.AMCORE_S0_REPORT = JSON.stringify({ ...evidence, file: reportFile })
     }
     if (!auditOnly && !group) {
-      if (evidence) await s0Inventory(options, lane, evidence.expected)
+      if (evidence) await s0Inventory(options, lane, evidence.expected, evidence.configured)
       else if (!m.s0Scenario) await profileInventory(m, lane, options, extra)
     }
     const filters =
       !auditOnly && group
-        ? await groupArguments(m, group, options, evidence?.expected, evidence?.cardOnly)
+        ? await groupArguments(
+            m,
+            group,
+            options,
+            evidence?.expected,
+            evidence?.cardOnly,
+            evidence?.configured
+          )
         : []
     if (!auditOnly)
       await run(

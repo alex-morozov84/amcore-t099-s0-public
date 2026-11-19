@@ -145,11 +145,29 @@ export function auditPlan(root, identity, options) {
     browserCases['configured-standard'] = standardCases
   }
   if (cardOnly) browserCases['configured-standard'] = caseDigest(cardCaseIds)
+  const configuredCases =
+    options?.configured && !options?.s0
+      ? (options.configuredCases ??
+        (process.env.AMCORE_EXPECTED_AUDIT_PLAN
+          ? JSON.parse(process.env.AMCORE_EXPECTED_AUDIT_PLAN).configuredCases
+          : undefined))
+      : undefined
+  if (configuredCases) {
+    invariant(
+      JSON.stringify(Object.keys(configuredCases)) === JSON.stringify(Object.keys(assignments)),
+      'configured-case-lane-mismatch'
+    )
+    invariant(
+      Object.values(configuredCases).every((value) => /^[a-f0-9]{64}$/.test(value)),
+      'invalid-configured-case-digest'
+    )
+  }
   const plan = {
     version: 1,
     ...(cardOnly ? { cardOnly: true } : {}),
     ...(options?.configured ? { execution: 'configured' } : {}),
     ...(browserCases ? { browserCases } : {}),
+    ...(configuredCases ? { configuredCases, browserCases: configuredCases } : {}),
     ...(standardCases ? { standardCases } : {}),
     ...identity,
     config: digest(choices),

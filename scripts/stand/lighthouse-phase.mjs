@@ -29,7 +29,8 @@ export async function runAuditPhase(m, token) {
     { run: expected.run, attempt: expected.attempt, source: expected.source },
     {
       configured: expected.execution === 'configured',
-      s0: Boolean(expected.browserCases),
+      s0: Boolean(expected.browserCases) && !expected.configuredCases,
+      configuredCases: expected.configuredCases,
       cardOnly: expected.cardOnly === true,
       standardCases: expected.standardCases,
     }

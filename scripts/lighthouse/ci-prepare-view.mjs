@@ -5,7 +5,10 @@ import { runIdentity } from './identity.mjs'
 import { readViewBundle, writeView, verifyView } from '../lib/lighthouse-view-export.mjs'
 
 const s0 = process.env.AMCORE_E2E_INVENTORY === 's0'
-const plan = auditPlan(process.cwd(), runIdentity(process.cwd()), { configured: s0, s0 })
+const plan = auditPlan(process.cwd(), runIdentity(process.cwd()), {
+  configured: s0 || process.env.AMCORE_E2E_INVENTORY === 'configured',
+  s0,
+})
 const expected = JSON.parse(process.env.AMCORE_EXPECTED_AUDIT_PLAN)
 invariant(expected.digest === plan.digest, 'unexpected-ci-plan')
 const lane = process.env.E2E_CI_LANE
