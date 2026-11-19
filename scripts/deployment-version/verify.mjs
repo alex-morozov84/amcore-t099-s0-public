@@ -19,7 +19,7 @@ async function open(browser, state, port, worker, route, poll = true) {
     })
   })
   await page.goto(`http://127.0.0.1:${port}${route}?poll=${Number(poll)}`)
-  if ((worker === 'allow', route)) {
+  if (worker === 'allow') {
     await page.waitForFunction(() => Boolean(navigator.serviceWorker.controller))
     await page.reload()
   }
