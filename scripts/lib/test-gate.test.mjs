@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { requireS0Results, sealS0Plan } from './s0-ci-results.mjs'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { parse } from 'yaml'
@@ -7,34 +7,43 @@ import { parse } from 'yaml'
 const jobs = parse(readFileSync('.github/workflows/ci.yml', 'utf8')).jobs
 const expected = ['test-unit-redis', 'test-capability', 'test-notification-ai', 'api-e2e']
 const gate = jobs.test
-const script = gate.steps[0].run.trim().slice("node -e '".length, -1)
-const success = () => Object.fromEntries(expected.map((key) => [key, { result: 'success' }]))
-function verdict(results) {
-  return spawnSync(process.execPath, ['-e', script], {
-    env: { ...process.env, TEST_RESULTS: JSON.stringify(results) },
-    encoding: 'utf8',
-  }).status
-}
+const identity = { source: 'a'.repeat(40), run: '123', attempt: '1' }
+const selected = [
+  'lint',
+  'typecheck',
+  'promtool',
+  'test-unit-redis',
+  'test-notification-ai',
+  'api-e2e',
+  'test',
+]
+const plan = sealS0Plan({ ...identity, scope: 'selected-families', jobs: selected })
+const success = () =>
+  Object.fromEntries(
+    ['ci-plan', ...expected].map((key) => [
+      key,
+      { result: key === 'test-capability' ? 'skipped' : 'success' },
+    ])
+  )
 
-test('Test accepts only the exact nonempty successful dependency set', () => {
+test('Test requires every selected dependency and admits only planned skips', () => {
   assert.equal(gate.name, 'Test')
   assert.equal(gate['timeout-minutes'], 5)
-  assert.equal(gate.if, '${{ always() }}')
-  assert.deepEqual(gate.needs, expected)
-  assert.equal(gate.steps.length, 1)
-  assert.equal(gate.steps[0].env.TEST_RESULTS, '${{ toJSON(needs) }}')
-  assert.equal(verdict(success()), 0)
+  assert.match(gate.if, /always\(\)/)
+  assert.deepEqual(gate.needs, ['ci-plan', ...expected])
+  const step = gate.steps.at(-1)
+  assert.equal(step.env.CI_RESULTS, '${{ toJSON(needs) }}')
+  assert.match(step.run, /require-s0-ci\.mjs" test/)
+  assert.doesNotThrow(() => requireS0Results(success(), plan, identity, 'test'))
   for (const key of expected) {
-    for (const result of ['failure', 'skipped', 'cancelled', 'neutral', 'unknown', '', null]) {
-      assert.equal(verdict({ ...success(), [key]: { result } }), 1, `${key}: ${result}`)
-    }
+    const result = key === 'test-capability' ? 'success' : 'skipped'
+    assert.throws(() =>
+      requireS0Results({ ...success(), [key]: { result } }, plan, identity, 'test')
+    )
     const missing = success()
     delete missing[key]
-    assert.equal(verdict(missing), 1)
-    assert.equal(verdict({ ...success(), [key]: null }), 1)
+    assert.throws(() => requireS0Results(missing, plan, identity, 'test'), /inventory/)
   }
-  for (const bad of [{}, [], null, { ...success(), undeclared: { result: 'success' } }])
-    assert.equal(verdict(bad), 1)
 })
 
 test('independent leaves preserve commands and frozen preparation without aggregate cycles', () => {
@@ -47,7 +56,7 @@ test('independent leaves preserve commands and frozen preparation without aggreg
   }
   for (const [key, runs] of Object.entries(commands)) {
     const job = jobs[key]
-    assert.deepEqual(job.needs, ['lint', 'typecheck'])
+    assert.deepEqual(job.needs, ['ci-plan', 'lint', 'typecheck'])
     assert.deepEqual(
       job.steps
         .filter((step) => step.run && !step.run.startsWith('pnpm install'))

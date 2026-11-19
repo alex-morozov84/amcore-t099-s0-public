@@ -22,13 +22,20 @@ const plan = matrix
   : auditPlan(root, runIdentity(root), {
       configured,
       s0,
-      ...(requested === '--plan-ci' && s0 ? { cardOnly: selectCardFromPr(root) } : {}),
+      ...(requested === '--plan-ci' && s0
+        ? { cardOnly: !process.env.S0_PLAN && selectCardFromPr(root) }
+        : {}),
     })
 if (
   process.env.AMCORE_EXPECTED_AUDIT_PLAN &&
   JSON.parse(process.env.AMCORE_EXPECTED_AUDIT_PLAN).digest !== plan.digest
 )
   throw new Error('Unexpected Web E2E plan')
+if (requested === '--plan-ci' && process.env.S0_PLAN) {
+  const selection = JSON.parse(process.env.S0_PLAN)
+  if (selection.audit !== plan.digest)
+    throw new Error('Web E2E inventory differs from the selected CI plan')
+}
 const auditDirectory = (lane) =>
   join(root, '.amcore/lighthouse-results', plan.run, plan.attempt, lane)
 

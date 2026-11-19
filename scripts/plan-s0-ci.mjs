@@ -3,9 +3,11 @@ import { readFileSync } from 'node:fs'
 import { normalizeCiAreas, selectCiGroups } from './lib/ci-selection.mjs'
 import { parseCiRole, resolveCiPolicy } from './lib/ci-policy.mjs'
 import { readCiPolicySources } from './lib/ci-policy-source.mjs'
+import { runIdentity } from './lighthouse/identity.mjs'
+import { sealS0Plan } from './lib/s0-ci-results.mjs'
 import { auditPlan } from './lib/lighthouse-plan.mjs'
 
-const root = new URL('../', import.meta.url)
+const root = process.cwd()
 const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8' })
 
 function readChange(base, outputs) {
@@ -39,26 +41,33 @@ function s0Jobs(groups, audit, wide) {
   if (groups.web !== 'none') jobs.push('web-e2e-plan', 'web-e2e-lanes', 'web-e2e')
   if (jobs.includes('api-e2e')) jobs.push('test')
   const lanes = jobs.includes('web-e2e') ? Object.keys(audit.assignments) : []
+  if (groups.email) jobs.push('test-email')
+  if (wide || groups.deployment) jobs.push('deployment-version')
   return {
     jobs,
     lanes,
     apiShards: groups.api ? 3 : 0,
     coupledRedis: jobs.includes('test-unit-redis'),
-    unwired: [
-      ...(groups.email ? ['pnpm --filter api test:email'] : []),
-      ...(wide || groups.deployment ? ['node scripts/run-deployment-version-e2e.mjs'] : []),
-    ],
   }
 }
 
-const [base, outputsPath] = process.argv.slice(2)
-if (!/^[a-f0-9]{40}$/.test(base) || !outputsPath)
-  throw new Error('Usage: node scripts/plan-s0-ci.mjs <base-sha> <filter-outputs.json>')
-const head = git('rev-parse', 'HEAD').trim()
-if (git('merge-base', base, head).trim() !== base)
-  throw new Error('S0 local replay requires a complete history with base as ancestor')
-if (git('status', '--porcelain', '--untracked-files=normal').trim())
-  throw new Error('S0 plan requires a clean committed source')
+const event = process.env.GITHUB_EVENT_NAME ?? 'pull_request'
+const pr = event === 'pull_request'
+const identity = runIdentity(root, {
+  ...process.env,
+  GITHUB_RUN_ID: process.env.GITHUB_RUN_ID ?? 'local-plan',
+})
+const [base = identity.source, outputsPath] = process.argv.slice(2)
+if (!/^[a-f0-9]{40}$/.test(base) || !['pull_request', 'push'].includes(event))
+  throw new Error('Expected an exact source base and an ordinary PR or push')
+if (git('merge-base', base, identity.source).trim() !== base)
+  throw new Error('S0 planning requires a complete history with base as ancestor')
+if (process.env.GITHUB_ACTIONS === 'true' && pr) {
+  const { pull_request: change } = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'))
+  const parents = git('show', '-s', '--format=%P', 'HEAD').trim()
+  if (base !== change.base.sha || parents !== `${base} ${change.head.sha}`)
+    throw new Error('PR merge checkout does not match the event')
+}
 const role = parseCiRole(git('show', 'HEAD:PROJECT_CONTEXT.md'))
 if (
   role !== 'downstream-product' ||
@@ -70,58 +79,31 @@ for (const path of ['.github/ci-paths.yml', 'ci/s0-browser-cases.json']) {
     throw new Error(`Trusted input changed: ${path}`)
 }
 const policy = resolveCiPolicy({
-  ...readCiPolicySources({ root, event: 'pull_request', base, head }),
+  ...readCiPolicySources({ root, event, base, head: identity.source }),
   role,
-  event: 'pull_request',
+  event,
 })
 if (policy.mode !== 'normal' || policy.proposed !== 'normal')
-  throw new Error('S0 local replay covers ordinary PRs in normal mode only')
-const { areas, reason } = readChange(base, JSON.parse(readFileSync(outputsPath, 'utf8')))
-const wide = !!reason || !Object.values(areas).some(Boolean)
-const select = (mode) => selectCiGroups({ role, mode, areas, diffComplete: !wide })
-const groups = select(wide ? 'full' : 'normal')
-const audit = auditPlan(
-  root.pathname,
-  { run: 'local-plan', attempt: '1', source: head },
-  {
-    configured: true,
-    s0: true,
-    cardOnly: false,
-  }
+  throw new Error('S0 workflow covers normal mode only')
+const outputs = JSON.parse(
+  outputsPath ? readFileSync(outputsPath, 'utf8') : process.env.S0_FILTER_OUTPUT || '{}'
 )
-const plan = s0Jobs(groups, audit, wide)
-const full = s0Jobs(select('full'), audit, true)
+const { areas, reason } = pr ? readChange(base, outputs) : { areas: {}, reason: 'push' }
+const wide = !!reason || !Object.values(areas).some(Boolean)
+const groups = selectCiGroups({ role, mode: wide ? 'full' : 'normal', areas, diffComplete: !wide })
+const audit = auditPlan(root, identity, { configured: true, s0: true, cardOnly: false })
+const selection = s0Jobs(groups, audit, wide)
 console.log(
   JSON.stringify(
-    {
+    sealS0Plan({
+      ...identity,
       base,
-      head,
       scope: wide ? 'full-applicable' : 'selected-families',
       reason: reason ?? (wide ? 'empty-diff' : 'known-areas'),
       areas,
-      ...plan,
-      audits: Object.fromEntries(plan.lanes.map((lane) => [lane, audit.assignments[lane]])),
-      browserCases: Object.fromEntries(
-        plan.lanes
-          .filter((lane) => lane !== 'safety')
-          .map((lane) => [lane, audit.browserCases[lane]])
-      ),
-      excludedJobs: full.jobs.filter((job) => !plan.jobs.includes(job)),
-      excludedCommands: full.unwired.filter((command) => !plan.unwired.includes(command)),
-      policyExclusions: [
-        'starter capability patch',
-        'starter configuration fleet',
-        'event-only checks outside ordinary PR',
-      ],
-      companionChecks: [
-        'PR title',
-        'workflow lint',
-        'security scans',
-        'dependency review',
-        'CodeQL',
-      ],
-      executableAsWorkflow: false,
-    },
+      ...selection,
+      audit: selection.lanes.length ? audit.digest : null,
+    }),
     null,
     2
   )

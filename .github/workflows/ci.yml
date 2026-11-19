@@ -19,12 +19,56 @@ env:
   API_E2E_PR_HEAD: ${{ github.event.pull_request.head.sha || '' }}
 
 jobs:
+  ci-plan:
+    name: CI selection plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      plan: ${{ steps.plan.outputs.plan }}
+    steps:
+      - name: Checkout tested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Load policy from the trusted source
+        env:
+          POLICY_SOURCE: ${{ github.event.pull_request.base.sha || github.sha }}
+        run: |
+          mkdir "$RUNNER_TEMP/s0-policy"
+          git archive "$POLICY_SOURCE" scripts .github/ci-paths.yml | tar -x -C "$RUNNER_TEMP/s0-policy"
+      - name: Classify PR paths
+        id: changes
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d
+        with:
+          filters: ${{ runner.temp }}/s0-policy/.github/ci-paths.yml
+          list-files: json
+          predicate-quantifier: every
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Seal plan for this attempt
+        id: plan
+        env:
+          POLICY_SOURCE: ${{ github.event.pull_request.base.sha || github.sha }}
+          S0_FILTER_OUTPUT: ${{ toJSON(steps.changes.outputs) }}
+        run: |
+          plan="$(node "$RUNNER_TEMP/s0-policy/scripts/plan-s0-ci.mjs" "$POLICY_SOURCE")"
+          echo "plan=$(jq -c . <<< "$plan")" >> "$GITHUB_OUTPUT"
+          printf '### CI selection\n\n%s\n' "$plan" >> "$GITHUB_STEP_SUMMARY"
+
   ci-required:
     name: CI required
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: ${{ always() }}
     needs:
+      - ci-plan
       - lint
       - typecheck
       - build
@@ -43,23 +87,33 @@ jobs:
       - promtool
       - observability-contract-live
       - storybook
+      - test-email
+      - deployment-version
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
       - name: Require every CI family
         env:
+          S0_PLAN: ${{ needs.ci-plan.outputs.plan }}
+          POLICY_SOURCE: ${{ github.event.pull_request.base.sha || github.sha }}
           CI_RESULTS: ${{ toJSON(needs) }}
-        run: node scripts/ci-required.mjs
+        run: |
+          mkdir "$RUNNER_TEMP/s0-policy"
+          git archive "$POLICY_SOURCE" scripts | tar -x -C "$RUNNER_TEMP/s0-policy"
+          node "$RUNNER_TEMP/s0-policy/scripts/require-s0-ci.mjs"
 
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    needs: [ci-plan]
+    if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'lint') }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -93,6 +147,8 @@ jobs:
   typecheck:
     name: Type Check
     runs-on: ubuntu-latest
+    needs: [ci-plan]
+    if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'typecheck') }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -117,7 +173,8 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
-    needs: [lint, typecheck]
+    needs: [ci-plan, lint, typecheck]
+    if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'build') }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -146,7 +203,8 @@ jobs:
   test-unit-redis:
     name: Test unit and Redis
     runs-on: ubuntu-latest
-    needs: [lint, typecheck]
+    needs: [ci-plan, lint, typecheck]
+    if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'test-unit-redis') }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -176,7 +234,8 @@ jobs:
   test-capability:
     name: Test capability extension
     runs-on: ubuntu-latest
-    needs: [lint, typecheck]
+    needs: [ci-plan, lint, typecheck]
+    if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'test-capability') }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -204,7 +263,8 @@ jobs:
   test-notification-ai:
     name: Test notification and AI extension
     runs-on: ubuntu-latest
-    needs: [lint, typecheck]
+    needs: [ci-plan, lint, typecheck]
+    if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'test-notification-ai') }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -233,23 +293,37 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    if: ${{ always() }}
-    needs: [test-unit-redis, test-capability, test-notification-ai, api-e2e]
+    if: ${{ always() && needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'test') }}
+    needs: [ci-plan, test-unit-redis, test-capability, test-notification-ai, api-e2e]
     steps:
-      - name: Require every Test dependency
+      - name: Checkout tested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Require every selected Test dependency
         env:
-          TEST_RESULTS: ${{ toJSON(needs) }}
-        run: >-
-          node -e 'const expected=["test-unit-redis", "test-capability", "test-notification-ai", "api-e2e"]; const results=JSON.parse(process.env.TEST_RESULTS); if (!results || Array.isArray(results) || Object.keys(results).length !== expected.length || expected.some(key => results[key]?.result !== "success")) process.exit(1)'
+          POLICY_SOURCE: ${{ github.event.pull_request.base.sha || github.sha }}
+          S0_PLAN: ${{ needs.ci-plan.outputs.plan }}
+          CI_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          mkdir "$RUNNER_TEMP/s0-policy"
+          git archive "$POLICY_SOURCE" scripts | tar -x -C "$RUNNER_TEMP/s0-policy"
+          node "$RUNNER_TEMP/s0-policy/scripts/require-s0-ci.mjs" test
 
   # Diagnostic full coverage. Live required status is enabled only after Linux admission.
   api-e2e-plan:
     name: API E2E plan
     runs-on: ubuntu-latest
-    needs: [lint, typecheck]
+    needs: [ci-plan, lint, typecheck]
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+    if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'api-e2e-plan') }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -293,12 +367,13 @@ jobs:
   api-e2e-shards:
     name: API E2E shard (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    needs: [api-e2e-plan]
+    needs: [ci-plan, api-e2e-plan]
     # Measurement headroom; this is not the admission target.
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.api-e2e-plan.outputs.matrix) }}
+    if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'api-e2e-shards') }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -353,8 +428,8 @@ jobs:
   api-e2e:
     name: API E2E
     runs-on: ubuntu-latest
-    needs: [api-e2e-plan, api-e2e-shards]
-    if: ${{ always() }}
+    needs: [ci-plan, api-e2e-plan, api-e2e-shards]
+    if: ${{ always() && needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'api-e2e') }}
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -378,7 +453,8 @@ jobs:
   script-contracts:
     name: Script contracts
     runs-on: ubuntu-latest
-    needs: [lint, typecheck]
+    needs: [ci-plan, lint, typecheck]
+    if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'script-contracts') }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -417,7 +493,7 @@ jobs:
   docker-image-smoke:
     name: Docker production image smoke
     runs-on: ubuntu-latest
-    needs: [lint, typecheck]
+    needs: [ci-plan, lint, typecheck]
     permissions:
       actions: read
       contents: read
@@ -430,6 +506,7 @@ jobs:
       COMPOSE_PROJECT_NAME: amcore-smoke
       WEB_FRONTEND_CONTEXT_KEY: ci-fake-frontend-context-key-never-a-real-secret
       FRONTEND_URL: http://127.0.0.1:3000
+    if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'docker-image-smoke') }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -770,11 +847,12 @@ jobs:
   web-e2e-plan:
     name: Web E2E plan
     runs-on: ubuntu-latest
-    needs: [lint, typecheck]
+    needs: [ci-plan, lint, typecheck]
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       audit-plan: ${{ steps.plan.outputs.audit-plan }}
+    if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'web-e2e-plan') }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -787,12 +865,14 @@ jobs:
           node-version: 24
       - name: Select all applicable E2E lanes
         id: plan
+        env:
+          S0_PLAN: ${{ needs.ci-plan.outputs.plan }}
         run: node scripts/e2e-ci.mjs --plan-ci
 
   web-e2e-lanes:
     name: Web E2E (${{ matrix.lane }})
     runs-on: ubuntu-24.04
-    needs: [web-e2e-plan]
+    needs: [ci-plan, web-e2e-plan]
     timeout-minutes: ${{ matrix.timeout }}
     env:
       E2E_CI_LANE: ${{ matrix.lane }}
@@ -801,6 +881,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.web-e2e-plan.outputs.matrix) }}
+    if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'web-e2e-lanes') }}
     steps:
       - name: Record enclosing job epoch
         run: echo "AMCORE_CI_EPOCH=$(($(date +%s) * 1000))" >> "$GITHUB_ENV"
@@ -981,8 +1062,8 @@ jobs:
   web-e2e:
     name: Web E2E
     runs-on: ubuntu-latest
-    needs: [web-e2e-plan, web-e2e-lanes]
-    if: ${{ always() }}
+    needs: [ci-plan, web-e2e-plan, web-e2e-lanes]
+    if: ${{ always() && needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'web-e2e') }}
     timeout-minutes: 5
     env:
       AMCORE_EXPECTED_AUDIT_PLAN: ${{ needs.web-e2e-plan.outputs.audit-plan }}
@@ -1072,12 +1153,13 @@ jobs:
   promtool:
     name: Observability contract (static)
     runs-on: ubuntu-latest
-    needs: [lint, typecheck]
+    needs: [ci-plan, lint, typecheck]
     env:
       PROMETHEUS_IMAGE: prom/prometheus:v3.14.0@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
       ALERTMANAGER_IMAGE: prom/alertmanager:v0.34.0@sha256:690c7b525f4367aa91f73e2f91c632206d32e97c6384bdbf2fb7a861b420340d
       LOKI_IMAGE: grafana/loki:3.7.8@sha256:1107dd5274e0ada47e42472b7a7e71f3b2a2fe878878108f3e2f9e51528f0193
       ALLOY_IMAGE: grafana/alloy:v1.20.1@sha256:2aa2099af76c0098d4af7a4d6e48f86cb66dc1a000222ad927a1c67c6542d13f
+    if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'promtool') }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1181,7 +1263,7 @@ jobs:
   observability-contract-live:
     name: Observability contract (live)
     runs-on: ubuntu-latest
-    needs: [promtool]
+    needs: [ci-plan, promtool]
     # Builds 3 app images from scratch, boots the full local-infra +
     # monitoring Compose profiles, runs every live check, then a second
     # isolated old-volume Grafana migration smoke — a reasoned bound, not a
@@ -1195,6 +1277,7 @@ jobs:
       # projects to tear down, independent of the shell traps.
       COMPOSE_PROJECT_NAME: obs-contract-live-${{ github.run_id }}
       OLD_VOLUME_PROJECT_NAME: obs-contract-oldvol-${{ github.run_id }}
+    if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'observability-contract-live') }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1245,7 +1328,7 @@ jobs:
   storybook:
     name: Storybook
     runs-on: ubuntu-latest
-    needs: [lint, typecheck]
+    needs: [ci-plan, lint, typecheck]
     # No job in this file previously set this; added here after a real
     # incident (2026-08-18, PR #329's first run) where `apt-get install`
     # (invoked internally by `playwright install --with-deps`) hung on an
@@ -1256,6 +1339,7 @@ jobs:
     # exposure until it got the same fix (timeout-minutes + env vars on its
     # own install step).
     timeout-minutes: 20
+    if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'storybook') }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1320,3 +1404,56 @@ jobs:
       - name: Run Storybook a11y/interaction tests
         working-directory: apps/web
         run: pnpm test:storybook
+
+  test-email:
+    name: Email rendering
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [ci-plan, lint, typecheck]
+    if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'test-email') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build shared package
+        run: pnpm --filter @amcore/shared build
+      - name: Email rendering
+        run: pnpm --filter api test:email
+
+  deployment-version:
+    name: Deployment version recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [ci-plan, lint, typecheck]
+    if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'deployment-version') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build shared package
+        run: pnpm --filter @amcore/shared build
+      - name: Install Playwright Chromium
+        working-directory: apps/web
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Deployment version recovery
+        run: node scripts/run-deployment-version-e2e.mjs
