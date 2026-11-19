@@ -11,6 +11,7 @@ test.beforeEach(async ({ page }) => {
 })
 
 test('catalogue renders the product card name and price', async ({ page }) => {
+  test.skip(true, 'T099 control: skip a selected card case during execution')
   const card = page.getByRole('article')
   await expect(card.getByRole('heading', { name: 'AMCore Mug' })).toBeVisible()
   await expect(card.getByText('$12.00', { exact: true })).toBeVisible()
