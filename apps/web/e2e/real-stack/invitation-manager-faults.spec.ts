@@ -11,6 +11,7 @@ import { directApi } from './credential-containment.helpers'
 import {
   browserCredentialRequest,
   ensureAdministrationSession,
+  productAdministrationOrigin,
   TEST_PASSWORD,
   uniqueEmail,
 } from './helpers'
@@ -238,7 +239,18 @@ for (const locale of SERVED_LOCALES)
         })
       ).status()
     ).toBe(201)
-    await ensureAdministrationSession(context, replacement)
+    const staffOrigin = productAdministrationOrigin()
+    if (staffOrigin !== target.origins.product) {
+      const replaced = await browserCredentialRequest(
+        context.request,
+        '/api/product-admin/auth/login',
+        {
+          headers: { origin: staffOrigin },
+          data: { email: replacement, password: TEST_PASSWORD },
+        }
+      )
+      expect(replaced.status()).toBe(200)
+    }
     await page.evaluate(() => window.dispatchEvent(new Event('focus')))
     await expect(page.getByText(t.denied, { exact: true })).toBeVisible()
     finish()
