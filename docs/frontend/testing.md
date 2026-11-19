@@ -169,11 +169,9 @@ workflow selects this browser inventory for non-S0 settings. It keeps the
 full S0 browser inventory for the original S0 settings, including mocked,
 stand safety and specialist lanes. In both modes standard keeps all applicable
 cases. The browser jobs and the required result use the same plan for the
-checked-out commit, run and attempt. With unchanged product settings, the
-plan requires every applicable browser case from the PR base and includes
-newly collected cases. A settings change can alter which cases apply. For
-configured inventory, the plan then checks mandatory cases for the new
-settings without comparing the two case lists. Native mocked transport for host source
+checked-out commit, run and attempt. For configured inventory, CI collects
+the base tests with the PR's settings. The plan retains every base case
+that applies under those settings and includes newly collected cases. Native mocked transport for host source
 settings is refused before stand allocation. A matrix or audit assignment
 shows the expected checks. Browser reports show which checks actually passed.
 

@@ -39,10 +39,11 @@ export function configuredBrowserCases(root, identity, collection) {
   )
 }
 
-/** Preserve every applicable base case when source settings are unchanged. */
+/** Preserve every applicable base case under the settings used for the PR. */
 export function requireConfiguredBaseCases(identity, baseCollection, headCollection) {
   const { lanes, ...baseIdentity } = baseCollection
   assert.deepEqual(baseIdentity, identity, 'Configured base collection identity mismatch')
+  assert.ok(lanes?.['configured-standard']?.length, 'Missing configured base cases')
   for (const [lane, cases] of Object.entries(lanes)) {
     const current = new Set(
       (headCollection.lanes[lane] ?? [])

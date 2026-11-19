@@ -4,6 +4,7 @@ import {
   requireConfiguredBaseCases,
 } from './lib/configured-browser-cases.mjs'
 import assert from 'node:assert/strict'
+import { isDeepStrictEqual } from 'node:util'
 import { execFileSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -104,10 +105,14 @@ const casesPath = process.env.S0_STANDARD_COLLECTION
 if (process.env.GITHUB_ACTIONS === 'true' && groups.web !== 'none' && !casesPath)
   throw new Error('Missing S0 standard collection')
 const policyRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const settings = ['locales', 'admin-console', 'product-admin'].map(
-  (name) => `packages/shared/src/config/${name}.json`
-)
-const sameSettings = pr && !git('diff', '--name-only', base, identity.source, '--', ...settings)
+function sourceSettings(commit) {
+  return Object.fromEntries(
+    ['locales', 'admin-console', 'product-admin'].map((name) => [
+      name,
+      JSON.parse(git('show', `${commit}:packages/shared/src/config/${name}.json`)),
+    ])
+  )
+}
 function readBaseCollection() {
   const path = process.env.S0_STANDARD_BASE_COLLECTION
   if (!path) throw new Error('Missing browser base collection')
@@ -134,8 +139,17 @@ if (casesPath && groups.web !== 'none') {
     }
     standardCases = admitStandardCases(root, policyRoot, ids, baseIds)
   } else {
-    if (sameSettings)
-      requireConfiguredBaseCases({ ...identity, source: base }, readBaseCollection(), cases)
+    if (pr) {
+      const { configuredSettings, ...baseCollection } = readBaseCollection()
+      const settings = sourceSettings(identity.source)
+      if (configuredSettings !== undefined || !isDeepStrictEqual(sourceSettings(base), settings))
+        assert.deepEqual(
+          configuredSettings,
+          settings,
+          'Configured base collected under wrong settings'
+        )
+      requireConfiguredBaseCases({ ...identity, source: base }, baseCollection, cases)
+    }
     configuredCases = configuredBrowserCases(root, identity, cases)
   }
 }

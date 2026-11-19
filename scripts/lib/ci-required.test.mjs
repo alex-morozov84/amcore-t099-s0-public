@@ -55,6 +55,13 @@ test('browser planning and validation consume the same selected inventory', () =
       'auto'
     )
 
+  const baseCollection = jobs['s0-browser-base-collection']
+  assert.deepEqual(baseCollection.needs, ['s0-browser-collection'])
+  assert.equal(
+    baseCollection.steps.find(({ id }) => id === 'collect').env.CONFIGURED_SETTINGS,
+    '${{ needs.s0-browser-collection.outputs.configured-settings }}'
+  )
+
   const inventory = "${{ fromJSON(needs.ci-plan.outputs.plan).inventory || 's0' }}"
   const audit = '${{ needs.web-e2e-plan.outputs.audit-plan }}'
   const webPlan = jobs['web-e2e-plan'].steps.find(({ id }) => id === 'plan')

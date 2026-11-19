@@ -26,6 +26,7 @@ jobs:
       contents: read
     outputs:
       standard: ${{ steps.collect.outputs.standard }}
+      configured-settings: ${{ steps.collect.outputs.configured-settings }}
     steps:
       - name: Checkout tested source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,9 +50,17 @@ jobs:
           pnpm --filter @amcore/shared build
           node scripts/collect-s0-standard.mjs "$RUNNER_TEMP/s0-standard.json"
           printf 'standard=%s\n' "$(jq -c . "$RUNNER_TEMP/s0-standard.json")" >> "$GITHUB_OUTPUT"
+          if jq -e 'has("lanes")' "$RUNNER_TEMP/s0-standard.json" >/dev/null; then
+            printf 'configured-settings=%s\n' "$(jq -cn \
+              --slurpfile locales packages/shared/src/config/locales.json \
+              --slurpfile console packages/shared/src/config/admin-console.json \
+              --slurpfile admin packages/shared/src/config/product-admin.json \
+              '{locales:$locales[0], "admin-console":$console[0], "product-admin":$admin[0]}')" >> "$GITHUB_OUTPUT"
+          fi
 
   s0-browser-base-collection:
-    name: Collect S0 browser cases from PR base
+    name: Collect applicable browser cases from PR base
+    needs: [s0-browser-collection]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -79,11 +88,29 @@ jobs:
         env:
           AMCORE_E2E_INVENTORY: auto
           S0_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CONFIGURED_SETTINGS: ${{ needs.s0-browser-collection.outputs.configured-settings }}
         run: |
+          # Use only settings data from the tested source. Collect the base's own tests.
+          projected=false
+          if [[ -n "$CONFIGURED_SETTINGS" ]]; then
+            for name in locales admin-console product-admin; do
+              file="packages/shared/src/config/$name.json"
+              value="$(jq -ceS --arg name "$name" '.[$name] | objects' <<< "$CONFIGURED_SETTINGS")"
+              if [[ "$(jq -cS . "$file")" != "$value" ]]; then
+                printf '%s\n' "$value" > "$file"
+                projected=true
+              fi
+            done
+          fi
           pnpm install --frozen-lockfile --ignore-scripts
           pnpm --filter @amcore/shared build
           GITHUB_SHA="$S0_BASE_SHA" node scripts/collect-s0-standard.mjs "$RUNNER_TEMP/s0-standard.json"
-          printf 'standard=%s\n' "$(jq -c . "$RUNNER_TEMP/s0-standard.json")" >> "$GITHUB_OUTPUT"
+          collection="$(jq -c . "$RUNNER_TEMP/s0-standard.json")"
+          if [[ "$projected" == true ]]; then
+            collection="$(jq -c --argjson settings "$CONFIGURED_SETTINGS" \
+              '. + {configuredSettings:$settings}' <<< "$collection")"
+          fi
+          printf 'standard=%s\n' "$collection" >> "$GITHUB_OUTPUT"
 
   ci-plan:
     name: CI selection plan
