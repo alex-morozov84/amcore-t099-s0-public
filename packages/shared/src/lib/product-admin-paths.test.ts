@@ -3,8 +3,8 @@ import { describe, expect, it } from 'vitest'
 import { productAdminConfigSchema, productAdminReturnSchema } from '../schemas/frontend-context'
 
 import {
-  PRODUCT_ADMIN_CONFIG,
   parseProductAdminReturn,
+  PRODUCT_ADMIN_CONFIG,
   productAdminPath,
   productAdminReturnPath,
 } from './product-admin-paths'
