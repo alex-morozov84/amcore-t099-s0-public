@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises'
 import { PostgreSqlContainer } from '@testcontainers/postgresql'
 import { Client } from 'pg'
 
+import { e2eContainerLabels } from './e2e-owned-containers'
 import { searchCatalogue } from './fixtures/t099-catalogue/search.js'
 
 describe('S0 catalogue search after source updates', () => {
@@ -10,7 +11,7 @@ describe('S0 catalogue search after source updates', () => {
     const retainedDatabase = process.env.T099_CATALOGUE_DATABASE_URL
     const container = retainedDatabase
       ? undefined
-      : await new PostgreSqlContainer('postgres:18-alpine').start()
+      : await new PostgreSqlContainer('postgres:18-alpine').withLabels(e2eContainerLabels()).start()
     try {
       const database = new Client({
         connectionString: retainedDatabase ?? container?.getConnectionUri(),
