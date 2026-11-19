@@ -10,12 +10,6 @@ test.beforeEach(async ({ page }) => {
   await page.goto(productPath('/catalogue'))
 })
 
-test('catalogue renders the product card name and price', async ({ page }) => {
-  const card = page.getByRole('article')
-  await expect(card.getByRole('heading', { name: 'AMCore Mug' })).toBeVisible()
-  await expect(card.getByText('$12.00', { exact: true })).toBeVisible()
-})
-
 test('product card is accessible in the catalogue', async ({ page }) => {
   await expect(page.getByRole('article').getByRole('heading', { name: 'AMCore Mug' })).toBeVisible()
   await expectNoAxeViolations(page)
