@@ -5,9 +5,9 @@ import {
   AuthErrorCode,
   DEFAULT_LOCALE,
   localePathPrefix,
-  SERVED_LOCALES,
   type OAuthTokens,
   type OAuthUserProfile,
+  SERVED_LOCALES,
 } from '@amcore/shared'
 
 import { hashOAuthStateNonce } from '../src/core/auth/oauth/oauth-nonce'
