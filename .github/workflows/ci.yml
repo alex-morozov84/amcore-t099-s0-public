@@ -1346,7 +1346,7 @@ jobs:
     # exposure until it got the same fix (timeout-minutes + env vars on its
     # own install step).
     timeout-minutes: 20
-    if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'storybook') }}
+    if: ${{ needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'storybook') && github.event_name != 'pull_request' }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
