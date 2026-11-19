@@ -133,12 +133,24 @@ export function auditPlan(root, identity, options) {
         ? JSON.parse(process.env.AMCORE_EXPECTED_AUDIT_PLAN).cardOnly === true
         : false))
   const browserCases = options?.s0 ? browserCaseDigests(root, Object.keys(assignments)) : undefined
+  const standardCases =
+    options?.s0 && !cardOnly
+      ? (options.standardCases ??
+        (process.env.AMCORE_EXPECTED_AUDIT_PLAN
+          ? JSON.parse(process.env.AMCORE_EXPECTED_AUDIT_PLAN).standardCases
+          : undefined))
+      : undefined
+  if (standardCases !== undefined) {
+    invariant(/^[a-f0-9]{64}$/.test(standardCases), 'invalid-standard-case-digest')
+    browserCases['configured-standard'] = standardCases
+  }
   if (cardOnly) browserCases['configured-standard'] = caseDigest(cardCaseIds)
   const plan = {
     version: 1,
     ...(cardOnly ? { cardOnly: true } : {}),
     ...(options?.configured ? { execution: 'configured' } : {}),
     ...(browserCases ? { browserCases } : {}),
+    ...(standardCases ? { standardCases } : {}),
     ...identity,
     config: digest(choices),
     descriptors: digest(catalogue),

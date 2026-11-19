@@ -19,9 +19,40 @@ env:
   API_E2E_PR_HEAD: ${{ github.event.pull_request.head.sha || '' }}
 
 jobs:
+  s0-browser-collection:
+    name: Collect S0 browser cases
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      standard: ${{ steps.collect.outputs.standard }}
+    steps:
+      - name: Checkout tested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Collect standard browser cases without running them
+        id: collect
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm --filter @amcore/shared build
+          node scripts/collect-s0-standard.mjs "$RUNNER_TEMP/s0-standard.json"
+          printf 'standard=%s\n' "$(jq -c . "$RUNNER_TEMP/s0-standard.json")" >> "$GITHUB_OUTPUT"
+
   ci-plan:
     name: CI selection plan
     runs-on: ubuntu-latest
+    needs: [s0-browser-collection]
     timeout-minutes: 5
     permissions:
       contents: read
@@ -39,7 +70,7 @@ jobs:
           POLICY_SOURCE: ${{ github.event.pull_request.base.sha || github.sha }}
         run: |
           mkdir "$RUNNER_TEMP/s0-policy"
-          git archive "$POLICY_SOURCE" scripts packages/shared/src/constants/locales.ts .github/ci-paths.yml | tar -x -C "$RUNNER_TEMP/s0-policy"
+          git archive "$POLICY_SOURCE" scripts packages/shared/src/constants/locales.ts .github/ci-paths.yml ci/s0-standard-required.json | tar -x -C "$RUNNER_TEMP/s0-policy"
       - name: Classify PR paths
         id: changes
         if: github.event_name == 'pull_request'
@@ -57,7 +88,10 @@ jobs:
         env:
           POLICY_SOURCE: ${{ github.event.pull_request.base.sha || github.sha }}
           S0_FILTER_OUTPUT: ${{ toJSON(steps.changes.outputs) }}
+          S0_STANDARD_IDS: ${{ needs.s0-browser-collection.outputs.standard }}
         run: |
+          printf '%s' "$S0_STANDARD_IDS" > "$RUNNER_TEMP/s0-standard.json"
+          export S0_STANDARD_COLLECTION="$RUNNER_TEMP/s0-standard.json"
           plan="$(node "$RUNNER_TEMP/s0-policy/scripts/plan-s0-ci.mjs" "$POLICY_SOURCE")"
           echo "plan=$(jq -c . <<< "$plan")" >> "$GITHUB_OUTPUT"
           printf '### CI selection\n\n%s\n' "$plan" >> "$GITHUB_STEP_SUMMARY"

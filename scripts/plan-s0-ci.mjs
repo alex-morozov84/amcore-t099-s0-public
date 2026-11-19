@@ -1,4 +1,7 @@
 import { execFileSync } from 'node:child_process'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { admitStandardCases } from './stand/s0-case-evidence.mjs'
 import { readFileSync } from 'node:fs'
 import { normalizeCiAreas, selectCiGroups } from './lib/ci-selection.mjs'
 import { parseCiRole, resolveCiPolicy } from './lib/ci-policy.mjs'
@@ -91,7 +94,20 @@ const outputs = JSON.parse(
 const { areas, reason } = pr ? readChange(base, outputs) : { areas: {}, reason: 'push' }
 const wide = !!reason || !Object.values(areas).some(Boolean)
 const groups = selectCiGroups({ role, mode: wide ? 'full' : 'normal', areas, diffComplete: !wide })
-const audit = auditPlan(root, identity, { configured: true, s0: true, cardOnly: false })
+const casesPath = process.env.S0_STANDARD_COLLECTION
+if (process.env.GITHUB_ACTIONS === 'true' && groups.web !== 'none' && !casesPath)
+  throw new Error('Missing S0 standard collection')
+const policyRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const standardCases =
+  casesPath && groups.web !== 'none'
+    ? admitStandardCases(root, policyRoot, JSON.parse(readFileSync(casesPath, 'utf8')))
+    : undefined
+const audit = auditPlan(root, identity, {
+  configured: true,
+  s0: true,
+  cardOnly: false,
+  standardCases,
+})
 const selection = s0Jobs(groups, audit, wide)
 console.log(
   JSON.stringify(
@@ -103,6 +119,7 @@ console.log(
       areas,
       ...selection,
       audit: selection.lanes.length ? audit.digest : null,
+      ...(standardCases ? { standardCases } : {}),
     }),
     null,
     2

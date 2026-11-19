@@ -838,9 +838,12 @@ administration at `/manage`. The invitation HTTPS group uses the existing web
 TLS configuration. Setup, provisioning, support mail and closed-signup
 invitation groups use the existing isolated data and mail preparations.
 
-When changing cases, compare Playwright's collection in each affected managed
-group with the intended inventory before updating `ci/s0-browser-cases.json`.
-Each value is a SHA-256 digest of the JSON array of sorted Playwright case IDs.
+CI collects standard with Playwright `--list` in a separate read-only job.
+The trusted planner checks that collection against the mandatory standard IDs
+in the policy base. Additions enter the current plan automatically. Removal
+or replacement of a mandatory ID requires a separately reviewed baseline change.
+Other browser groups still use their declared case-set hashes.
+Each hash is SHA-256 over the JSON array of sorted Playwright case IDs.
 The aggregate requires matching execution evidence from the current checkout
 and attempt. It also requires the `login`, `members` and `console-overview`
 audit reports from `configured-standard`.

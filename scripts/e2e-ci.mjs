@@ -23,7 +23,12 @@ const plan = matrix
       configured,
       s0,
       ...(requested === '--plan-ci' && s0
-        ? { cardOnly: !process.env.S0_PLAN && selectCardFromPr(root) }
+        ? {
+            cardOnly: !process.env.S0_PLAN && selectCardFromPr(root),
+            standardCases: process.env.S0_PLAN
+              ? JSON.parse(process.env.S0_PLAN).standardCases
+              : undefined,
+          }
         : {}),
     })
 if (
