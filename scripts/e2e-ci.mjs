@@ -24,13 +24,15 @@ const configured =
 const lanes = ciLanes(root, { configured, s0 })
 const matrix = ['--matrix', '--configured-matrix'].includes(requested)
 const identity = matrix ? undefined : runIdentity(root)
+const selection = process.env.S0_PLAN ? JSON.parse(process.env.S0_PLAN) : undefined
 const configuredCases =
   nativeEvidence && requested === '--plan-ci'
-    ? configuredBrowserCases(
+    ? (selection?.configuredCases ??
+      configuredBrowserCases(
         root,
         identity,
         JSON.parse(await readFile(process.env.AMCORE_CONFIGURED_COLLECTION, 'utf8'))
-      )
+      ))
     : undefined
 const plan = matrix
   ? auditScope(root, { configured, s0 })
@@ -40,10 +42,8 @@ const plan = matrix
       configuredCases,
       ...(requested === '--plan-ci' && s0
         ? {
-            cardOnly: !process.env.S0_PLAN && selectCardFromPr(root),
-            standardCases: process.env.S0_PLAN
-              ? JSON.parse(process.env.S0_PLAN).standardCases
-              : undefined,
+            cardOnly: !selection && selectCardFromPr(root),
+            standardCases: selection?.standardCases,
           }
         : {}),
     })
@@ -52,9 +52,11 @@ if (
   JSON.parse(process.env.AMCORE_EXPECTED_AUDIT_PLAN).digest !== plan.digest
 )
   throw new Error('Unexpected Web E2E plan')
-if (requested === '--plan-ci' && process.env.S0_PLAN) {
-  const selection = JSON.parse(process.env.S0_PLAN)
-  if (selection.audit !== plan.digest)
+if (requested === '--plan-ci' && selection) {
+  if (
+    selection.audit !== plan.digest ||
+    JSON.stringify(selection.lanes) !== JSON.stringify(Object.keys(plan.assignments))
+  )
     throw new Error('Web E2E inventory differs from the selected CI plan')
 }
 if (nativeEvidence && !matrix && !plan.configuredCases)

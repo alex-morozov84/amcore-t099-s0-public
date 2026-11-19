@@ -43,20 +43,24 @@ export function ciLanes(root, { configured = false, s0 = false } = {}) {
   return [...lanes, ...productAdminCiLanes(root)]
 }
 
-export function admitS0(root) {
+export function productBrowserInventory(root) {
   const console = readAdminConsoleSettings(root)
   const locales = readLocaleSettings(root)
   const admin = JSON.parse(
     readFileSync(join(root, 'packages/shared/src/config/product-admin.json'))
   )
-  if (
-    console.mode !== 'path' ||
-    console.alias !== 'admin' ||
-    admin.mode !== 'path' ||
-    admin.alias !== 'manage' ||
-    locales.default !== 'en' ||
-    locales.enabled.join(',') !== 'en,ru'
-  )
+  return console.mode === 'path' &&
+    console.alias === 'admin' &&
+    admin.mode === 'path' &&
+    admin.alias === 'manage' &&
+    locales.default === 'en' &&
+    locales.enabled.join(',') === 'en,ru'
+    ? 's0'
+    : 'configured'
+}
+
+export function admitS0(root) {
+  if (productBrowserInventory(root) !== 's0')
     throw new Error('Synthetic browser inventory requires S0 source settings')
 }
 

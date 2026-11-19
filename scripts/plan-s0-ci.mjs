@@ -1,3 +1,5 @@
+import { productBrowserInventory } from './e2e-ci-plan.mjs'
+import { configuredBrowserCases } from './lib/configured-browser-cases.mjs'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
@@ -99,29 +101,38 @@ const casesPath = process.env.S0_STANDARD_COLLECTION
 if (process.env.GITHUB_ACTIONS === 'true' && groups.web !== 'none' && !casesPath)
   throw new Error('Missing S0 standard collection')
 const policyRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const inventory = productBrowserInventory(root)
+const s0 = inventory === 's0'
 let standardCases
+let configuredCases
 if (casesPath && groups.web !== 'none') {
-  const { ids, ...collectedIdentity } = JSON.parse(readFileSync(casesPath, 'utf8'))
-  assert.deepEqual(collectedIdentity, identity, 'S0 collection identity mismatch')
-  let baseIds
-  if (pr) {
-    const basePath = process.env.S0_STANDARD_BASE_COLLECTION
-    if (!basePath) throw new Error('Missing S0 standard base collection')
-    const { ids: requiredIds, ...baseIdentity } = JSON.parse(readFileSync(basePath, 'utf8'))
-    assert.deepEqual(
-      baseIdentity,
-      { ...identity, source: base },
-      'S0 base collection identity mismatch'
-    )
-    baseIds = requiredIds
+  const cases = JSON.parse(readFileSync(casesPath, 'utf8'))
+  if (s0) {
+    const { ids, ...collectedIdentity } = cases
+    assert.deepEqual(collectedIdentity, identity, 'S0 collection identity mismatch')
+    let baseIds
+    if (pr) {
+      const basePath = process.env.S0_STANDARD_BASE_COLLECTION
+      if (!basePath) throw new Error('Missing S0 standard base collection')
+      const { ids: requiredIds, ...baseIdentity } = JSON.parse(readFileSync(basePath, 'utf8'))
+      assert.deepEqual(
+        baseIdentity,
+        { ...identity, source: base },
+        'S0 base collection identity mismatch'
+      )
+      baseIds = requiredIds
+    }
+    standardCases = admitStandardCases(root, policyRoot, ids, baseIds)
+  } else {
+    configuredCases = configuredBrowserCases(root, identity, cases)
   }
-  standardCases = admitStandardCases(root, policyRoot, ids, baseIds)
 }
 const audit = auditPlan(root, identity, {
   configured: true,
-  s0: true,
+  s0,
   cardOnly: false,
   standardCases,
+  configuredCases,
 })
 const selection = s0Jobs(groups, audit, wide)
 console.log(
@@ -133,6 +144,8 @@ console.log(
       reason: reason ?? (wide ? 'empty-diff' : 'known-areas'),
       areas,
       ...selection,
+      inventory,
+      ...(configuredCases ? { configuredCases } : {}),
       audit: selection.lanes.length ? audit.digest : null,
       ...(standardCases ? { standardCases } : {}),
     }),

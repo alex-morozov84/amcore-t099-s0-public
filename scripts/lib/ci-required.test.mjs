@@ -47,6 +47,34 @@ test('admission covers every workflow job, including browser and component famil
   assert.doesNotThrow(() => requireCompleteCi(successful()))
 })
 
+test('browser planning and validation consume the same selected inventory', () => {
+  const { jobs } = parse(readFileSync('.github/workflows/ci.yml', 'utf8'))
+  for (const job of ['s0-browser-collection', 's0-browser-base-collection'])
+    assert.equal(
+      jobs[job].steps.find(({ id }) => id === 'collect').env.AMCORE_E2E_INVENTORY,
+      'auto'
+    )
+
+  const inventory = '${{ fromJSON(needs.ci-plan.outputs.plan).inventory }}'
+  const audit = '${{ needs.web-e2e-plan.outputs.audit-plan }}'
+  const webPlan = jobs['web-e2e-plan'].steps.find(({ id }) => id === 'plan')
+  assert.equal(webPlan.env.AMCORE_E2E_INVENTORY, inventory)
+  assert.equal(webPlan.env.S0_PLAN, '${{ needs.ci-plan.outputs.plan }}')
+  for (const job of ['web-e2e-lanes', 'web-e2e']) {
+    assert.equal(jobs[job].env.AMCORE_E2E_INVENTORY, inventory)
+    assert.equal(jobs[job].env.AMCORE_EXPECTED_AUDIT_PLAN, audit)
+  }
+  assert.equal(
+    jobs['web-e2e-lanes'].strategy.matrix,
+    '${{ fromJSON(needs.web-e2e-plan.outputs.matrix) }}'
+  )
+  const gate = jobs['web-e2e'].steps.find(
+    ({ name }) => name === 'Require every planned E2E lane to succeed'
+  )
+  assert.equal(gate.env.S0_PLAN, webPlan.env.S0_PLAN)
+  assert.match(gate.run, /selection.audit === digest/)
+})
+
 test('one lost, cancelled, failed or skipped family cannot be hidden by the other successes', () => {
   for (const name of requiredCiJobs) {
     for (const result of ['failure', 'cancelled', 'skipped', 'neutral', undefined]) {

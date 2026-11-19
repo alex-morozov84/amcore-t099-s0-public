@@ -14,7 +14,6 @@ permissions:
   contents: read
 
 env:
-  AMCORE_E2E_INVENTORY: s0
   API_E2E_CACHE_MODE: warm
   API_E2E_PR_HEAD: ${{ github.event.pull_request.head.sha || '' }}
 
@@ -41,8 +40,10 @@ jobs:
         with:
           node-version: 24
 
-      - name: Collect standard browser cases without running them
+      - name: Collect applicable browser cases without running them
         id: collect
+        env:
+          AMCORE_E2E_INVENTORY: auto
         run: |
           pnpm install --frozen-lockfile --ignore-scripts
           pnpm --filter @amcore/shared build
@@ -73,9 +74,10 @@ jobs:
         with:
           node-version: 24
 
-      - name: Collect standard browser cases without running them
+      - name: Collect applicable browser cases without running them
         id: collect
         env:
+          AMCORE_E2E_INVENTORY: auto
           S0_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           pnpm install --frozen-lockfile --ignore-scripts
@@ -941,6 +943,7 @@ jobs:
         id: plan
         env:
           S0_PLAN: ${{ needs.ci-plan.outputs.plan }}
+          AMCORE_E2E_INVENTORY: ${{ fromJSON(needs.ci-plan.outputs.plan).inventory }}
         run: node scripts/e2e-ci.mjs --plan-ci
 
   web-e2e-lanes:
@@ -951,6 +954,7 @@ jobs:
     env:
       E2E_CI_LANE: ${{ matrix.lane }}
       AMCORE_AUDIT_JOB_OWNER: ${{ matrix.timeout == 40 }}
+      AMCORE_E2E_INVENTORY: ${{ fromJSON(needs.ci-plan.outputs.plan).inventory }}
       AMCORE_EXPECTED_AUDIT_PLAN: ${{ needs.web-e2e-plan.outputs.audit-plan }}
     strategy:
       fail-fast: false
@@ -1140,6 +1144,7 @@ jobs:
     if: ${{ always() && needs.ci-plan.result == 'success' && contains(fromJSON(needs.ci-plan.outputs.plan).jobs, 'web-e2e') }}
     timeout-minutes: 5
     env:
+      AMCORE_E2E_INVENTORY: ${{ fromJSON(needs.ci-plan.outputs.plan).inventory }}
       AMCORE_EXPECTED_AUDIT_PLAN: ${{ needs.web-e2e-plan.outputs.audit-plan }}
       E2E_RESULTS: ${{ toJSON(needs) }}
     steps:

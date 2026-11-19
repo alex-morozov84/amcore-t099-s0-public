@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { allocateControlSocket } from './stand/control-socket.mjs'
 import { supervise } from './stand/supervisor.mjs'
 import { runIdentity } from './lighthouse/identity.mjs'
-import { configuredLanes } from './e2e-ci-plan.mjs'
+import { configuredLanes, productBrowserInventory } from './e2e-ci-plan.mjs'
 import { collect, groupArguments } from './stand/test-inventory.mjs'
 
 const worktree = process.cwd()
@@ -14,7 +14,9 @@ const id = 's0-collection-' + randomUUID()
 const directory = join(stands, id)
 const token = randomUUID()
 
-const inventoryMode = process.env.AMCORE_E2E_INVENTORY === 'configured'
+const requested = process.env.AMCORE_E2E_INVENTORY
+const inventory = requested === 'auto' ? productBrowserInventory(worktree) : requested
+const inventoryMode = inventory === 'configured'
 const lanes = inventoryMode ? configuredLanes(worktree) : ['configured-standard']
 const inventories = {}
 for (const lane of lanes) {

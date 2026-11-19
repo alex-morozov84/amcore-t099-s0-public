@@ -164,12 +164,14 @@ A disabled Console contributes an explicit audit exclusion.
 
 This is the configured **Docker** subset, not a complete replacement for
 `--all` or the required workflow. It does not include mocked browser flows,
-stand safety contracts or starter-only integration fixtures. The workflow still
-uses its existing full plan. Native mocked transport for host source settings
-is not admitted; the stand refuses it before allocation. Source-specific staff
-journeys and their runtime proof remain necessary before adopting a complete
-product CI plan. A matrix or audit assignment proves neither browser success
-nor a faster CI run.
+stand safety contracts or starter-only integration fixtures. The product PR
+workflow selects this browser inventory for non-S0 settings. It keeps the
+full S0 browser inventory for the original S0 settings, including mocked,
+stand safety and specialist lanes. In both modes standard keeps all applicable
+cases. The browser jobs and the required result use the same plan for the
+checked-out commit, run and attempt. Native mocked transport for host source
+settings is refused before stand allocation. A matrix or audit assignment
+shows the expected checks. Browser reports show which checks actually passed.
 
 The separate `setup-cli` lane proves closed-registration installation with the
 compiled command and an actual captured recovery email. It always applies.
