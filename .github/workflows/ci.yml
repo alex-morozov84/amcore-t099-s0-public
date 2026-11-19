@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, 's0-t099-control-*']
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
