@@ -24,14 +24,9 @@
 # AMCORE_ADMIN_CONSOLE_PROXY_START — the managed stand copies the block between these two
 # markers (scripts/stand/product-admin-source.mjs); keep both lines.
 {$ADMIN_CONSOLE_HOSTNAME} {
-	@physicalConsolePath path /admin /admin/*
+	@physicalConsolePath path /ops /ops/*
 	handle @physicalConsolePath {
 		respond 404
-	}
-
-	@consoleTrailingSlash path_regexp consoleTrailingSlash ^(/(?:en|ru)(?:/.*[^/])?)/$
-	handle @consoleTrailingSlash {
-		redir {re.consoleTrailingSlash.1}?{query} 308
 	}
 
 	@cspReport path /api/csp-report
@@ -69,9 +64,29 @@
 		}
 	}
 
-	@consolePage path_regexp consolePage ^/(en|ru)(/.*)?$
+	@consoleTrailingSlash path_regexp consoleTrailingSlash ^(/.*[^/])/$
+	handle @consoleTrailingSlash {
+		redir {re.consoleTrailingSlash.1}?{query} 308
+	}
+
+	@consoleNextAssets path /_next/*
+	handle @consoleNextAssets {
+		reverse_proxy web:3000 {
+			header_up Host {hostport}
+		}
+	}
+
+	@consoleRoot path /
+	handle @consoleRoot {
+		rewrite * /ops
+		reverse_proxy web:3000 {
+			header_up Host {hostport}
+		}
+	}
+
+	@consolePage path_regexp consolePage ^(/[^.]*)$
 	handle @consolePage {
-		rewrite * /{re.consolePage.1}/admin{re.consolePage.2}
+		rewrite * /ops{re.consolePage.1}
 		reverse_proxy web:3000 {
 			header_up Host {hostport}
 		}

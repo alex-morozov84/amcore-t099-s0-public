@@ -1,2 +1,53 @@
 # Generated from product-admin placement. Regenerate with scripts/render-product-admin-edge.mjs.
-# Path mode: no separate administration host.
+(product_admin_site) {
+  route {
+    @physicalOnSite path_regexp adminPhysicalSite ^/staff(?:/|$)
+    respond @physicalOnSite 404
+    @staffAuthOnSite path /api/product-admin /api/product-admin/*
+    respond @staffAuthOnSite 404
+    reverse_proxy web:3000 {
+  header_up Host {hostport}
+  header_up -X-Forwarded-Host
+  header_up X-Forwarded-Proto {scheme}
+  header_up -X-Amcore-Web-Frontend
+  header_up -X-Amcore-Web-Placement
+  header_up -X-Amcore-Web-Context-Key
+}
+  }
+}
+(product_admin_staff) {
+  route {
+    @physical path_regexp adminPhysical ^/staff(?:/|$)
+    respond @physical 404
+    @controlPlane path /api/console /api/console/* /api/auth/login /api/auth/login/* /api/auth/register /api/auth/register/* /api/auth/logout /api/auth/logout/* /api/auth/forgot-password /api/auth/forgot-password/* /api/auth/reset-password /api/auth/reset-password/* /api/auth/verify-email /api/auth/verify-email/* /api/auth/resend-verification /api/auth/resend-verification/* /api/auth/oauth /api/auth/oauth/* /api/auth/mfa /api/auth/mfa/*
+    respond @controlPlane 404
+    @root path /
+    redir @root /organizations 308
+    @transport path /api/* /_next/* "/icons/README.md" "/icons/icon-192x192.png" "/icons/icon-512x512-maskable.png" "/icons/icon-512x512.png" "/logo-dark.png" "/logo-light.png" "/mockServiceWorker.js" "/sw.js" "/favicon.ico" "/manifest.webmanifest" "/robots.txt" "/sitemap.xml"
+    handle @transport {
+      reverse_proxy web:3000 {
+  header_up Host {hostport}
+  header_up -X-Forwarded-Host
+  header_up X-Forwarded-Proto {scheme}
+  header_up -X-Amcore-Web-Frontend
+  header_up -X-Amcore-Web-Placement
+  header_up -X-Amcore-Web-Context-Key
+}
+    }
+    @trailing path_regexp adminTrailing ^(.+[^/])/$
+    redir @trailing {re.adminTrailing.1}?{query} 308
+    @pages path_regexp adminPage ^((?:/auth/linked|/forgot-password|/invite/accept|/invite/bootstrap/[^/]+|/invite/flow/[^/]+|/invite/unusable|/login|/mfa|/resend-verification|/reset-password|/sign-in-again|/verify-email|/account/security|/organizations/[^/]+/invites|/organizations/[^/]+/members|/organizations/[^/]+|/organizations/[^/]+/roles/[^/]+|/organizations/[^/]+/roles|/organizations||/settings/api-keys|/settings/sessions|/auth/callback))$
+    handle @pages {
+      rewrite * /staff{re.adminPage.1}
+      reverse_proxy web:3000 {
+  header_up Host {hostport}
+  header_up -X-Forwarded-Host
+  header_up X-Forwarded-Proto {scheme}
+  header_up -X-Amcore-Web-Frontend
+  header_up -X-Amcore-Web-Placement
+  header_up -X-Amcore-Web-Context-Key
+}
+    }
+    respond 404
+  }
+}
