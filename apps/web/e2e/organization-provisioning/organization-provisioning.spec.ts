@@ -7,10 +7,13 @@ import { expect, test } from '@playwright/test'
 import { expectNoAxeViolations } from '../shared/axe'
 import { completeMfaSignIn } from '../shared/mfa-login'
 import { activeTarget, guardedSql } from '../support/managed-target.mjs'
+import { resetBrowserProbeDomainBudget } from '../support/mfa-domain-fixture.mjs'
 import { proveSetupMailbox, SETUP_PASSWORD, setupCommand } from '../support/organization-setup'
 
 import { acceptAdministrator } from './recipient'
 
+// Initial setup commits once. A retry would reuse a changed database.
+test.describe.configure({ retries: 0 })
 test.use({ trace: 'off', video: 'off', screenshot: 'off' })
 test('operator steps, lost reply and actual recipient consent produce a working ADMIN', async ({
   page,
@@ -83,6 +86,7 @@ test('operator steps, lost reply and actual recipient consent produce a working 
   await flow.getByRole('button', { name: t.createAndInvite, exact: true }).click()
   await expect(flow.getByText(t.unknown, { exact: true })).toBeVisible()
   await expect(flow.getByRole('button', { name: t.checkResult, exact: true })).toBeEnabled()
+  resetBrowserProbeDomainBudget()
   await page.reload()
   await flow.getByRole('button', { name: t.checkResult, exact: true }).click()
   await expect(page.getByRole('heading', { name: t.created, exact: true })).toBeVisible()
@@ -90,6 +94,7 @@ test('operator steps, lost reply and actual recipient consent produce a working 
   const orgId = guardedSql("SELECT id FROM core.organizations WHERE slug='north-shop';").trim()
   expect(guardedSql('SELECT count(*) FROM core.org_members;').trim()).toBe('0')
 
+  resetBrowserProbeDomainBudget()
   const firstUserId = await acceptAdministrator(browser, recipientEmail, 'North shop', en)
   expect(
     guardedSql(
@@ -102,6 +107,7 @@ test('operator steps, lost reply and actual recipient consent produce a working 
       id: prepared.userId,
     }).trim()
   ).toBe('0')
+  resetBrowserProbeDomainBudget()
   await page.goto(
     localizedFrontendUrl(consoleOrigin, alternateLocale, `${organizationPath}/${orgId}`)
   )
@@ -121,8 +127,20 @@ test('operator steps, lost reply and actual recipient consent produce a working 
   // New initial cancellation is terminal; a distinct additional invitation repairs the same organization.
   await page.setViewportSize({ width: 1280, height: 1000 })
   async function createOrganization(name: string, slug: string, email: string) {
-    await page.goto(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, organizationPath))
-    await page.getByRole('button', { name: t.start, exact: true }).click()
+    resetBrowserProbeDomainBudget()
+    const destination = localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, organizationPath)
+    const sessionResponse = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === `${consoleApi}/organization-provisionings/session`,
+      { timeout: 10000 }
+    )
+    await page.goto(destination)
+    await expect(page).toHaveURL(destination)
+    await expect(page.locator('html')).toHaveAttribute('lang', DEFAULT_LOCALE)
+    expect((await sessionResponse).status(), `${name} operator admission`).toBe(200)
+    const start = flow.getByRole('button', { name: t.start, exact: true })
+    await expect(start).toBeEnabled()
+    await start.click()
     await page.getByLabel(t.name, { exact: true }).fill(name)
     await page.getByLabel(t.slug, { exact: true }).fill(slug)
     await page.getByRole('button', { name: t.next, exact: true }).click()
@@ -140,6 +158,8 @@ test('operator steps, lost reply and actual recipient consent produce a working 
     .getByRole('alertdialog')
     .getByRole('button', { name: t.confirmCancel, exact: true })
     .click()
+  // The repair invitation is a new administrative action after creation and cancellation.
+  resetBrowserProbeDomainBudget()
   const admin = en.console.organizationAdministration
   await expect(page.getByRole('button', { name: admin.invite, exact: true })).toBeEnabled()
   await page.getByRole('button', { name: admin.invite, exact: true }).click()
@@ -152,12 +172,14 @@ test('operator steps, lost reply and actual recipient consent produce a working 
   await invitation.getByRole('button', { name: admin.confirmInvite, exact: true }).click()
   await expect(page.getByText(admin.sent, { exact: true })).toBeVisible()
   await createOrganization('West shop', 'west-shop', 'later-admin@e2e.amcore.test')
+  resetBrowserProbeDomainBudget()
   await page.goto(localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, organizationPath))
   const attention = page
     .locator('[data-slot="card"]')
     .filter({ has: page.getByRole('heading', { name: admin.attentionTitle, exact: true }) })
   await expect(attention.getByRole('heading', { name: 'South shop', exact: true })).toBeVisible()
   await expect(attention.getByRole('heading', { name: 'West shop', exact: true })).toBeVisible()
+  resetBrowserProbeDomainBudget()
   await acceptAdministrator(browser, 'second-admin@e2e.amcore.test', 'South shop', en)
   await attention.getByRole('button', { name: admin.attentionRefresh, exact: true }).click()
   await expect(attention.getByRole('heading', { name: 'South shop', exact: true })).toHaveCount(0)
@@ -167,6 +189,7 @@ test('operator steps, lost reply and actual recipient consent produce a working 
     `INSERT INTO core.org_members (id,"userId","organizationId","createdAt") VALUES ('proof-south-member',:'user',:'org',CURRENT_TIMESTAMP); INSERT INTO core.member_roles (id,"memberId","roleId") SELECT 'proof-south-member-role','proof-south-member',id FROM core.roles WHERE name='MEMBER' AND "organizationId" IS NULL;`,
     { user: firstUserId, org: southId }
   )
+  resetBrowserProbeDomainBudget()
   await page.goto(
     localizedFrontendUrl(consoleOrigin, DEFAULT_LOCALE, `${organizationPath}/${southId}`)
   )
@@ -182,6 +205,7 @@ test('operator steps, lost reply and actual recipient consent produce a working 
       { org: southId }
     ).trim()
   ).toBe('2')
+  resetBrowserProbeDomainBudget()
   for (const [locale, messages] of SERVED_LOCALES.map(
     (locale) => [locale, copy(locale)] as const
   )) {

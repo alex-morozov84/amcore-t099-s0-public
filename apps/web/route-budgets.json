@@ -5,6 +5,7 @@
     "app:/_not-found": "report-only",
     "app:/account/security": 1210121,
     "app:/auth/callback": 933872,
+    "app:/catalogue": 1127831,
     "app:/forgot-password": 933872,
     "app:/invite/flow/[flowId]": 1021363,
     "app:/invite/unusable": 1013492,

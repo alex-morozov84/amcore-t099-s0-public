@@ -127,12 +127,16 @@ test('Console MFA reentry retires target reads across browser history and a conf
     ignoreHTTPSErrors: true,
   })
   const page = await operator.newPage()
-  const signIn = async () => {
+  const signIn = async (destination?: string) => {
     await page.getByLabel(messages.auth.email, { exact: true }).fill(email)
     await page.getByLabel(messages.auth.password, { exact: true }).fill('Test1234Secure')
     await page.getByRole('button', { name: messages.auth.login, exact: true }).click()
     await completeMfaSignIn(page, email)
-    await expect(page).toHaveURL((url) => url.origin === consoleOrigin && isProductHome(url))
+    await expect(page).toHaveURL(
+      (url) =>
+        url.origin === consoleOrigin &&
+        (destination ? url.pathname === destination : isProductHome(url))
+    )
   }
   const openTarget = async () => {
     if (!host) await page.goto(consolePath())
@@ -178,27 +182,40 @@ test('Console MFA reentry retires target reads across browser history and a conf
     expect(reads).toBe(1)
     const loadedAt = Date.now()
     await page.evaluate(() => Object.assign(window, { __t093Document: 'retained' }))
-    // Select the exact native history entry instead of racing repeated asynchronous Back calls.
-    const navigation = await operator.newCDPSession(page)
-    const history = await navigation.send('Page.getNavigationHistory')
-    const loginEntry = history.entries.find((entry) => {
-      const url = new URL(entry.url)
-      return url.origin === consoleOrigin && url.pathname === productPath('/login')
-    })
-    expect(!!loginEntry).toBe(true)
-    await navigation.send('Page.navigateToHistoryEntry', { entryId: loginEntry!.id })
-    await navigation.detach()
-    await expect(page).toHaveURL((url) => url.pathname === productPath('/login'))
-    expect(
-      await page.evaluate(() => (window as unknown as Record<string, unknown>).__t093Document)
-    ).toBe('retained')
-    await signIn()
+    if (host) {
+      // Select the exact native history entry instead of racing repeated asynchronous Back calls.
+      const navigation = await operator.newCDPSession(page)
+      const history = await navigation.send('Page.getNavigationHistory')
+      const loginEntry = history.entries.find((entry) => {
+        const url = new URL(entry.url)
+        return url.origin === consoleOrigin && url.pathname === productPath('/login')
+      })
+      expect(!!loginEntry).toBe(true)
+      await navigation.send('Page.navigateToHistoryEntry', { entryId: loginEntry!.id })
+      await navigation.detach()
+      await expect(page).toHaveURL((url) => url.pathname === productPath('/login'))
+      expect(
+        await page.evaluate(() => (window as unknown as Record<string, unknown>).__t093Document)
+      ).toBe('retained')
+      await signIn()
+    } else {
+      await page.getByRole('button').filter({ hasText: email }).click()
+      await page.getByRole('menuitem', { name: messages.console.signOut, exact: true }).click()
+      await expect(page).toHaveURL(
+        (url) =>
+          url.pathname === consolePath('/sign-in-again') &&
+          url.searchParams.has('entryId') &&
+          url.searchParams.has('returnEntryId')
+      )
+      expect((await page.request.get('/api/console/access')).status()).toBe(401)
+      await signIn(consolePath(`/users/${targetId}`))
+    }
     const secondFamily = await sessionFamily()
     // Never expose the cookie or family identities in assertion output.
     expect(secondFamily === firstFamily).toBe(false)
-    await openTarget()
+    if (host) await openTarget()
     expect(Date.now() - loadedAt).toBeLessThan(60000)
-    expect(reads).toBe(2)
+    await expect.poll(() => reads).toBe(2)
     await page.goBack()
     await expect(page).toHaveURL((url) => url.pathname === consoleUrlPath('/users'))
     await page.goForward()
