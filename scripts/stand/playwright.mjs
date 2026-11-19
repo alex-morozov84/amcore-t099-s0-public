@@ -65,7 +65,7 @@ export async function test(m, lane, token, extra = [], group, auditOnly = false)
     const reportFile = join(tmp, 's0-browser-evidence.json')
     if (evidence) {
       assert.equal(m.settingsPolicy, 'preserve', 'S0 evidence requires preserved settings')
-      await assertCompiledSettings(m)
+      await assertCompiledSettings(m, evidence.configured)
       options.env.AMCORE_S0_REPORT = JSON.stringify({ ...evidence, file: reportFile })
     }
     if (!auditOnly && !group) {
@@ -99,7 +99,7 @@ export async function test(m, lane, token, extra = [], group, auditOnly = false)
         options
       )
     if (evidence) {
-      await assertCompiledSettings(m)
+      await assertCompiledSettings(m, evidence.configured)
       const { expected, ...identity } = evidence
       m.browserEvidence = JSON.parse(await readFile(reportFile, 'utf8'))
       assert.deepEqual(m.browserEvidence, { ...identity, observed: expected })

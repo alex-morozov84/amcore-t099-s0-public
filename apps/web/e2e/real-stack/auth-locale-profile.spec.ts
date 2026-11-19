@@ -1,20 +1,39 @@
-import { productAdminPath } from '@amcore/shared'
+import { PRODUCT_ADMIN_CONFIG, productAdminPath } from '@amcore/shared'
 import { expect, test } from '@playwright/test'
 
 import en from '../../messages/en.json'
 import ru from '../../messages/ru.json'
 import { expectDocumentTitle, verifyUrlOnlyLocale } from '../shared/url-only-locale-journey'
 import { saveContextDiagnostics } from '../support/context-read-diagnostics'
+import { activeTarget } from '../support/managed-target.mjs'
 
 import { registerViaUi, uniqueEmail } from './helpers'
 
-for (const path of ['/mfa', productAdminPath('/mfa')]) {
-  test(`whole pending MFA document adds no product profile calls: ${path}`, async ({ page }) => {
-    await verifyUrlOnlyLocale(page, path, {
-      title: { en: en.meta.title, ru: ru.meta.title },
-      en: en.accountMfa.sessionChanged,
-      ru: ru.accountMfa.sessionChanged,
-    })
+const staffOrigin = () => {
+  if (PRODUCT_ADMIN_CONFIG.mode === 'path') return ''
+  const origin = activeTarget().origins.staff
+  if (!origin) throw new Error('Expected the configured product admin host')
+  return origin
+}
+
+for (const [scope, path] of [
+  ['site', '/mfa'],
+  ['staff', productAdminPath('/mfa')],
+]) {
+  const hostLabel = scope === 'staff' && PRODUCT_ADMIN_CONFIG.mode === 'host' ? ' (staff)' : ''
+  test(`whole pending MFA document adds no product profile calls: ${path}${hostLabel}`, async ({
+    page,
+  }) => {
+    await verifyUrlOnlyLocale(
+      page,
+      path,
+      {
+        title: { en: en.meta.title, ru: ru.meta.title },
+        en: en.accountMfa.sessionChanged,
+        ru: ru.accountMfa.sessionChanged,
+      },
+      scope === 'staff' ? staffOrigin() : ''
+    )
   })
 }
 
@@ -22,11 +41,16 @@ test('standalone product-admin denied document adds no product profile calls', a
   await registerViaUi(page, uniqueEmail('locale-denied'))
   const denied = await page.context().newPage()
   try {
-    await verifyUrlOnlyLocale(denied, productAdminPath('/organizations/not-a-valid-id'), {
-      title: { en: en.meta.title, ru: ru.meta.title },
-      en: en.productAdmin.unavailableTitle,
-      ru: ru.productAdmin.unavailableTitle,
-    })
+    await verifyUrlOnlyLocale(
+      denied,
+      productAdminPath('/organizations/not-a-valid-id'),
+      {
+        title: { en: en.meta.title, ru: ru.meta.title },
+        en: en.productAdmin.unavailableTitle,
+        ru: ru.productAdmin.unavailableTitle,
+      },
+      staffOrigin()
+    )
   } finally {
     await denied.close()
   }

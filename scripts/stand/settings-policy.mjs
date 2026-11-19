@@ -33,15 +33,16 @@ export async function assertSettings(m) {
     throw new Error('Product execution must preserve source settings')
 }
 
-export async function assertCompiledSettings(m) {
+export async function assertCompiledSettings(m, configured = false) {
   await assertSettings(m)
   const settings = m.exercisedSettings
-  assert.deepEqual(settings, await sourceSettings(m.worktree), 'S0 source settings changed')
+  assert.deepEqual(settings, await sourceSettings(m.worktree), 'Source settings changed')
   const shared = await import(pathToFileURL(join(m.snapshot, 'packages/shared/dist/index.js')).href)
   assert.deepEqual(shared.SERVED_LOCALES, settings.locales.enabled)
   assert.equal(shared.DEFAULT_LOCALE, settings.locales.default)
   assert.deepEqual(shared.ADMIN_CONSOLE_SETTINGS, settings['admin-console'])
   assert.deepEqual(shared.PRODUCT_ADMIN_CONFIG, settings['product-admin'])
+  if (configured) return
   const product = new URL(m.origins.product)
   assert.equal(m.consoleTopology, 'path')
   assert.equal(m.productAdminHost, false)

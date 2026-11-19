@@ -9,7 +9,8 @@ import { expectNoAxeViolations } from './axe'
 export async function verifyUrlOnlyLocale(
   page: Page,
   path: string,
-  ready: { en: string; ru: string; title: { en: string; ru: string } }
+  ready: { en: string; ru: string; title: { en: string; ru: string } },
+  origin = ''
 ) {
   let profileCalls = 0
   let profileTruncated = false
@@ -35,7 +36,7 @@ export async function verifyUrlOnlyLocale(
   })
   try {
     const first = SERVED_LOCALES[0]
-    await page.goto(`${localePathPrefix(first)}${path}?tag=a&tag=b#locale`)
+    await page.goto(`${origin}${localePathPrefix(first)}${path}?tag=a&tag=b#locale`)
     await expect(page.getByRole('main').getByText(ready[first], { exact: true })).toBeVisible()
     await expect(page.locator('[aria-busy="true"]')).toHaveCount(0)
     await expect(page.locator('html')).toHaveAttribute('lang', first)
