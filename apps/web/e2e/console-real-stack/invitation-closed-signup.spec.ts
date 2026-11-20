@@ -7,9 +7,8 @@ import { DEFAULT_LOCALE, localizedFrontendUrl } from '@amcore/shared'
 import { expect, request, test } from '@playwright/test'
 
 import { usesClosedSignup } from '../../../../scripts/stand/organization-setup-fixture.mjs'
-
-import { browserCredentialRequest } from '../real-stack/helpers'
 import {
+  browserCredentialRequest,
   logoutViaApi,
   postBrowserCredentials,
   TEST_PASSWORD,
