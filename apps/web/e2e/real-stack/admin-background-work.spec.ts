@@ -96,7 +96,9 @@ test('path-mode Background work: an ordinary user never sees it', async ({ page 
   await expect(page).toHaveURL(isProductHome)
   const response = await page.goto(URL)
   expect(response?.status()).toBe(404)
-  await expect(page.getByRole('heading', { name: messages.console.backgroundWork.title })).toHaveCount(0)
+  await expect(
+    page.getByRole('heading', { name: messages.console.backgroundWork.title })
+  ).toHaveCount(0)
   await expect(
     page.getByRole('table', { name: messages.console.backgroundWork.tableLabel })
   ).toHaveCount(0)
