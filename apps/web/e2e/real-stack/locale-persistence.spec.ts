@@ -66,28 +66,30 @@ test('a locale switch persists to a fresh session on another device/browser', as
   await freshContext.close()
 })
 
-test('a failed profile save does not block the displayed language change', async ({ page }) => {
+test.describe(() => {
   test.skip(!second, 'A single served locale has no locale-switch profile write')
-  await registerViaUi(page, uniqueEmail('locale-failed-save'), { name: 'E2E Test' })
-  await expect(page).toHaveURL(isProductHome)
-  await page.route('**/api/auth/me', async (route) => {
-    if (route.request().method() !== 'PATCH') return route.continue()
-    await route.fulfill({ status: 503, json: { errorCode: 'SERVICE_UNAVAILABLE' } })
+  test('a failed profile save does not block the displayed language change', async ({ page }) => {
+    await registerViaUi(page, uniqueEmail('locale-failed-save'), { name: 'E2E Test' })
+    await expect(page).toHaveURL(isProductHome)
+    await page.route('**/api/auth/me', async (route) => {
+      if (route.request().method() !== 'PATCH') return route.continue()
+      await route.fulfill({ status: 503, json: { errorCode: 'SERVICE_UNAVAILABLE' } })
+    })
+    const failed = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === '/api/auth/me' &&
+        response.request().method() === 'PATCH' &&
+        response.status() === 503
+    )
+    await page
+      .getByRole('combobox', { name: messages.locale.label, exact: true })
+      .selectOption(second!)
+    await failed
+    await expect(page).toHaveURL(
+      (url) => url.pathname.replace(/\/$/, '') === localePathPrefix(second!)
+    )
+    await expect(page.locator('html')).toHaveAttribute('lang', second!)
+    await expect(page.getByRole('combobox')).toHaveValue(second!)
+    await expect(page.getByRole('combobox')).toBeEnabled()
   })
-  const failed = page.waitForResponse(
-    (response) =>
-      new URL(response.url()).pathname === '/api/auth/me' &&
-      response.request().method() === 'PATCH' &&
-      response.status() === 503
-  )
-  await page
-    .getByRole('combobox', { name: messages.locale.label, exact: true })
-    .selectOption(second!)
-  await failed
-  await expect(page).toHaveURL(
-    (url) => url.pathname.replace(/\/$/, '') === localePathPrefix(second!)
-  )
-  await expect(page.locator('html')).toHaveAttribute('lang', second!)
-  await expect(page.getByRole('combobox')).toHaveValue(second!)
-  await expect(page.getByRole('combobox')).toBeEnabled()
 })
