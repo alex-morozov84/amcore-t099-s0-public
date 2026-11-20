@@ -1,4 +1,3 @@
-import { s0Scenarios } from './s0-scenarios.mjs'
 import { managedReadiness } from '../runner-disk/policy.mjs'
 import { mfaE2EEnvironment } from './mfa-e2e.mjs'
 import { operatorMfaEnvironment } from './operator-mfa.mjs'
@@ -12,6 +11,7 @@ import { setupMailCollectorService } from './setup-mail-collector.mjs'
 import {
   assertOrganizationSetupFixture,
   isOrganizationMailFixture,
+  usesClosedSignup,
   usesResendMailFixture,
 } from './organization-setup-fixture.mjs'
 import { directory } from './state.mjs'
@@ -32,13 +32,6 @@ const labelLines = (m, pad) =>
     .join('')
 const overridden = (value) =>
   `!override\n      ${stringify(value).trimEnd().replaceAll('\n', '\n      ')}`
-
-function signupPolicy(m) {
-  const closed = m.s0Scenario
-    ? s0Scenarios[m.s0Scenario].closedSignup
-    : isOrganizationMailFixture(m)
-  return closed ? 'false' : 'true'
-}
 
 export async function configuration(m) {
   assertOrganizationSetupFixture(m)
@@ -64,7 +57,7 @@ export async function configuration(m) {
     // The browser-facing API origin of this stand, so a public avatar URL resolves.
     ...(m.origins.api && { STORAGE_PUBLIC_BASE_URL: `${m.origins.api}/api/v1/storage/public` }),
     EMAIL_PROVIDER: 'mock',
-    AUTH_PUBLIC_SIGNUP_ENABLED: signupPolicy(m),
+    AUTH_PUBLIC_SIGNUP_ENABLED: usesClosedSignup(m) ? 'false' : 'true',
     ORG_SELF_SERVICE_CREATION_ENABLED:
       isOrganizationMailFixture(m) || closedCreationProfiles.includes(m.fixtureProfile)
         ? 'false'
@@ -265,7 +258,7 @@ export function validateModel(m) {
       )
         throw new Error('Provisioning fixture mail policy changed')
       if (
-        environment.AUTH_PUBLIC_SIGNUP_ENABLED !== signupPolicy(m) ||
+        environment.AUTH_PUBLIC_SIGNUP_ENABLED !== (usesClosedSignup(m) ? 'false' : 'true') ||
         environment.ORG_SELF_SERVICE_CREATION_ENABLED !== 'false' ||
         environment.AMCORE_SETUP_MAIL_CAPTURE_KEY !== m.mailCaptureKey
       )

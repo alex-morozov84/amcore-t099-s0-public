@@ -1,13 +1,20 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { DEFAULT_LOCALE, localePathPrefix, SERVED_LOCALES } from '@amcore/shared'
+import { DEFAULT_LOCALE, localePathPrefix, productAdminPath, SERVED_LOCALES } from '@amcore/shared'
 import { type APIResponse, expect, test } from '@playwright/test'
 
 import { ROOT_CLIENT_NAMESPACES } from '../../src/i18n/message-selection'
 import { embeddedFlight, serializedClientMessages } from '../shared/client-message-payload'
+import { productPath } from '../shared/product-settings'
+import { activeTarget } from '../support/managed-target.mjs'
 
-import { registerViaUi, uniqueEmail } from './helpers'
+import {
+  ensureAdministrationSession,
+  productAdministrationOrigin,
+  registerViaUi,
+  uniqueEmail,
+} from './helpers'
 
 const messages = JSON.parse(
   readFileSync(join(__dirname, `../../messages/${DEFAULT_LOCALE}.json`), 'utf8')
@@ -21,7 +28,13 @@ test('sibling navigation sends new section messages without the departed section
     if (entry.type() === 'error' && entry.text().includes('MISSING_MESSAGE'))
       missing.push(entry.text())
   })
-  await registerViaUi(page, uniqueEmail('message-boundaries'))
+  const email = uniqueEmail('message-boundaries')
+  await registerViaUi(page, email)
+  const origin = productAdministrationOrigin()
+  if (origin !== activeTarget().origins.product) {
+    await ensureAdministrationSession(page.context(), email)
+    await page.goto(new URL(productPath(productAdminPath('/settings/sessions')), origin).href)
+  }
   async function navigate(label: string) {
     const link = page.getByRole('link', { name: label, exact: true })
     const href = await link.getAttribute('href')

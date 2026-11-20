@@ -3,6 +3,7 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { allocateControlSocket } from './stand/control-socket.mjs'
 import { supervise } from './stand/supervisor.mjs'
+import { projectChoices } from './stand/project.mjs'
 import { runIdentity } from './lighthouse/identity.mjs'
 import { configuredLanes, productBrowserInventory } from './e2e-ci-plan.mjs'
 import { collect, groupArguments } from './stand/test-inventory.mjs'
@@ -18,6 +19,7 @@ const requested = process.env.AMCORE_E2E_INVENTORY
 const inventory = requested === 'auto' ? productBrowserInventory(worktree) : requested
 const inventoryMode = inventory === 'configured'
 const lanes = inventoryMode ? configuredLanes(worktree) : ['configured-standard']
+const choices = await projectChoices(worktree)
 const inventories = {}
 for (const lane of lanes) {
   await collectLane(lane)
@@ -42,14 +44,14 @@ async function collectLane(lane) {
       worktree,
       snapshot: worktree,
       purpose: 'e2e',
-      topology: 'path',
-      consoleTopology: 'path',
+      ...choices,
       settingsPolicy: 'preserve',
       lane: hostConsole ? 'console-real-stack' : 'real-stack',
       origins: {
-        product: 'http://127.0.0.1:20000',
-        console: 'https://ops.invalid:20000',
-        staff: 'https://staff.invalid:20000',
+        product:
+          choices.topology === 'host' ? 'https://product.invalid:20000' : 'http://127.0.0.1:20000',
+        ...(choices.consoleTopology === 'host' ? { console: 'https://ops.invalid:20000' } : {}),
+        ...(choices.productAdminHost ? { staff: 'https://staff.invalid:20000' } : {}),
       },
       ports: { web: 20000 },
       relay: 'http://127.0.0.1:20001',

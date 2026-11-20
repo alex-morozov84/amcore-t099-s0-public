@@ -1,17 +1,22 @@
 import { randomBytes } from 'node:crypto'
 import { spawn } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
 import { buildFixture } from './deployment-version/build-fixture.mjs'
 import { startProxy } from './deployment-version/proxy.mjs'
+import { readLocaleSettings } from './lib/settings-files.mjs'
 import { verifyRecovery } from './deployment-version/verify.mjs'
 
 const root = process.cwd()
 const { chromium } = createRequire(join(root, 'apps/web/package.json'))('@playwright/test')
 const workspace = await mkdtemp(join(tmpdir(), 'amcore-version-e2e-'))
 const port = Number(process.env.VERSION_E2E_PORT ?? 3420)
+const placement = JSON.parse(readFileSync('packages/shared/src/config/product-admin.json', 'utf8'))
+const locales = readLocaleSettings(root)
+const route = `${locales.enabled.length > 1 ? '/' + locales.default : ''}/deployment-probe`
 const contextKey = randomBytes(32).toString('hex')
 const children = []
 const logs = []
@@ -25,7 +30,8 @@ async function start(artifact, targetPort) {
       PORT: String(targetPort),
       HOSTNAME: '127.0.0.1',
       NODE_ENV: 'production',
-      FRONTEND_URL: `http://127.0.0.1:${port}`,
+      FRONTEND_URL: `${placement.mode === 'host' ? 'https' : 'http'}://127.0.0.1:${port}`,
+      ...(placement.mode === 'host' ? { PRODUCT_ADMIN_ORIGIN: 'https://staff.example.test' } : {}),
       WEB_FRONTEND_CONTEXT_KEY: contextKey,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -53,7 +59,7 @@ try {
   proxy = startProxy(port)
   await proxy.ready
   browser = await chromium.launch({ headless: true })
-  await verifyRecovery(browser, proxy.state, port)
+  await verifyRecovery(browser, proxy.state, port, route)
   console.log(
     `Missing-action stacks: ${(logs.join('').match(/Failed to find Server Action/g) ?? []).length}`
   )

@@ -96,7 +96,7 @@ test('path-mode Background work: an ordinary user never sees it', async ({ page 
   await expect(page).toHaveURL(isProductHome)
   const response = await page.goto(URL)
   expect(response?.status()).toBe(404)
-  await expect(page.getByRole('heading', { name: 'Background work' })).toHaveCount(0)
+  await expect(page.getByRole('heading', { name: messages.console.backgroundWork.title })).toHaveCount(0)
   await expect(
     page.getByRole('table', { name: messages.console.backgroundWork.tableLabel })
   ).toHaveCount(0)
@@ -112,7 +112,7 @@ test('path-mode Background work shows no rows while Redis stalls and recovers af
   // generic temporary state, and nothing identity-bearing or queue-related may be rendered.
   const response = await page.request.get(URL, { timeout: 8_000 })
   const body = await response.text()
-  expect(body).toMatch(/temporarily unavailable/i)
+  expect(body).toContain(messages.common.temporarilyUnavailable)
   expect(body).not.toContain('data-slot="table"')
   expect(body).not.toContain('data-sidebar')
   // After the stall ends the screen works again without any manual intervention.

@@ -65,7 +65,6 @@ test('Console vault stall preserves four isolated sessions and recovery', async 
     const started = performance.now()
     settingsProof('pause-redis')
     await test.step('outsiders see only the accepted temporary state during the stall', async () => {
-      const TEMPORARY = /usually temporary|temporarily unavailable/i
       const during: Record<string, { status: number; shown: boolean }> = {}
       for (const [name, ctx] of [
         ['anonymous', anonymous],
@@ -77,7 +76,11 @@ test('Console vault stall preserves four isolated sessions and recovery', async 
         const response = await page.goto(URL, { timeout: 15_000 })
         during[name] = {
           status: response!.status(),
-          shown: await page.getByText(TEMPORARY).first().isVisible(),
+          shown: await page
+            .getByText(messages.dashboard.unavailable, { exact: true })
+            .or(page.getByText(messages.common.temporarilyUnavailable, { exact: true }))
+            .first()
+            .isVisible(),
         }
         forbidden(await page.content())
         await page.close()
@@ -89,7 +92,7 @@ test('Console vault stall preserves four isolated sessions and recovery', async 
     await test.step('operator temporary response contains no shell, queue or identity', async () => {
       const response = await operatorPage.request.get(URL, { timeout: 10_000 })
       const body = await response.text()
-      expect(body).toMatch(/temporarily unavailable/i)
+      expect(body).toContain(messages.common.temporarilyUnavailable)
       forbidden(body)
       expect(body).not.toContain(email)
     })
