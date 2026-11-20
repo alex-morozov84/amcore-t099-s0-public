@@ -1,5 +1,6 @@
 import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { s0Scenarios } from './s0-scenarios.mjs'
 
 const mailFixtures = new Map([
   ['organization-setup', 'mock'],
@@ -10,6 +11,12 @@ const mailFixtures = new Map([
 ])
 
 export const isOrganizationMailFixture = (m) => mailFixtures.has(m.fixtureProfile)
+export function usesClosedSignup(m) {
+  return m.s0Scenario
+    ? s0Scenarios[m.s0Scenario].closedSignup === true
+    : isOrganizationMailFixture(m)
+}
+
 export const usesResendMailFixture = (m) => mailFixtures.get(m.fixtureProfile) === 'resend'
 
 export function assertOrganizationSetupFixture(m) {

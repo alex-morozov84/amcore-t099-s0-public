@@ -162,6 +162,31 @@ spec groups. The standard lane owns the login and product-administration audits;
 a host Console has its own audit owner. A path Console remains in standard.
 A disabled Console contributes an explicit audit exclusion.
 
+### Write a browser test for the product settings
+
+Add the spec to the existing browser directory for its test boundary. For
+example, a live organization-members flow belongs in
+`apps/web/e2e/real-stack/`. The product PR workflow discovers it automatically.
+Use the same configured locale for the URL and its expected text:
+
+- For product pages, use `productPath('/login')` and `loginViaUi`. Use
+  `messages` for the default locale and `messagesForLocale(locale)` for a
+  scenario that deliberately visits another served locale.
+- For product administration, register on the site, then call
+  `ensureAdministrationSession(context, email)`. Open
+  `organizationUi(locale).url(path)`, using the organization ID in `path`. For other
+  administration routes, combine `productAdministrationOrigin()`,
+  `productAdminPath` and `productPath`. Always keep the origin when navigating
+  from the site to the staff host.
+- For a path Console, use `consolePath` and sign in on the product. For a host
+  Console, use the managed stand's Console origin and `loginToConsoleHost`.
+  Call the Console BFF on that same origin. Keep the disabled Console scenario
+  on the product origin and check both the page and API as an operator.
+- Declare configuration-based applicability at file or describe scope, before
+  Playwright collects the case list. Use an assertion for a prerequisite the
+  assigned stand is supposed to provide. A runtime skip of a selected case
+  fails the required result.
+
 This is the configured **Docker** subset, not a complete replacement for
 `--all` or the required workflow. It does not include mocked browser flows,
 stand safety contracts or starter-only integration fixtures. The product PR

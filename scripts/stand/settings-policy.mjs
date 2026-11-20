@@ -42,12 +42,32 @@ export async function assertCompiledSettings(m, configured = false) {
   assert.equal(shared.DEFAULT_LOCALE, settings.locales.default)
   assert.deepEqual(shared.ADMIN_CONSOLE_SETTINGS, settings['admin-console'])
   assert.deepEqual(shared.PRODUCT_ADMIN_CONFIG, settings['product-admin'])
-  if (configured) return
+  if (configured) {
+    assertConfiguredTransport(m, settings)
+    return
+  }
   const product = new URL(m.origins.product)
   assert.equal(m.consoleTopology, 'path')
   assert.equal(m.productAdminHost, false)
   assert.equal(m.origins.console ?? m.origins.staff, undefined)
   assert.equal(product.protocol, s0Scenarios[m.s0Scenario]?.https ? 'https:' : 'http:')
+}
+
+function assertConfiguredTransport(m, settings) {
+  const staffHost = settings['product-admin'].mode === 'host'
+  const consoleMode = settings['admin-console'].mode
+  const consoleHost = consoleMode === 'host'
+  assert.equal(m.productAdminHost, staffHost)
+  assert.equal(m.consoleTopology, consoleHost ? 'host' : 'path')
+  assert.equal(m.consoleEnabled, consoleMode !== 'disabled')
+  assert.equal(m.topology, staffHost || consoleHost ? 'host' : 'path')
+  const { product, staff, console } = m.origins
+  const productProtocol = staffHost || consoleHost ? 'https:' : 'http:'
+  assert.equal(new URL(product).protocol, productProtocol)
+  const isolated = [product, ...(staffHost ? [staff] : []), ...(consoleHost ? [console] : [])]
+  const origins = isolated.map((address) => new URL(address).origin)
+  assert.equal(new Set(origins).size, origins.length, 'Configured audiences need distinct origins')
+  for (const origin of origins.slice(1)) assert.equal(new URL(origin).protocol, 'https:')
 }
 
 export function assertPreserveRequest(policy, fixture, topology, choices, scenario) {

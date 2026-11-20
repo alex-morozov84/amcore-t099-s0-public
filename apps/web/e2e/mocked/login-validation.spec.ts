@@ -1,10 +1,13 @@
 import { DEFAULT_LOCALE, localizedFrontendUrl, SERVED_LOCALES } from '@amcore/shared'
 import { expect, type Page } from '@playwright/test'
 
-import en from '../../messages/en.json'
-import ru from '../../messages/ru.json'
 import { test } from '../shared/auth-test'
 import { expectNoAxeViolations } from '../shared/axe'
+import { messages, productPath } from '../shared/product-settings'
+
+const resetUrl = localizedFrontendUrl('', DEFAULT_LOCALE, '/reset-password', {
+  token: 'a'.repeat(64),
+})
 
 const passwordHints = {
   en: 'Use at least 8 characters, including one uppercase Latin letter (A–Z) and one digit (0–9).',
@@ -47,18 +50,18 @@ test('login form rejects an invalid submission without calling the BFF', async (
     return route.abort()
   })
 
-  await page.goto('/en/login')
+  await page.goto(productPath('/login'))
   // A real visibility interaction establishes hydration before submitting invalid data.
-  await page.getByRole('button', { name: /^show password$/i }).click()
+  await page.getByRole('button', { name: messages.common.showPassword }).click()
   await expect(page.locator('input[name="password"]')).toHaveAttribute('type', 'text')
-  await page.getByRole('button', { name: /^hide password$/i }).click()
+  await page.getByRole('button', { name: messages.common.hidePassword }).click()
   await expect(page.locator('input[name="password"]')).toHaveAttribute('type', 'password')
 
-  await page.getByRole('textbox', { name: /email/i }).fill('not-an-email')
+  await page.getByRole('textbox', { name: messages.auth.email }).fill('not-an-email')
   // Password left empty — required field.
-  await page.getByRole('button', { name: /sign in/i }).click()
+  await page.getByRole('button', { name: messages.auth.login }).click()
 
-  await expect(page.getByRole('textbox', { name: /email/i })).toHaveAttribute(
+  await expect(page.getByRole('textbox', { name: messages.auth.email })).toHaveAttribute(
     'aria-invalid',
     'true'
   )
@@ -72,14 +75,14 @@ test('register form rejects a weak password without calling the BFF', async ({ p
     return route.abort()
   })
 
-  await page.goto('/en/register')
+  await page.goto(productPath('/register'))
 
   const input = await expectPasswordHint(page, DEFAULT_LOCALE)
 
-  await page.getByRole('textbox', { name: /email/i }).fill('spike-e2e@example.com')
+  await page.getByRole('textbox', { name: messages.auth.email }).fill('spike-e2e@example.com')
   // `registerSchema` requires min 8 chars + an uppercase + a digit.
   await input.fill('weak')
-  await page.getByRole('button', { name: /sign up/i }).click()
+  await page.getByRole('button', { name: messages.auth.register }).click()
 
   await expect(input).toHaveAttribute('aria-invalid', 'true')
   await expectHintAndErrorDescription(page)
@@ -103,10 +106,10 @@ test('reset form explains the password rule and rejects a weak password locally'
     return route.abort()
   })
 
-  await page.goto(`/en/reset-password?token=${'a'.repeat(64)}`)
+  await page.goto(resetUrl)
   const input = await expectPasswordHint(page, DEFAULT_LOCALE)
   await input.fill('weak')
-  await page.getByRole('button', { name: /reset password/i }).click()
+  await page.getByRole('button', { name: messages.auth.resetPasswordSubmit }).click()
 
   await expect(input).toHaveAttribute('aria-invalid', 'true')
   await expectHintAndErrorDescription(page)
@@ -135,22 +138,22 @@ test('valid reset submission reaches the BFF and replaces the form on success', 
   })
 
   await page.setViewportSize({ width: 390, height: 844 })
-  await page.goto(`/en/reset-password?token=${'a'.repeat(64)}`)
+  await page.goto(resetUrl)
   const oldHeading = await page.getByRole('heading', { level: 1 }).innerText()
   const oldSubtitle = await page.locator('[data-slot="card-description"]').innerText()
   const input = await expectPasswordHint(page, DEFAULT_LOCALE)
   await input.fill('CorrectPassword1')
-  await page.getByRole('button', { name: /reset password/i }).click()
+  await page.getByRole('button', { name: messages.auth.resetPasswordSubmit }).click()
 
-  await expect(page.getByText(/your password has been reset/i)).toBeVisible()
+  await expect(page.getByText(messages.auth.resetPasswordSuccess)).toBeVisible()
   await expect(page.getByText(passwordHints[DEFAULT_LOCALE], { exact: true })).toHaveCount(0)
   await expect(page.getByRole('heading', { level: 1 })).toHaveText(
-    /^(Password changed|Пароль изменён)$/
+    messages.auth.resetPasswordSuccessTitle
   )
   await expect(page.getByRole('heading', { name: oldHeading, exact: true })).toHaveCount(0)
   await expect(page.getByText(oldSubtitle, { exact: true })).toHaveCount(0)
   await expect(page.locator('input[type="password"]')).toHaveCount(0)
-  await expect(page.getByRole('link', { name: /^(Sign in|Войти)$/ })).toHaveAttribute(
+  await expect(page.getByRole('link', { name: messages.auth.login })).toHaveAttribute(
     'href',
     /\/login$/
   )
@@ -162,13 +165,11 @@ test('valid reset submission reaches the BFF and replaces the form on success', 
 })
 
 // These page branches need actual Next route/query/link wiring but no live backend.
-const authCopy = { en, ru }[DEFAULT_LOCALE]
-const authPath = (route: string) =>
-  new URL(localizedFrontendUrl('https://page.example', DEFAULT_LOCALE, route)).pathname
+const authPath = (route: string) => productPath(`/${route}`)
 
 test('login page links to forgot-password', async ({ page }) => {
   await page.goto(authPath('login'))
-  await page.getByRole('link', { name: authCopy.auth.forgotPassword }).click()
+  await page.getByRole('link', { name: messages.auth.forgotPassword }).click()
   await expect(page).toHaveURL(new RegExp(`${authPath('forgot-password')}$`))
 })
 
@@ -185,7 +186,7 @@ for (const route of ['reset-password', 'verify-email'] as const) {
     await page.goto(authPath(route))
     const linkTarget = route === 'reset-password' ? 'forgot-password' : 'resend-verification'
     const link = page.locator(`a[href="${authPath(linkTarget)}"]`)
-    await expect(page.getByText(authCopy.errors.TOKEN_INVALID, { exact: true })).toBeVisible()
+    await expect(page.getByText(messages.errors.TOKEN_INVALID, { exact: true })).toBeVisible()
     await expect(page.locator('input[name="password"]')).toHaveCount(0)
     await expect(link).toBeVisible()
     await link.click()
