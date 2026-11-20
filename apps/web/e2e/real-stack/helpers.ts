@@ -166,7 +166,11 @@ export async function browserCredentialRequest(
     resetMfaDomainSourceBudgets()
     resetBrowserProbeDomainBudget()
   }
-  const bootstrap = await request.post(new URL('/api/auth/browser-context', origin).href, {
+  const staffAuth = new URL(url, origin).pathname.startsWith('/api/product-admin/auth/')
+  const bootstrapPath = staffAuth
+    ? '/api/product-admin/auth/browser-context'
+    : '/api/auth/browser-context'
+  const bootstrap = await request.post(new URL(bootstrapPath, origin).href, {
     headers: { Origin: origin },
     data: {},
   })

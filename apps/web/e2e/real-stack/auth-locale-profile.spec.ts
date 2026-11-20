@@ -7,7 +7,7 @@ import { expectDocumentTitle, verifyUrlOnlyLocale } from '../shared/url-only-loc
 import { saveContextDiagnostics } from '../support/context-read-diagnostics'
 import { activeTarget } from '../support/managed-target.mjs'
 
-import { registerViaUi, uniqueEmail } from './helpers'
+import { ensureAdministrationSession, registerViaUi, uniqueEmail } from './helpers'
 
 const staffOrigin = () => {
   if (PRODUCT_ADMIN_CONFIG.mode === 'path') return ''
@@ -38,7 +38,9 @@ for (const [scope, path] of [
 }
 
 test('standalone product-admin denied document adds no product profile calls', async ({ page }) => {
-  await registerViaUi(page, uniqueEmail('locale-denied'))
+  const email = uniqueEmail('locale-denied')
+  await registerViaUi(page, email)
+  await ensureAdministrationSession(page.context(), email)
   const denied = await page.context().newPage()
   try {
     await verifyUrlOnlyLocale(

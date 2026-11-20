@@ -1,4 +1,8 @@
-import { BULL_BOARD_CONTENT_SECURITY_POLICY, DEFAULT_LOCALE } from '@amcore/shared'
+import {
+  ADMIN_CONSOLE_SETTINGS,
+  BULL_BOARD_CONTENT_SECURITY_POLICY,
+  DEFAULT_LOCALE,
+} from '@amcore/shared'
 import { expect, type Locator, type Page } from '@playwright/test'
 
 import { probeRefusalEvidence } from '../real-stack/helpers'
@@ -13,7 +17,7 @@ import {
 } from '../support/queue-fixture'
 
 import { expectNoAxeViolations } from './axe'
-import { messages, translate } from './product-settings'
+import { consolePath, messages, productPath, translate } from './product-settings'
 
 const workNames = {
   en: { default: 'Default queue', email: 'Email delivery' },
@@ -196,7 +200,9 @@ export async function backgroundWorkJourney(page: Page, url: string): Promise<vo
       }),
       page.getByText(messages.console.backgroundWork.control.success.resume, { exact: true })
     )
-    await expect(page.locator('a[href*="/admin/queues"]')).toHaveCount(0)
+    const queuePath =
+      ADMIN_CONSOLE_SETTINGS.mode === 'host' ? productPath('/queues') : consolePath('/queues')
+    await expect(page.locator(`a[href*="${queuePath}"], a[href*="/admin/queues"]`)).toHaveCount(0)
 
     // The browser never holds a backend token.
     expect(withAuthHeader).toEqual([])

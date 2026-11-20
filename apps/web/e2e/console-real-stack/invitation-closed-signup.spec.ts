@@ -6,8 +6,9 @@ import { join } from 'node:path'
 import { DEFAULT_LOCALE, localizedFrontendUrl } from '@amcore/shared'
 import { expect, request, test } from '@playwright/test'
 
-import { browserCredentialRequest } from '../real-stack/helpers'
+import { usesClosedSignup } from '../../../../scripts/stand/organization-setup-fixture.mjs'
 import {
+  browserCredentialRequest,
   logoutViaApi,
   postBrowserCredentials,
   TEST_PASSWORD,
@@ -15,6 +16,8 @@ import {
 } from '../real-stack/helpers'
 import { inviteRecipient, membershipCount } from '../real-stack/invitation-recipient.helpers'
 import { activeTarget, guardedSql } from '../support/managed-target.mjs'
+
+test.skip(!usesClosedSignup(activeTarget()), 'Requires a managed closed-signup fixture')
 
 test('deployed closed signup: reject new email/OAuth, allow existing login and invited registration', async ({
   page,
@@ -26,10 +29,7 @@ test('deployed closed signup: reject new email/OAuth, allow existing login and i
   )
   expect(policy.ok()).toBe(true)
   const data = await policy.json()
-  test.skip(
-    data.publicSignupEnabled !== false,
-    'Requires isolated closed-policy production fixture; ordinary stands keep signup enabled.'
-  )
+  expect(data.publicSignupEnabled).toBe(false)
   const c = JSON.parse(
     readFileSync(join(target.snapshot, `apps/web/messages/${DEFAULT_LOCALE}.json`), 'utf8')
   )

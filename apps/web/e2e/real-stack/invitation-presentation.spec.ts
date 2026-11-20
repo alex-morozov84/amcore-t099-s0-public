@@ -1,14 +1,20 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { localizedFrontendUrl, SERVED_LOCALES } from '@amcore/shared'
+import { SERVED_LOCALES } from '@amcore/shared'
 import { expect, test } from '@playwright/test'
 
 import { expectNoAxeViolations } from '../shared/axe'
 import { activeTarget } from '../support/managed-target.mjs'
 
 import { directApi } from './credential-containment.helpers'
-import { browserCredentialRequest, TEST_PASSWORD, uniqueEmail } from './helpers'
+import {
+  browserCredentialRequest,
+  ensureAdministrationSession,
+  TEST_PASSWORD,
+  uniqueEmail,
+} from './helpers'
+import { organizationUi } from './organization-context.helpers'
 
 // Uses only an isolated managed stand and newly created accounts.
 test('manager presentation: themes, reduced motion, CSS zoom and keyboard dismissal', async ({
@@ -31,16 +37,11 @@ test('manager presentation: themes, reduced motion, CSS zoom and keyboard dismis
   ).toBe(201)
   const login = await directApi('auth/login', { email, password: TEST_PASSWORD })
   const org = await directApi('organizations', { name: 'Presentation proof' }, login.accessToken)
+  await ensureAdministrationSession(context, email)
   await page.emulateMedia({ reducedMotion: 'reduce' })
   for (const theme of ['light', 'dark'] as const) {
     await page.addInitScript((value) => localStorage.setItem('amcore-theme', value), theme)
-    await page.goto(
-      localizedFrontendUrl(
-        target.origins.product,
-        SERVED_LOCALES[0],
-        `organizations/${org.id}/invites`
-      )
-    )
+    await page.goto(organizationUi(SERVED_LOCALES[0]).url(`/${org.id}/invites`))
     await expect(page.locator('html')).toHaveClass(theme === 'dark' ? /dark/ : /^(?!.*dark).*$/)
     const trigger = page.getByRole('button', { name: t.invite, exact: true })
     await expect(trigger).toBeEnabled()

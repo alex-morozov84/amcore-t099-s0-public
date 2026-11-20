@@ -11,8 +11,21 @@ import {
   replaceOnce,
 } from '../fixtures/product-admin-example-context.mjs'
 
+import { snapshot } from '../stand/snapshot.mjs'
+
 const root = resolve(import.meta.dirname, '../..')
 const read = (path) => readFile(join(root, path), 'utf8')
+
+async function pathSource(t) {
+  const dir = await mkdtemp(join(tmpdir(), 'amcore-example-path-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  await snapshot(root, dir)
+  const path = 'packages/shared/src/config/product-admin.json'
+  const placement = JSON.parse(await read(path))
+  await writeFile(join(dir, path), JSON.stringify({ ...placement, mode: 'path' }))
+  execFileSync('git', ['init', '--quiet'], { cwd: dir })
+  return dir
+}
 async function selectedSource() {
   const dir = await mkdtemp(join(tmpdir(), 'amcore-example-contract-'))
   const files = [
@@ -33,6 +46,8 @@ async function selectedSource() {
     // One served locale and no Console: the choices live in the settings files.
     if (path.endsWith('config/locales.json'))
       contents = `${JSON.stringify({ version: 1, enabled: ['ru'], default: 'ru' })}\n`
+    if (path.endsWith('config/product-admin.json'))
+      contents = JSON.stringify({ version: 1, mode: 'path', alias: 'manage' })
     if (path.endsWith('config/admin-console.json'))
       contents = `${JSON.stringify({ version: 1, mode: 'disabled', alias: 'admin' })}\n`
     await mkdir(dirname(join(dir, path)), { recursive: true })
@@ -83,11 +98,11 @@ test('context mismatch and ambiguous mount anchors refuse rather than guessing',
   }
 })
 
-test('the actual roles generator replaces the admitted mount and never adds a legacy page', async () => {
+test('the actual roles generator replaces the admitted mount and never adds a legacy page', async (t) => {
   const stdout = execFileSync(
     process.execPath,
     ['scripts/fixtures/organization-roles-headless.mjs'],
-    { cwd: root, encoding: 'utf8' }
+    { cwd: await pathSource(t), encoding: 'utf8' }
   )
   const generated = stdout.match(/Prepared roles headless example: (.+)/)?.[1]
   assert.ok(generated)
@@ -109,11 +124,11 @@ test('the actual roles generator replaces the admitted mount and never adds a le
   }
 })
 
-test('shop replaces effective palette blocks and preserves fonts and charts', async () => {
+test('shop replaces effective palette blocks and preserves fonts and charts', async (t) => {
   const stdout = execFileSync(
     process.execPath,
     ['scripts/fixtures/organization-shop-headless.mjs'],
-    { cwd: root, encoding: 'utf8' }
+    { cwd: await pathSource(t), encoding: 'utf8' }
   )
   const generated = stdout.match(/Prepared shop headless example: (.+)/)?.[1]
   assert.ok(generated)
@@ -157,10 +172,10 @@ test('shop replaces effective palette blocks and preserves fonts and charts', as
   }
 })
 
-test('members, roles and invitations compose without losing earlier mounts', async () => {
+test('members, roles and invitations compose without losing earlier mounts', async (t) => {
   const copies = []
   try {
-    let source = root
+    let source = await pathSource(t)
     for (const kind of ['members', 'roles', 'invitations']) {
       const stdout = execFileSync(
         process.execPath,

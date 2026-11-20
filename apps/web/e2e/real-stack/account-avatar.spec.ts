@@ -5,6 +5,7 @@ import { DEFAULT_LOCALE } from '@amcore/shared'
 import { expect, type Page, test } from '@playwright/test'
 
 import { expectNoAxeViolations } from '../shared/axe'
+import { messages } from '../shared/product-settings'
 import { activeTarget } from '../support/managed-target.mjs'
 
 import { registerViaUi, signOutViaUi, uniqueEmail } from './helpers'
@@ -149,7 +150,9 @@ test.describe('account menu and avatar', () => {
     await expect(trigger).toBeVisible()
     await expect(trigger.getByText('Avatar Narrow')).toBeHidden()
     await trigger.click()
-    await expect(page.getByRole('menuitem', { name: /sign out/i })).toBeVisible()
+    await expect(
+      page.getByRole('menuitem', { name: messages.auth.logout, exact: true })
+    ).toBeVisible()
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(375)
   })
 
