@@ -8,5 +8,5 @@
  * contract promises.
  */
 export function escapeLikeLiteral(value: string): string {
-  return value.replace(/[\\%_]/g, (char) => `\\${char}`)
+  return Array.from(value, (char) => ('\\%_'.includes(char) ? '\\' + char : char)).join('')
 }
