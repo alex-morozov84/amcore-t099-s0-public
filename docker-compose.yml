@@ -684,3 +684,5 @@ volumes:
   prometheus_data:
   alertmanager_data:
   grafana_data:
+
+# Local CI plan review probe
